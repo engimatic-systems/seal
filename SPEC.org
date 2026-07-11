@@ -1,0 +1,440 @@
+#+title: Seal v0 Specification
+
+* Status
+
+This is the initial specification for review. It defines the first implemented
+Seal, not the full system imagined by the design notes.
+
+Where this document and an earlier design note assign different behavior to v0,
+this document governs the implementation. The =P, W, A, E, R= trace remains a
+useful account of the manual workflow. Seal v0 does not represent or attest
+those objects itself.
+
+* Purpose
+
+Seal v0 moves one opaque mailbox directory between a peer location and an
+operator-controlled directory using rsync. The peer may be another local
+directory or a path reached through SSH.
+
+It replaces manual file copying. It does not replace human review, decide what
+mailbox entries mean, or execute anything found in the mailbox.
+
+The complete working loop is:
+
+#+begin_example
+agent writes peer mailbox
+operator runs seal pull
+operator inspects arbitrary mailbox material and local circumstances
+operator may manually run or modify material outside Seal
+operator may place arbitrary material in the local mailbox
+operator runs seal push
+agent reads peer mailbox
+#+end_example
+
+* Contract boundary
+
+** Authority direction
+
+- Every rsync operation, and every SSH operation used by rsync, is initiated by
+  the operator.
+- Seal exposes no listener, server, callback, approval endpoint, or execution
+  endpoint to the sandbox.
+- The sandbox may mutate its peer mailbox at any time.
+- With an SSH peer, the sandbox has no Seal-provided route to mutate the
+  operator's local mailbox directly.
+- Peer mutation reaches the local mailbox through Seal only when the operator
+  invokes =seal pull=.
+- Local mutation reaches the peer mailbox through Seal only when the operator
+  invokes =seal push=.
+
+Host initiation limits who can start a transfer. It does not make the peer or
+transferred tree trustworthy. A local peer may be independently writable
+through local filesystem topology; Seal does not create or enforce separation
+between two local paths.
+
+** One mailbox
+
+One Seal configuration names exactly two directory roots:
+
+- one local mailbox;
+- one peer mailbox, optionally on one SSH destination.
+
+=pull= and =push= reverse the direction between those same roots. Seal does not
+assign inbox, outbox, proposal, result, request, or response roles to entries
+inside either directory.
+
+** Opaque contents
+
+Seal does not parse, lint, normalize, classify, hash, summarize, or format
+mailbox contents. Filenames, directory layout, file contents, and executable
+bits carry no meaning to Seal.
+
+The fixed rsync invocation defines which filesystem object kinds can move.
+Ordinary files, directories, and symbolic links are expected v0 material.
+Seal must not ask rsync to dereference source symbolic links. A transferred
+symbolic link remains a link; Seal makes no claim about its target or the
+consequence of following it later.
+
+Special files, devices, sockets, hard-link identity, ACLs, extended attributes,
+and other filesystem-specific objects are not promised until the fixed rsync
+argument set says otherwise.
+
+* Configuration
+
+** Discovery
+
+By default Seal reads =seal.toml= from the current working directory. An
+explicit =--config PATH= selects another file.
+
+Seal does not search parent directories, user configuration directories, or
+system configuration directories. It does not select a configuration from an
+environment variable in v0.
+
+Relative local paths are resolved relative to the directory containing the
+selected configuration file, not relative to a later subprocess working
+directory.
+
+** Initial fields
+
+The initial configuration represents the mailbox pair, optional SSH transport,
+and the exact local tools selected during initialization:
+
+#+begin_src toml
+local_mailbox = "mailbox"
+
+[peer]
+path = "/home/agent/mailbox"
+ssh = "experiment.agent"
+rsync = "/run/current-system/sw/bin/rsync"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+ssh = "/run/current-system/sw/bin/ssh"
+
+[debug]
+rsync_debug_flags = ["-v"]
+ssh_debug_flags = ["-v"]
+#+end_src
+
+Omitting =peer.ssh= makes =peer.path= a local path. A relative local peer path
+is resolved relative to the configuration directory. An SSH peer path remains
+a peer-side path and is not resolved on the operator machine.
+
+=peer.ssh= is one opaque SSH destination argument, such as =user@host= or an
+alias from the operator's SSH configuration. Seal does not parse
+=~/.ssh/config=, hostnames, usernames, or SSH destination syntax. Seal
+configuration contains no passwords, private keys, tokens, or agent
+credentials.
+
+An SSH peer must also name =peer.rsync= as an absolute peer-side executable
+path. A local peer must omit it. Seal does not fall back to peer =PATH= or run
+remote discovery. It passes the validated path through rsync's =--rsync-path=
+option.
+
+=peer.ssh=, =peer.rsync=, and =tools.ssh= are one conditional group: all are
+required for an SSH peer and all are absent for a local peer.
+=debug.ssh_debug_flags= is valid only for an SSH peer; when omitted there, it
+defaults to one =-v=. Unknown configuration fields are errors rather than
+silently ignored future behavior.
+
+Upstream rsync permits =--rsync-path= to contain an arbitrary shell program.
+Seal does not expose that surface: =peer.rsync= is one absolute executable path,
+not a command, argument list, or shell fragment. After the leading slash, each
+nonempty path component may contain only ASCII letters, digits, =.=, =_=, =+=,
+and =-=. The components =.= and =..= are invalid. This excludes whitespace,
+control characters, shell metacharacters, and ambiguous repeated separators.
+
+=tools.rsync= and, for an SSH peer, =tools.ssh= are absolute local executable
+paths resolved and recorded by =seal init=. Seal executes those paths rather
+than resolving tool names through =PATH= on every invocation. Pinning a path
+does not attest the bytes later found at that path.
+
+Rsync receives its remote-shell selection as one command string. To keep the
+pinned SSH executable from becoming an argument-injection surface,
+=tools.ssh= uses the same restricted absolute-path grammar as =peer.rsync=.
+Seal constructs that string only from the validated path, any command-specific
+fixed SSH options, and validated diagnostic flags. It never accepts an
+arbitrary remote-shell command string.
+
+The optional =debug= table controls only diagnostic flags used when global
+=--debug= is present. Missing applicable fields default to one =-v= flag for
+each configured tool. An empty array disables underlying-tool verbosity. V0
+accepts only documented diagnostic forms; it does not expose arbitrary SSH or
+rsync flag passthrough.
+
+The fixed transfer flags are not configuration. =seal cfg= displays them, but
+the specification and obvious constants in the literate Rust source own their
+meaning.
+
+=seal.toml= is authoritative for installation-specific choices: mailbox paths,
+peer transport, pinned local tools, and permitted debug verbosity. The Seal
+binary version and this specification remain authoritative for fixed transfer
+semantics. =seal cfg= presents both parts as one effective behavior surface.
+
+Additional fields require concrete pressure from the working executable.
+
+* Command surface
+
+** Global options
+
+=--config PATH= selects configuration as described above.
+
+=--debug= explains Seal's own resolution and subprocess plan. Debug output goes
+to standard error so it does not replace ordinary command output.
+
+** =seal init=
+
+=init= accepts a peer mailbox path and an optional opaque SSH destination:
+
+#+begin_src sh
+seal init ../other-mailbox
+seal init /home/agent/mailbox --ssh dayjob.agent \
+  --peer-rsync /run/current-system/sw/bin/rsync
+seal init /home/agent/mailbox --ssh rosin@example.test \
+  --peer-rsync /usr/bin/rsync
+#+end_src
+
+It creates an initial configuration and one local =mailbox/= directory in the
+selected directory, which defaults to the current directory. It resolves and
+records the local rsync path and, for an SSH peer, the local SSH path.
+
+=--peer-rsync PATH= is required with =--ssh= and invalid without it. =init=
+records the supplied path without contacting the peer.
+
+=init= performs no SSH connection and creates no peer directory. It refuses
+to overwrite an existing configuration. It must preflight conflicts before
+making partial local changes.
+
+** =seal cfg=
+
+=cfg= is a read-only inspection command. It reports:
+
+- selected configuration path;
+- how that path was selected;
+- configured peer path, optional SSH destination, and required peer rsync path
+  for an SSH peer;
+- configured and resolved local mailbox;
+- Seal binary version, pinned local tool paths, debug flags, and the fixed
+  transfer profile; and
+- validation errors or missing required values.
+
+=cfg= does not inspect local mailbox contents, contact the peer, or
+modify any state.
+
+** =seal pull=
+
+=pull= invokes rsync with the peer mailbox as source and the local mailbox as
+destination. Rsync uses the pinned SSH executable when the peer has an SSH
+destination and passes the configured peer rsync executable through
+=--rsync-path=.
+
+=pull= does not execute mailbox content. It does not automatically invoke
+=push= or =doctor=.
+
+=pull --dry-run= asks the same rsync plan to report intended changes without
+applying them.
+
+** =seal push=
+
+=push= invokes rsync with the local mailbox as source and the peer mailbox as
+destination. Rsync uses the pinned SSH executable when the peer has an SSH
+destination and passes the configured peer rsync executable through
+=--rsync-path=.
+
+=push= does not execute mailbox content. It does not automatically invoke
+=pull= or =doctor=.
+
+=push --dry-run= asks the same rsync plan to report intended changes without
+applying them.
+
+** =seal doctor=
+
+=doctor= performs these active but non-mutating diagnostics in order:
+
+1. Select, parse, and validate configuration. Failure is an error.
+2. Check each configured local tool path for existence and executability, then
+   run the pinned rsync =--version= and, for an SSH peer, pinned SSH =-V=.
+   The local rsync version must be at least 3.2.6 because Seal uses the
+   =--secluded-args= long option. Failure or unparseable version output is an
+   error.
+3. Resolve =rsync= and, when applicable, =ssh= through the current =PATH=.
+   A result different from the pinned path is a warning. Missing =PATH= entries
+   are also warnings because Seal still invokes the pinned paths.
+4. Check that the local mailbox exists, is a directory, and can be enumerated.
+   Failure is an error.
+5. For a local peer, check that its mailbox exists, is a directory, and can be
+   enumerated. For an SSH peer, run this fixed reachability probe with the
+   pinned SSH executable:
+
+   #+begin_example
+   ssh -n -T \
+     -o BatchMode=yes \
+     -o ClearAllForwardings=yes \
+     -o PermitLocalCommand=no \
+     -o RemoteCommand=none \
+     -o ConnectTimeout=10 \
+     PEER true
+   #+end_example
+
+   Debug mode inserts only the validated SSH debug flags before =PEER=.
+   Failure is an error.
+6. For an SSH peer, use the same fixed SSH probe profile to run the configured
+   peer rsync executable with =--version=. Require a version that supports
+   secluded arguments: rsync 3.0.0 or newer. Failure or unparseable version
+   output is an error; there is no fallback to peer =PATH=.
+7. Check peer mailbox reachability. A local peer uses another directory
+   enumeration. An SSH peer uses the pinned local rsync with =--list-only=, the
+   pinned SSH executable, =--secluded-args=, the configured =--rsync-path=, and
+   the peer mailbox as its sole source operand. Its remote-shell string uses the
+   fixed SSH options from step 5 except =-n=: rsync requires SSH standard input
+   for its protocol. Failure is an error.
+
+=doctor= reports every independent check it can perform. It marks checks that
+depend on a failed prerequisite as skipped, and returns nonzero when any
+required check fails. Warnings alone leave a zero exit status. Under =--debug=,
+each subprocess probe is shown as a structured program and argv before it runs.
+
+=doctor= must not run a full pull or push dry-run, create directories or files,
+transfer mailbox entries, or repair a failure. A non-mutating check cannot prove
+destination write access. Doctor reports that limitation as information rather
+than treating it as a warning or a successful attestation.
+
+A successful probe describes only the facts observed during that invocation;
+it does not attest that a later transfer will succeed.
+
+* Transfer semantics
+
+Each transfer is an explicit, one-way update of one directory tree from the
+configured source toward the configured destination.
+
+V0 has:
+
+- no bidirectional reconciliation algorithm;
+- no conflict detection or merge;
+- no automatic retry;
+- no whole-tree atomicity claim;
+- no transfer history or manifest; and
+- no deletion propagation.
+
+Destination-only entries therefore remain after a transfer. Pull and push use
+the same fixed profile:
+
+#+begin_example
+--recursive
+--links
+--perms
+--times
+--checksum
+#+end_example
+
+For an SSH peer, the profile also uses =--secluded-args=, names the pinned SSH
+executable through rsync's remote-shell option, and supplies the configured
+peer executable as =--rsync-path=PATH=. Seal never falls back to remote =PATH=.
+=--checksum= selects updates by file content rather than rsync's default
+size-and-modification-time quick check. It improves synchronization correctness;
+it is not an attestation.
+
+The source and destination operands both use trailing slashes so the contents
+of each mailbox root synchronize into the other root. A =--= argument separates
+the fixed options from the two operands.
+
+The profile intentionally omits:
+
+- deletion;
+- source-link or directory-link dereferencing;
+- owner and group preservation;
+- devices and special files;
+- ACLs, extended attributes, and hard-link identity;
+- compression, partial-file retention, and automatic destination creation; and
+- any operator-configurable transfer flags.
+
+The literate Rust source must define the ordinary and SSH-only transfer flags
+as small, obvious constants. Changing them changes this contract and requires a
+specification change before implementation.
+
+Seal invokes rsync directly as a child process. It does not interpolate config
+or mailbox data into a local command shell. Rsync remains responsible for its
+own SSH remote-shell operation.
+
+Seal inherits or relays useful child output. A child failure is visible and
+causes Seal to return nonzero. Seal does not convert partial transfer into
+success, roll it back, or retry it automatically.
+
+* Debug behavior
+
+For every command, =--debug= reports facts useful for inspecting behavior as it
+exists in that train car. As applicable, these include:
+
+- process working directory;
+- selected and resolved configuration path;
+- effective configuration values;
+- resolved local paths;
+- exact subprocess program and argv represented structurally, not as an
+  ambiguous shell command string; and
+- child exit status.
+
+Debug adds the validated =debug.rsync_debug_flags= and, for an SSH peer,
+=debug.ssh_debug_flags=. The default for both is one =-v=. Supported v0 forms
+are limited to diagnostic output:
+
+- SSH =-v=, =-vv=, and =-vvv=; and
+- rsync repeated =-v= forms, =--verbose=, =--info=...=, and =--debug=...=.
+
+Invalid debug flags fail before subprocess execution. Debug flags must not
+change source selection, destination selection, deletion behavior, symlink
+handling, or other transfer semantics. V0 exposes no arbitrary pass-through
+argument facility.
+
+* Diagnostic output
+
+Seal's own messages use four plain-text levels:
+
+#+begin_example
+[info] :: something
+[warn] :: something
+[error] :: something
+[debug] :: something
+#+end_example
+
+The plain labels and separator are the canonical format. Seal may color only
+the level label when writing to an interactive terminal. It uses a small local
+reporting function rather than a logging dependency. Child output remains
+recognizable as child output and is not rewritten into Seal log records.
+
+* Failure posture
+
+- Invalid or incomplete configuration fails before transfer.
+- Missing local prerequisites fail before transfer when Seal can detect them.
+- SSH, rsync, and peer failures remain failures.
+- A partially changed destination may remain after rsync failure.
+- Recovery is an operator decision: inspect state, then explicitly run another
+  command or repair it with ordinary tools.
+- Seal does not infer that failure means nothing changed.
+
+* Non-claims
+
+Seal v0 does not provide:
+
+- automated command execution;
+- proposal, result, or request schemas;
+- representation of =P=, =W=, =A=, =E=, or =R=;
+- approval records or reusable attestations;
+- shape matching or equivalence between filesystem states;
+- immutable snapshots, digests, or execution attribution;
+- mailbox history, durable delivery, or replay protection;
+- code safety, symlink-target safety, or sandbox escape prevention;
+- assurance that an operator inspected the right material;
+- protection of the local rsync or SSH process from a malicious peer;
+- assurance that a configured executable path still names the same bytes;
+- a daemon, watcher, scheduler, notification system, TUI, or web UI;
+- a global mailbox registry or multiple configured mailboxes; or
+- peer directory provisioning.
+
+These omissions define the first implementation boundary. They are not aliases
+for hidden behavior.
+
+* Implementation readiness
+
+No open contract decision blocks the v0 train. A later discovery that changes
+peer executable selection, diagnostic mutation, mailbox interpretation, or
+automatic execution requires a specification change before implementation.
