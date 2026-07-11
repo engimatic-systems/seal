@@ -1,0 +1,8 @@
+# Generated from SEAL.org; edit that file instead.
+local_mailbox = "mailbox"
+
+[peer]
+path = "peer-mailbox"
+
+[tools]
+rsync = "/not-run/rsync"

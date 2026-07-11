@@ -1,0 +1,13 @@
+# Generated from SEAL.org; edit that file instead.
+[peer]
+path = "mailbox"
+ssh = "agent"
+rsync = "/usr/bin/rsync;false"
+
+[tools]
+rsync = "rsync"
+ssh = "/usr/../bin/ssh"
+
+[debug]
+rsync_debug_flags = ["--delete"]
+ssh_debug_flags = ["-oProxyCommand=false"]

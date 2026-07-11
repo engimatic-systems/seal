@@ -1,0 +1,15 @@
+# Generated from SEAL.org; edit that file instead.
+local_mailbox = "mailbox"
+
+[peer]
+path = "/srv/agent/mailbox"
+ssh = "experiment.agent"
+rsync = "/run/current-system/sw/bin/rsync"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+ssh = "/run/current-system/sw/bin/ssh"
+
+[debug]
+rsync_debug_flags = ["--info=name"]
+ssh_debug_flags = ["-vv"]
