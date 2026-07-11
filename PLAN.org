@@ -20,7 +20,7 @@ operator invokes verb
   -> select and parse local config
   -> construct one directional transfer plan
   -> explain plan when debugging or dry-running
-  -> invoke rsync, which invokes SSH
+  -> invoke pinned rsync, which invokes pinned SSH for an SSH peer
   -> relay output and status
 #+end_example
 
@@ -29,7 +29,7 @@ Mailbox bytes remain opaque at every stage.
 | Stage | Receives | Emits | May mutate | Must not know |
 |-
 | CLI selection | argv and current directory | verb, flags, config selection | nothing | mailbox contents |
-| Configuration | selected config bytes | validated transport coordinates | nothing | proposal or result roles |
+| Configuration | selected config bytes | validated peer coordinates, tool paths, and debug settings | nothing | proposal or result roles |
 | Planning | verb and coordinates | exact subprocess program and argv | nothing | file meaning |
 | Explanation | plan and resolved facts | human-readable diagnostics | nothing | approval state |
 | Transfer | exact subprocess plan | child output and status | configured destination tree | execution semantics |
@@ -75,6 +75,8 @@ Deliverables:
 - =seal --help= and =seal --version=;
 - accepted global =--debug= flag with useful seed diagnostics such as process
   working directory and binary version;
+- local =[info] ::=, =[warn] ::=, =[error] ::=, and =[debug] ::= reporting
+  without a logging dependency;
 - tangle, build, and test commands; and
 - tests for the initial CLI contract.
 
@@ -98,11 +100,16 @@ Deliverables:
 - explicit =--config PATH= selection;
 - default selection of =./seal.toml= only;
 - local path resolution relative to the config directory;
+- local or optional SSH peer representation;
+- pinned absolute local tool paths;
+- validated =ssh_debug_flags= and =rsync_debug_flags= with =-v= defaults;
+- inspection of the effective fixed transfer profile without making that
+  profile configurable;
 - validation that can report all useful field errors together;
 - read-only =seal cfg= output; and
 - expanded =--debug= output showing selection and resolved values.
 
-Out of scope: creating config, creating directories, contacting a remote host,
+Out of scope: creating config, creating directories, contacting the peer,
 and invoking rsync.
 
 Evidence: unit tests for parsing, missing fields, explicit/default selection,
@@ -114,64 +121,68 @@ endpoints Seal would use without hidden global discovery?
 ** PR 3: Local =init=
 
 Goal: create a reviewable current-directory Seal workspace without pretending
-to provision a global or remote mailbox.
-
-Contract decision before code: settle whether remote endpoint values arrive as
-=init= arguments or as explicit placeholders in an editable template.
+to provision global state or a peer mailbox.
 
 Deliverables:
 
 - =seal init=;
+- =seal init PEER_PATH= for a local peer;
+- =seal init PEER_PATH --ssh SSH_DESTINATION= for an SSH peer;
 - initial =seal.toml= creation;
 - one local =mailbox/= directory;
+- resolution and recording of the local rsync executable and, for an SSH peer,
+  the local SSH executable;
 - preflight and refusal to overwrite existing config;
 - no-partial-change behavior for locally detectable conflicts; and
 - debug output describing selected paths and intended local creation.
 
-Out of scope: SSH, remote directory creation, transfer, and global config.
+Out of scope: contacting the peer, peer directory creation, transfer, and
+global config.
 
 Evidence: temporary-directory tests for clean creation, existing config,
-conflicting paths, explicit config path, and absence of remote subprocesses.
+conflicting paths, explicit config path, and absence of peer subprocesses.
 
 Review question: does =init= create only the local, operator-visible state that
 the current directory needs?
 
 ** PR 4: =pull=
 
-Goal: move the opaque remote mailbox into the local mailbox through one explicit
+Goal: move the opaque peer mailbox into the local mailbox through one explicit
 operator action.
 
-Contract decisions before code:
-
-- settle the fixed rsync argument set;
-- settle default update-selection semantics;
-- settle the diagnostic-only rsync and SSH verbosity used by =--debug=; and
-- record these choices in =SPEC.org=.
+Contract decision before code: settle whether an SSH peer uses =rsync= from its
+remote =PATH= or an explicit executable through =--rsync-path=.
 
 Deliverables:
 
 - a Rust transfer plan represented as program plus argv;
+- obvious constants for =--recursive=, =--links=, =--perms=, =--times=, and
+  =--checksum=, plus the SSH-only =--secluded-args=;
 - =seal pull=;
 - =seal pull --dry-run=;
 - direct child-process invocation without local shell interpolation;
 - exact debug rendering of the planned subprocess;
-- no deletion flag and no source-symlink dereference flag;
+- pinned local process paths, trailing-slash operands, and an option terminator;
+- no deletion flag, source-symlink dereference flag, or configurable ordinary
+  transfer flags;
+- validated diagnostic-only flags under =--debug=;
 - relayed rsync output and failure status; and
 - focused command-construction and process-outcome tests.
 
 Out of scope: push, automatic retry, snapshots, content inspection, and any
 execution of mailbox material.
 
-Evidence: plan snapshots, a local/fake-process integration harness, successful
-and failed exit propagation, and a filesystem fixture showing that links are
-not dereferenced by the chosen transfer flags.
+Evidence: plan snapshots for local and SSH peers, a local/fake-process
+integration harness, successful and failed exit propagation, checksum-based
+update coverage, and a filesystem fixture showing that links are not
+dereferenced by the chosen transfer flags.
 
-Review question: does =pull= do exactly one visible remote-to-local transfer
+Review question: does =pull= do exactly one visible peer-to-local transfer
 without interpreting or executing what arrives?
 
 ** PR 5: =push=
 
-Goal: move the opaque local mailbox back to the same configured remote mailbox
+Goal: move the opaque local mailbox back to the same configured peer mailbox
 through one explicit operator action.
 
 Deliverables:
@@ -187,28 +198,25 @@ Out of scope: automatic push after another action, result classification,
 delivery records, conflict resolution, and deletion propagation.
 
 Evidence: plan snapshots, process tests, and a fixture proving that =push= uses
-the local mailbox as source and remote mailbox as destination.
+the local mailbox as source and peer mailbox as destination.
 
 Review question: is =push= the precise reverse transfer without becoming a
 publication protocol or assigning meaning to outgoing files?
 
 ** PR 6: =doctor=
 
-Goal: expose local and remote prerequisites without changing either mailbox.
+Goal: expose local and peer prerequisites without changing either mailbox.
 
-Contract decisions before code:
-
-- settle exact non-mutating probe commands;
-- settle required versus advisory checks; and
-- settle stable human-readable check output.
+Contract decisions before code: settle exact non-mutating probe commands and
+required-versus-advisory classification.
 
 Deliverables:
 
 - =seal doctor=;
 - configuration and local-path checks;
-- SSH and rsync executable discovery;
-- non-interactive SSH reachability probe;
-- non-mutating remote mailbox probe through rsync;
+- pinned SSH and rsync executable, version, and current-=PATH= drift checks;
+- local-peer checks or a non-interactive SSH reachability probe as applicable;
+- non-mutating peer mailbox probe through local inspection or rsync;
 - per-check status and aggregate exit status; and
 - exact probe commands under =--debug=.
 
@@ -230,7 +238,10 @@ SSH.
 Deliverables:
 
 - a disposable current-directory Seal workspace;
+- reuse of an existing experiment VM when it provides an isolated SSH peer,
+  with a new disposable VM only when the existing target is unsuitable;
 - documented =init=, edit, =cfg=, and =doctor= transcript;
+- local-peer smoke coverage before network behavior;
 - pull of a mailbox containing arbitrary directories, regular files, and
   symbolic links;
 - operator-side mailbox modification followed by push;
@@ -271,7 +282,7 @@ V0 is complete when an operator can, from an ordinary directory:
 
 1. initialize a local Seal workspace;
 2. inspect the exact effective configuration;
-3. diagnose local and remote prerequisites;
+3. diagnose local and peer prerequisites;
 4. preview and perform an explicit pull;
 5. inspect or manipulate mailbox contents with ordinary tools;
 6. preview and perform an explicit push; and
