@@ -1,0 +1,495 @@
+#+title: Seal Literate Source
+#+PROPERTY: header-args :comments no :mkdirp yes :padline yes
+
+* Purpose and ownership
+
+This document is the canonical handwritten source for the Seal executable.
+Edit it first, then tangle the ordinary Rust files so Cargo and other standard
+tools can inspect and build the repository without understanding Org.
+
+This car generates exactly these files:
+
+- =.gitignore=
+- =Cargo.toml=
+- =src/main.rs=
+- =tests/cli.rs=
+
+=Cargo.lock= is Cargo-generated dependency resolution, not handwritten
+literate source. Build output under =target/= is neither source nor committed
+artifact.
+
+* Reproducing generated files
+
+Run the following from the repository root. =--quick= excludes user Emacs
+configuration; the remaining settings suppress evaluation prompts and tangle
+only the named document.
+
+#+begin_src sh :tangle no
+emacs --batch --quick \
+  --eval "(require 'org)" \
+  --eval '(setq org-confirm-babel-evaluate nil)' \
+  --eval '(org-babel-tangle-file "SEAL.org")'
+#+end_src
+
+The complete clean-tree gate is one fail-fast sequence. It verifies the first
+tangle before running a second tangle, verifies that second result, then runs
+the accumulated Rust checks:
+
+#+begin_src sh :tangle no
+set -eu
+emacs --batch --quick \
+  --eval "(require 'org)" \
+  --eval '(setq org-confirm-babel-evaluate nil)' \
+  --eval '(org-babel-tangle-file "SEAL.org")'
+git diff --exit-code -- .gitignore Cargo.toml src/main.rs tests/cli.rs
+emacs --batch --quick \
+  --eval "(require 'org)" \
+  --eval '(setq org-confirm-babel-evaluate nil)' \
+  --eval '(org-babel-tangle-file "SEAL.org")'
+git diff --exit-code -- .gitignore Cargo.toml src/main.rs tests/cli.rs
+cargo fmt --check
+cargo test --locked
+cargo build --locked
+#+end_src
+
+* Project files
+
+The build ignores only Cargo's build directory. Dependency resolution remains
+visible in =Cargo.lock=.
+
+#+begin_src text :tangle .gitignore
+# Generated from SEAL.org; edit that file instead.
+/target/
+#+end_src
+
+The package has no runtime or development dependencies. The standard library
+is sufficient for the seed option parser, diagnostics, and subprocess-based
+CLI tests.
+
+#+begin_src toml :tangle Cargo.toml
+# Generated from SEAL.org; edit that file instead.
+[package]
+name = "seal"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "seal"
+path = "src/main.rs"
+#+end_src
+
+* Executable
+
+** Seed surface
+
+Pseudocode:
+
+1. Compile package version into executable.
+2. Offer only help, version, and debug options in this car.
+3. Represent requested ordinary output separately from debug diagnostics.
+
+#+begin_src rust :tangle src/main.rs
+// Generated from SEAL.org; edit that file instead.
+
+use std::{env, ffi::OsString, process::ExitCode};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HELP: &str = "\
+Seal executable seed
+
+Usage: seal [OPTIONS]
+
+Options:
+      --debug    Report process working directory and Seal version
+  -h, --help     Print help
+  -V, --version  Print version";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Display {
+    Help,
+    Version,
+}
+
+impl Display {
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::Help => "--help",
+            Self::Version => "--version",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Cli {
+    debug: bool,
+    display: Display,
+}
+
+#+end_src
+
+** Local reporting
+
+Pseudocode:
+
+1. Accept one of four fixed diagnostic levels and message text.
+2. Escape every control character in message text so one call produces one
+   physical diagnostic line.
+3. Format every Seal diagnostic as =[level] :: message=.
+4. Write diagnostics to standard error without changing child or command
+   output.
+
+The seed uses error and debug records directly. Info and warning entry points
+are present because all four levels are part of the v0 diagnostic contract;
+their first runtime call sites belong to later cars.
+
+#+begin_src rust :tangle src/main.rs
+mod report {
+    #[derive(Clone, Copy)]
+    enum Level {
+        Info,
+        Warn,
+        Error,
+        Debug,
+    }
+
+    impl Level {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Info => "info",
+                Self::Warn => "warn",
+                Self::Error => "error",
+                Self::Debug => "debug",
+            }
+        }
+    }
+
+    fn escape_control_characters(message: &str) -> String {
+        let mut escaped = String::with_capacity(message.len());
+
+        for character in message.chars() {
+            if character.is_control() {
+                escaped.extend(character.escape_default());
+            } else {
+                escaped.push(character);
+            }
+        }
+
+        escaped
+    }
+
+    fn format(level: Level, message: &str) -> String {
+        format!(
+            "[{}] :: {}",
+            level.label(),
+            escape_control_characters(message)
+        )
+    }
+
+    fn emit(level: Level, message: &str) {
+        eprintln!("{}", format(level, message));
+    }
+
+    #[allow(dead_code)]
+    pub fn info(message: &str) {
+        emit(Level::Info, message);
+    }
+
+    #[allow(dead_code)]
+    pub fn warn(message: &str) {
+        emit(Level::Warn, message);
+    }
+
+    pub fn error(message: &str) {
+        emit(Level::Error, message);
+    }
+
+    pub fn debug(message: &str) {
+        emit(Level::Debug, message);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Level, format};
+
+        #[test]
+        fn formats_each_contract_level() {
+            assert_eq!(format(Level::Info, "message"), "[info] :: message");
+            assert_eq!(format(Level::Warn, "message"), "[warn] :: message");
+            assert_eq!(format(Level::Error, "message"), "[error] :: message");
+            assert_eq!(format(Level::Debug, "message"), "[debug] :: message");
+        }
+    }
+}
+
+#+end_src
+
+** Option selection
+
+Pseudocode:
+
+1. Start with debug disabled and no selected display action.
+2. For each Unicode argument, enable debug or select help/version.
+3. Reject unknown, non-Unicode, or conflicting display options.
+4. Default to help when no display option was supplied.
+
+#+begin_src rust :tangle src/main.rs
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
+    let mut debug = false;
+    let mut display = None;
+
+    for argument in args {
+        let argument = argument
+            .into_string()
+            .map_err(|_| "argument is not valid UTF-8".to_owned())?;
+
+        match argument.as_str() {
+            "--debug" => debug = true,
+            "-h" | "--help" => select_display(&mut display, Display::Help)?,
+            "-V" | "--version" => select_display(&mut display, Display::Version)?,
+            _ => return Err(format!("unrecognized argument: {argument}")),
+        }
+    }
+
+    Ok(Cli {
+        debug,
+        display: display.unwrap_or(Display::Help),
+    })
+}
+
+fn select_display(selected: &mut Option<Display>, candidate: Display) -> Result<(), String> {
+    match selected {
+        Some(previous) if *previous != candidate => Err(format!(
+            "{} and {} cannot be used together",
+            previous.flag(),
+            candidate.flag()
+        )),
+        _ => {
+            *selected = Some(candidate);
+            Ok(())
+        }
+    }
+}
+
+#+end_src
+
+** Dispatch
+
+Pseudocode:
+
+1. Parse process arguments; report a parse failure and exit with usage status
+   before producing ordinary output.
+2. When debug is enabled, resolve current working directory; failure is fatal.
+3. Report current working directory, then compiled Seal version.
+4. Print selected help or version output and exit successfully.
+
+#+begin_src rust :tangle src/main.rs
+fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    let cli = match parse_args(args) {
+        Ok(cli) => cli,
+        Err(message) => {
+            report::error(&message);
+            return ExitCode::from(2);
+        }
+    };
+
+    if cli.debug {
+        let current_dir = match env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                report::error(&format!(
+                    "cannot resolve process working directory: {error}"
+                ));
+                return ExitCode::FAILURE;
+            }
+        };
+
+        report::debug(&format!(
+            "process working directory: {}",
+            current_dir.display()
+        ));
+        report::debug(&format!("Seal version: {VERSION}"));
+    }
+
+    match cli.display {
+        Display::Help => println!("{HELP}"),
+        Display::Version => println!("seal {VERSION}"),
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn main() -> ExitCode {
+    run(env::args_os().skip(1))
+}
+
+#+end_src
+
+** Parser unit claims
+
+One parser test covers the default seed action; another fixes the only option
+conflict in this car.
+
+#+begin_src rust :tangle src/main.rs
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Display, parse_args};
+
+    #[test]
+    fn no_arguments_select_help_without_debug() {
+        assert_eq!(
+            parse_args(Vec::new()),
+            Ok(Cli {
+                debug: false,
+                display: Display::Help,
+            })
+        );
+    }
+
+    #[test]
+    fn help_and_version_conflict() {
+        let arguments = ["--help", "--version"].map(Into::into);
+
+        assert_eq!(
+            parse_args(arguments),
+            Err("--help and --version cannot be used together".to_owned())
+        );
+    }
+}
+#+end_src
+
+* CLI behavior tests
+
+** Test support
+
+Pseudocode:
+
+1. Start the exact Cargo-built =seal= test binary.
+2. Decode captured standard streams as UTF-8 for readable contract assertions.
+
+#+begin_src rust :tangle tests/cli.rs
+// Generated from SEAL.org; edit that file instead.
+
+use std::process::{Command, Output};
+
+fn seal() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_seal"))
+}
+
+fn stdout(output: &Output) -> &str {
+    std::str::from_utf8(&output.stdout).expect("stdout should be UTF-8")
+}
+
+fn stderr(output: &Output) -> &str {
+    std::str::from_utf8(&output.stderr).expect("stderr should be UTF-8")
+}
+
+#+end_src
+
+** Help names only seed behavior
+
+#+begin_src rust :tangle tests/cli.rs
+#[test]
+fn help_names_only_seed_behavior() {
+    let output = seal().arg("--help").output().expect("seal should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Seal executable seed\n",
+            "\n",
+            "Usage: seal [OPTIONS]\n",
+            "\n",
+            "Options:\n",
+            "      --debug    Report process working directory and Seal version\n",
+            "  -h, --help     Print help\n",
+            "  -V, --version  Print version\n",
+        )
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#+end_src
+
+** Version names package and build version
+
+#+begin_src rust :tangle tests/cli.rs
+#[test]
+fn version_names_package_and_build_version() {
+    let output = seal().arg("--version").output().expect("seal should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        stdout(&output),
+        format!("seal {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#+end_src
+
+** Debug reports seed facts on standard error
+
+#+begin_src rust :tangle tests/cli.rs
+#[test]
+fn debug_reports_seed_facts_on_standard_error() {
+    let working_directory = std::env::temp_dir();
+    let output = seal()
+        .current_dir(&working_directory)
+        .args(["--debug", "--version"])
+        .output()
+        .expect("seal should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        stdout(&output),
+        format!("seal {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "[debug] :: process working directory: {}\n\
+             [debug] :: Seal version: {}\n",
+            working_directory.display(),
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+}
+
+#+end_src
+
+** Invalid arguments fail through canonical reporting
+
+#+begin_src rust :tangle tests/cli.rs
+#[test]
+fn invalid_argument_is_an_error_record() {
+    let output = seal().arg("--unknown").output().expect("seal should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "[error] :: unrecognized argument: --unknown\n"
+    );
+}
+#+end_src
+
+** Control characters cannot forge diagnostic records
+
+#+begin_src rust :tangle tests/cli.rs
+#[test]
+fn control_characters_cannot_forge_diagnostic_records() {
+    let output = seal()
+        .arg("--unknown\n\u{1b}[31m[error] :: forged")
+        .output()
+        .expect("seal should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "[error] :: unrecognized argument: --unknown\\n\\u{1b}[31m[error] :: forged\n"
+    );
+    assert_eq!(stderr(&output).lines().count(), 1);
+}
+#+end_src
