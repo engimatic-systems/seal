@@ -1,0 +1,128 @@
+#+title: Why Seal
+
+#+begin_quote
+Draft. This is the reader's entrance to Seal, not a replacement for its
+runtime contract.
+#+end_quote
+
+An agent says: "run this block of code for me and paste the results in chat."
+
+The operator reads the code, considers the local machine and its consequences,
+runs it or declines, and returns a result. Nothing mysterious has happened. The
+workflow is slow and inconvenient, but it contains the whole semantic
+transaction that a more capable system must preserve.
+
+#+begin_example
+agent proposes P
+operator observes P and material W
+operator authorizes P under W or refuses
+system executes only authorized P under W
+system returns attributable result R
+#+end_example
+
+Here, =P= names the exact proposal, =W= names material facts exposed at review,
+and =R= names the attributable result. The runtime contract introduces the
+authorization and execution identities that connect them.
+
+The central mistake is to treat the manual steps as accidental friction and
+replace them all at once. Some are clerical. Some are the irreducible cost of a
+person with consequences at stake actually reading code. Seal exists to remove
+the former without laundering away the latter.
+
+* Language becomes capability
+
+Language is not only description. In its native tongue it asks, promises,
+warns, refuses, authorizes, witnesses, and binds. A system that turns language
+into local action must preserve those distinctions.
+
+An agent proposal is not an authorization. A summary is not the proposal it
+summarizes. A remembered approval is not a current approval. An execution is
+not evidence that it was authorized. They may all be represented as text, but
+they carry different capabilities and must remain different objects in the
+system.
+
+This is Seal's thesis:
+
+#+begin_quote
+Where language can become local action, semantic distinctions are capability
+distinctions.
+#+end_quote
+
+Seal is an essay in software form. It argues that a consequential system should
+not forget the speech act that brought an effect into being. The proposal should
+remain a proposal until a human authorizes it. The authorization should remain a
+named, inspectable boundary. The result should remain attributable to the exact
+act that crossed it.
+
+* Infinite proposals, finite attention
+
+LLMs make proposals cheap enough to become effectively unbounded. They can
+produce scripts, plans, explanations, summaries, requests, and revisions much
+faster than a human can inspect their effects. That asymmetry does not make
+human judgment obsolete. It makes preserving and allocating human attention the
+actual design problem.
+
+Seal does not claim to determine whether arbitrary code is safe. It gives the
+operator a legible, bounded object to judge, then makes local machinery follow
+that judgment faithfully. The human remains responsible for the decision; the
+system becomes responsible for not changing its meaning on the way to execution.
+
+* Hold, expose, bind
+
+Seal names the act the system must make true:
+
+#+begin_quote
+Hold an agent-proposed act still, expose its terms, and admit it into local
+execution only under human judgment.
+#+end_quote
+
+To /hold/ is to copy a proposal into host-owned, immutable identity. To /expose/
+is to show complete consequential evidence and material execution facts. To
+/bind/ is to ensure that only the reviewed, authorized object can produce the
+recorded local effect.
+
+The seal does not bind the agent. The agent can propose again, receive a reason
+for refusal, and adapt. The seal binds host-side execution to the operator's
+terms. This makes bargaining possible without making enforcement reciprocal.
+
+* The simple thing that works
+
+Seal begins from the manual reference workflow, sometimes called
+v-negative-one. v0 only replaces chat copy-and-paste with a host-initiated
+mailbox: the agent leaves one script, the host copies it into its own storage,
+the operator reviews and decides, the host runs the reviewed snapshot once, and
+the result returns to the agent.
+
+That system deliberately has no reusable grants, agent-selected execution
+environment, local shared directory, attachment tree, or automatic approval.
+It is not incomplete because it lacks those things. It is complete because it
+forms one honest path from proposal to consequence and back. The
+[[file:01-reference-protocol.org][reference protocol]] states its limits precisely.
+
+* What Seal is not
+
+Seal is not a claim that arbitrary approved code cannot damage a host. Code
+runs with the authority granted by its operating-system identity and containment
+boundary. Seal makes that authority visible and ties admission to human review;
+the operating system or another lower-level mechanism must impose any stronger
+process confinement.
+
+Seal is also not a claim that a human can be uninfluenced by an agent. The
+[[file:05-cold-cut.org][Cold Cut]] gives the narrower structural requirement: the agent
+must not be able to write the state through which human judgment becomes local
+execution.
+
+* Reading path
+
+This document supplies the stakes. The remaining documents make the claim
+checkable:
+
+1. [[file:00-doctrine.org][Doctrine]] gives the design north star.
+2. [[file:01-reference-protocol.org][Reference protocol]] defines the minimal mailbox.
+3. [[file:02-runtime-contract.org][Runtime contract]] states the invariants every
+   transformation must preserve.
+4. [[file:03-growth.org][Capability growth]] limits future automation.
+5. [[file:04-etymology.org][Etymology]] and [[file:05-cold-cut.org][The Cold Cut]] provide two
+   lenses on following, consequence, and authority.
+6. [[file:06-gradient.org][The Gradient]] accounts for review as an intervention
+   within human influence rather than an escape from it.

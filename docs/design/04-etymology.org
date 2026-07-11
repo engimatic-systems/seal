@@ -1,0 +1,67 @@
+#+title: Etymology: Following, Sign, and Seal
+
+* Scope
+
+This is a design note, not a claim that Seal's runtime contract follows from an
+etymology. The historical connections are useful because they name the relation
+Seal must preserve: later acts must follow from earlier, authorized acts.
+
+* Following and consequence
+
+The Latin family around /sequor/ means "to follow" (Claiborne 1989, 210). It
+gives English a cluster of words that describe Seal's reference trace:
+
+- a /sequence/ is an ordered following;
+- a /consequence/ is what follows with an act; and
+- to /execute/ a plan is, in its Latin history, to follow it out.
+
+Seal's trace is therefore not only chronological:
+
+#+begin_example
+proposal -> observation -> authorization -> execution -> result
+#+end_example
+
+Each arrow is a claim of consequence. The execution must follow the observed,
+authorized proposal. The result must follow the actual execution. A later
+artifact that merely resembles its predecessor does not satisfy the contract.
+
+* Sign, standard, and seal
+
+One proposed account derives Latin /signum/ from a form meaning "standard that
+one follows," related to the same Proto-Indo-European root (Watkins 2011).
+Under that account, a sign or seal is a visible mark that later action follows.
+
+This derivation is contested. Another account relates /signum/ to a root meaning
+"to cut," through a carved or cut-out mark (de Vaan 2008). Seal does not depend
+on resolving that historical question. Both readings are semantically apt:
+
+- a seal marks and holds a boundary around a consequential object; and
+- a seal provides a visible standard that the host may follow into action.
+
+The name should not imply magic containment. Seal does not bind an agent or
+make arbitrary approved code safe. It binds host-side local execution to the
+operator's terms. The agent remains free to receive a refusal and author a new
+proposal.
+
+* Operational reading
+
+Seal holds an agent-proposed act still, exposes its terms, and admits it into
+local execution only under human judgment.
+
+The host must follow the seal mechanically. The human must not follow a proposal
+blindly. That distinction is the point of the review boundary.
+
+* Bibliography
+
+Claiborne, Robert. 1989. /The Roots of English: A Reader's Handbook of Word
+Origins/. New York: Times Books. See "SEKW-1," 210.
+
+de Vaan, Michiel. 2008. /Etymological Dictionary of Latin and the Other Italic
+Languages/. Leiden and Boston: Brill.
+
+Etymonline. "[[https://www.etymonline.com/word/sign#etymonline_v_23500][Sign]]."
+Accessed 2026-07-11. An accessible synthesis that presents the competing Watkins
+and de Vaan accounts; it is not used here to resolve their disagreement.
+
+Watkins, Calvert, revised and edited by. 2011. /The American Heritage Dictionary
+of Indo-European Roots/. 3rd ed. Boston: Houghton Mifflin Harcourt.

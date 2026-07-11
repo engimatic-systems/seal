@@ -1,0 +1,100 @@
+#+title: The Cold Cut: Human Authority Outside Writable Closure
+
+* Scope
+
+This note borrows a useful construction from [[https://porcuquine.github.io/committee.html]["The Committee"]]:
+a human is a /cut/ in an influence graph, rather than another node in a cascade,
+when the relevant action channel cannot be observed or altered by the system
+influencing them.
+
+Seal does not claim to detect persuasion, model every influence path, or solve
+general affordance equivalence. It adopts the smaller, operational consequence:
+agent proposals may reach the operator, but agent-controlled state must not
+cross the boundary into host authorization or execution.
+
+* The cut in Seal v0
+
+#+begin_example
+agent proposal mailbox
+          |
+          v
+host-owned immutable snapshot P
+          |
+          v
+operator observes P and W, then authorizes or refuses
+          |
+          v
+host-owned execution attempt E and result R
+          |
+          v
+agent result mailbox
+#+end_example
+
+The agent may write the first mailbox and read the last one. It must not be able
+to write the snapshot, review display, authorization record, lifecycle state,
+runner configuration, or execution result before publication. Those host-owned
+objects constitute the cut.
+
+The operator is not outside all influence. The agent can still make a proposal,
+offer reasons, and submit another proposal after refusal. The operator is outside
+the agent's /writable closure/ only for the act that turns a proposal into local
+consequence.
+
+* Correspondence
+
+| The Committee | Seal v0 | Required property |
+|-
+| Human as cut, not node | Host-local operator action | Agent cannot mutate =P=, =A=, or =E=. |
+| Action-instance lineage | =P, W, A, E, R= | Authority identifies one attributable request. |
+| Summaries do not preserve authority | Raw =P= remains review object | Rendered or remembered prose cannot authorize a launch. |
+| Ask again when an action changes hands | New review after a material change | Transformations cannot silently carry authority forward. |
+| Affordance graph | Future capability language | Bind authority to real effect, not surface wording. |
+
+* Text is not affordance
+
+For arbitrary code, Seal cannot generally decide whether two different programs
+have the same effective authority or consequences. v0 therefore makes no such
+claim. It binds exact reviewed bytes, named world facts, one launch, and one
+result.
+
+Later features may wish to compress or transform proposals: a summary, template,
+parameterized command, reusable authorization, memory, scheduled action, or a
+second UI surface. Each creates a question that v0 avoids: does the transformed
+object retain the same write capability as the object the operator reviewed?
+
+There are only two honest answers:
+
+1. Preserve exact identity and require new review whenever it changes.
+2. Restrict the language and execution environment enough that equivalence can
+   be specified, checked, and inspected.
+
+An unproved claim that two differently represented actions are "basically the
+same" is not a safe authority transfer.
+
+* Topology test
+
+For a proposed feature, ask whether the agent has a route to alter, replace,
+reinterpret, replay, or conceal the object that crosses from proposal to local
+execution. If so, the operator has become a node inside the agent's writable
+closure rather than a cut outside it.
+
+Examples of failed cuts include a shared mutable directory executed directly,
+a mirror that can be replaced after review, a confirmation action that recomputes
+facts, and a second execution path that bypasses the normal review record.
+
+The test is intentionally structural. It does not depend on whether the agent's
+proposal is benevolent, persuasive, or stylistically alarming. It asks who can
+write the authority-bearing edge at the moment consequence becomes real.
+
+* Limits
+
+A cut is not a sandbox. Once an operator authorizes arbitrary code under a
+privileged runner, that code can exercise the runner's authority. Seal binds the
+admission decision; operating-system containment binds the process after
+admission. Both are needed where execution itself must be restricted.
+
+* Source
+
+- Porcuquine, [[https://porcuquine.github.io/committee.html]["The Committee"]],
+  accessed 2026-07-11. This note draws on its "human as cut, not node,"
+  "outside writable closure," action-instance lineage, and "Cold Cut" framing.

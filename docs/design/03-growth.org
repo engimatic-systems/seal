@@ -1,0 +1,74 @@
+#+title: Capability Growth
+
+* Rule
+
+Seal grows by conservative refinement of the manual reference protocol. It does
+not begin by modeling every future kind of authorization.
+
+The first question for any feature is not "what can it automate?" It is "which
+manual fact or action does it preserve, and where can that preservation be
+inspected?"
+
+* Safe-first order
+
+The early work should improve movement and visibility without changing authority:
+
+1. Host-initiated mailbox sync with bounded input and durable result delivery.
+2. Status, polling, batching, and notification around that same one-shot flow.
+3. Full-text review ergonomics: syntax highlighting, stable display, diffing,
+   filtering, and searchable history. Raw code remains reachable.
+4. Better host containment, when deployment requires it: restricted OS identity,
+   filesystem/network policy, container, VM, or equivalent enforcement.
+
+These features may reduce clerical work. They do not replace the operator's
+decision to read arbitrary code.
+
+* Authority-expanding work
+
+The following add authority rather than mere ergonomics. They belong after v0
+has a trustworthy lifecycle and adversarial evidence for its contract:
+
+1. Exact reuse: authorize a byte-identical proposal under explicitly unchanged
+   execution facts.
+2. Constrained parameterization: one mechanically specified input form at a
+   time, with matching and counterexample tests.
+3. Named immutable runtime contexts, only when their contents and invalidation
+   rules can be represented faithfully.
+4. Broader lifetimes or cross-context reuse, only when their closure and drift
+   events are real product events rather than fields with no enforcement path.
+5. Code-bearing payloads or generated scripts, only when their complete bytes,
+   interpreter semantics, storage identity, and review surface are as strong as
+   the ordinary proposal path.
+
+Each item needs one semantic path to execution. A parallel "fast path" is a
+separate authority system and should be treated as such.
+
+* Deferred by default
+
+Seal should defer mechanisms that create broad interaction surfaces before there
+is pressure and a proof of their contract:
+
+- local transport over a shared or sandbox-controlled filesystem;
+- multiple binding scopes such as global, ticket, or workstream;
+- automatic repair or replay of ambiguous execution;
+- agent-selected interpreters, attachment trees, or mutable code references;
+- direct mutating CLI shortcuts that bypass the review surface;
+- a second proposal type with its own lifecycle, store, or runner.
+
+Deferral is not rejection. It means the feature has not yet earned a legible
+place in the language.
+
+* Admission test
+
+Before a capability expansion is designed, answer these questions in its design
+document and tests:
+
+1. What does an operator see and choose that they did not see or choose before?
+2. Which exact bytes, facts, and authority records bind that choice to execution?
+3. What input change invalidates prior review?
+4. Can one request be replayed, substituted, or executed through another path?
+5. What happens after a crash between authorization, execution, and reporting?
+6. Which artifacts let an operator inspect the answer after the fact?
+
+A feature that cannot answer these questions is still a hypothesis. It should
+not become a control.

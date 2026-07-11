@@ -1,0 +1,80 @@
+#+title: The Gradient: Accounting for the Cost of Judgment
+
+* Scope
+
+This note draws on [[https://porcuquine.github.io/the-gradient.html]["The Gradient"]].
+Its role in Seal is narrow: a review boundary is an intervention in a human
+system of incentives, habits, time pressure, interfaces, and persuasion. It is
+not an escape from that system.
+
+The [[file:05-cold-cut.org][Cold Cut]] states a structural condition: the agent cannot
+write the host-side state through which a proposal becomes local execution. The
+Gradient adds a human-factors condition: the operator who controls that state is
+still influenced by the world, including by the proposal itself.
+
+* No outside position
+
+Seal must not promise an uninfluenced or omniscient reviewer. An agent can make
+a persuasive proposal. An operator can be tired, hurried, optimistic, afraid,
+or habituated to approval. A polished interface can bias a decision too. None
+of this makes the Cut useless. It names the Cut's limit.
+
+The point of the boundary is not to purify judgment. It is to ensure that an
+agent cannot directly alter the authority-bearing transition after it has made
+its case. Human judgment remains a real, situated act rather than a hidden
+implementation detail.
+
+* Accounted loss
+
+Review costs time and attention. Refusal costs delay, work, and sometimes
+social or operational friction. Recovery after uncertainty costs investigation.
+These costs are not evidence that the boundary has failed. They are part of the
+price of acting responsibly under uncertainty.
+
+Seal should neither worship that cost nor hide it. The useful distinction is
+between /accounted/ and /exported/ loss:
+
+| Cost | Accounted form | Exported form |
+|-
+| Code review | Operator sees the full proposal and spends time deciding. | System replaces review with an opaque summary or silent auto-approval. |
+| Delivery | Host retries result publication without rerunning code. | Failed publication silently causes duplicate execution. |
+| Uncertainty | Started-but-unresolved work becomes =unknown= for manual resolution. | System converts uncertainty into an automatic retry or apparent success. |
+| Feature complexity | Capability has explicit invariants, invalidation, and recovery. | Complexity becomes hidden interaction cost for a later operator or victim. |
+
+Automation is good when it removes clerical cost while preserving awareness and
+attribution. It is dangerous when it makes a decision feel free by moving its
+uncertainty somewhere less visible.
+
+* Product implications
+
+Seal should prefer controls and metrics that keep this expenditure legible:
+
+1. Make approval and refusal equally real actions; refusal must have a useful,
+   attributable path back to the agent.
+2. Do not use default approval, hidden confirmation, success-biased rendering,
+   or throughput alone as a measure of system quality.
+3. Show relevant evidence before a consequential decision, not only after
+   something has failed.
+4. Preserve pauses, inspection, and explicit =unknown= outcomes rather than
+   translating them into invisible automation.
+5. Treat every new convenience as a question: whose time, uncertainty, and
+   recovery burden did it remove, and where did those costs go?
+
+These are not a demand for maximal friction. They distinguish the cost of
+awareness from accidental toil. Host-initiated sync, bounded output capture,
+durable result delivery, and good review ergonomics should reduce the latter.
+They must not make the former disappear by changing the authority contract.
+
+* A small curvature
+
+Seal is not a mechanism for controlling an agent or leaving the surrounding
+gradient. It is a small, deliberate curvature in the path from language to
+local consequence. It asks the chain to stop at a place where a human can see
+what is being spent, decide whether to spend it, and make that decision bind.
+
+* Source
+
+- Porcuquine, [[https://porcuquine.github.io/the-gradient.html]["The Gradient"]],
+  accessed 2026-07-11. This note uses its distinction between a gradient and
+  destiny, its account of accounted loss, and its image of a small intervention
+  that changes what a larger system can do.

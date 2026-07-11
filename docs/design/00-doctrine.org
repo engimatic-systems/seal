@@ -1,0 +1,84 @@
+#+title: Seal Design Doctrine
+
+* Purpose
+
+Seal exists to make consequential LLM-assisted actions legible to a human who
+cares about their effects. LLMs make proposals cheap enough to become
+effectively unbounded. Human attention remains finite. The system must spend
+that attention on exact objects and preserve what the attention established.
+
+* Two seeds
+
+#+begin_quote
+Start with the smallest complete thing that works.
+
+Expand expression only while preserving authorized consequence and
+inspectability.
+#+end_quote
+
+"Complete" means a proposal reaches a real effect and evidence of that effect
+returns. It does not mean feature-rich. A manual conversation in which an agent
+posts code, an operator reads and runs it, and pastes back the result is already
+a complete reference system.
+
+An abstraction earns entry only when it replaces a concrete manual step without
+weakening the end-to-end truth that step carried.
+
+* Authorized consequence
+
+Authorial intent is broader than a system can observe. A system can preserve
+only intent that an author expressed through its language and an operator
+authorized under named facts. Seal calls that narrower, realizable object an
+/authorized consequence/.
+
+Seal has three authors:
+
+1. The designer defines what the system can express.
+2. The agent authors a proposal within that language.
+3. The operator authorizes an exact proposal under material world facts.
+
+Executed consequence must be their intersection, not their union. The agent
+cannot acquire authority merely because the designer made a feature possible.
+The implementation cannot silently widen an operator's decision while moving it
+between representations.
+
+* Consequence preservation
+
+Proposal, transport, rendering, approval, execution, and reporting may each
+change an object's structure. They must not change what the operator saw, chose,
+or caused.
+
+This is a runtime property, not an aspiration about documentation. Each layer
+must preserve the identity and semantics of the proposal and the facts that
+bound its authorization. A layer that offers an action whose real effect differs
+from its displayed effect corrupts the control surface.
+
+* Awareness and inspectability
+
+At the control surface, Seal should satisfy this operational criterion:
+
+#+begin_quote
+An operator who understands displayed state and an offered action can predict
+its material consequence without hidden implementation knowledge.
+#+end_quote
+
+This does not claim implementations are perfect. Preservation can fail through
+fault, corruption, or an incorrect model. Therefore every transformation must
+be inspectable: its source object, transformed object, rule, provenance, and
+observable result must remain available for comparison.
+
+Inspectable does not mean showing every detail at once. The ordinary interface
+may compress mechanical facts. It must retain lossless drill-down to raw
+evidence. Code that determines a decision is not replaceable by a summary.
+
+* Legibility and capability growth
+
+Systems become illegible when distinct authority paths, aliases, overlapping
+scopes, and duplicated state make local reasoning fail to predict global
+effect. The result is a topology in which every feature interacts with every
+other feature and no control has one clear meaning.
+
+Capability growth is therefore a language change, not merely a feature count.
+Each addition must have one semantic path to effect, preserve prior meanings,
+and remain inspectable. Unsupported intent should stay explicitly unsupported;
+it must not enter through an escape hatch because a nearby feature is powerful.

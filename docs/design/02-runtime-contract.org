@@ -1,0 +1,104 @@
+#+title: Runtime Contract
+
+* Contract objects
+
+For one request, define:
+
+- =P=: proposal identity, exact bytes, and digest.
+- =W=: named material execution facts observed at review, such as runner,
+  effective identity, working directory, and environment policy.
+- =A=: explicit operator decision to refuse or authorize =P= under =W=.
+- =E=: at most one execution attempt authorized by =A=.
+- =R=: result, refusal, or unknown-outcome record attributable to the request.
+
+The manual reference trace is:
+
+#+begin_example
+propose(P) -> observe(P, W) -> authorize(P, W) -> execute(P, W) -> report(P, R)
+#+end_example
+
+v0 and every later implementation must refine this trace. They may make steps
+more convenient. They may not introduce a trace in which execution bypasses
+observation and authorization, or one in which different proposal bytes or
+material facts reach execution.
+
+* Invariants
+
+** Proposal identity
+
+Once fetched, =P= is a host-owned immutable snapshot. The agent may alter its
+mailbox after fetch, but cannot alter =P=. Every review, authorization, launch,
+and result record names the same request ID and proposal digest.
+
+** Review binding
+
+The operator can inspect all bytes that determine execution and the named facts
+in =W=. =A= binds the exact digest of =P= and a representation of =W=. A
+confirmation cannot silently recompute changed facts and treat them as the
+reviewed decision.
+
+** Execution fidelity
+
+Only =A= can create =E=. Launch consumes the reviewed host snapshot rather than
+reopening an untrusted or replaceable source path. If a fact that =A= depends on
+has changed, Seal refuses to launch and asks for new review. One request ID can
+create at most one attempt.
+
+** Result attribution
+
+=R= identifies =P=, =A=, and, when an attempt began, =E=. Result publication is
+separate from execution: a failed publish may be retried, but it cannot repeat
+=E=. A remote agent's copy of =R= never becomes authority over host state.
+
+** Direction of authority
+
+Remote mailbox content is untrusted input. The host initiates transport and
+owns proposal snapshots, decisions, lifecycle state, and results until it
+chooses to publish them. Input parsing, filenames, and byte counts are bounded.
+
+** Failure is explicit
+
+When Seal cannot establish whether =E= ran, it records =unknown=. It does not
+convert uncertainty into a retry or a success. When a host state transition
+cannot be completed, the next action is an inspectable recovery decision.
+
+* Confinement is a separate claim
+
+The contract limits what Seal itself causes: it binds a host launch to a reviewed
+proposal. It does not restrict what arbitrary approved code can do after launch.
+The OS identity and containment mechanism in =W= are the relevant enforcement
+boundary for that question.
+
+Seal must never imply that review turns an unrestricted runner account into a
+sandbox. If a deployment requires a command not to exceed a capability boundary,
+that boundary must exist below Seal and be visible in =W=.
+
+* Inspectability requirements
+
+For every state transition, Seal retains or can derive:
+
+- the raw proposal snapshot and digest;
+- displayed execution facts and authorization decision;
+- lifecycle transition and actor/time information;
+- the exact runner invocation policy;
+- result bytes, truncation status, and exit information; and
+- enough provenance to trace a displayed review item back to its raw source.
+
+This is an audit path, not a demand that normal operation display every artifact
+at once. The normal control surface may summarize mechanically derived facts,
+but cannot replace consequential evidence with an uncheckable summary.
+
+* Refinement rule
+
+A proposed automation or feature is admissible only when its owner can state:
+
+1. Which manual action it replaces or which new authority it intentionally adds.
+2. The exact proposal, fact, and authorization identities it preserves.
+3. Its one path from authorization to effect.
+4. Its invalidation and recovery behavior when inputs, facts, or publication
+   fail.
+5. How an operator can inspect the transformation end to end.
+
+If it creates a second authorization or execution path, it needs a stronger
+reason than convenience. If it cannot state an invalidation condition, it does
+not yet have a stable authority boundary.

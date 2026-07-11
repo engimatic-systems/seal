@@ -1,0 +1,49 @@
+#+title: Seal
+
+Seal is a human-mediated execution mailbox for LLM agents.
+
+An agent may propose code. An operator reads it, decides whether to run it in a
+configured local execution context, and receives an attributable result to
+return to the agent. Seal does not determine whether arbitrary code is safe.
+It preserves the relationship between code the operator reviewed, authority the
+operator granted, the host effect, and the reported result.
+
+Seal is currently a design repository. The first implementation target is a
+small, one-shot mailbox protocol rather than a reusable-capability system.
+
+* Caveat
+
+These documents establish Seal's reference trace, current invariants, and
+non-claims. They are not a complete v0 protocol specification or proof of an
+implementation.
+
+Several operational details remain intentionally unresolved until a concrete v0
+makes their correct shape testable. Absence of a detail is not permission to
+weaken the stated trace or introduce another authority path.
+
+* Design documents
+
+- [[file:docs/design/00-why-seal.org][Why Seal]]: the problem, the thesis, and the
+  human attention Seal is trying to preserve.
+- [[file:docs/design/00-doctrine.org][Doctrine]]: the design north star and the meaning
+  of authorized consequence.
+- [[file:docs/design/01-reference-protocol.org][Reference protocol]]: v-negative-one
+  and the deliberately small v0 mailbox.
+- [[file:docs/design/02-runtime-contract.org][Runtime contract]]: invariants every
+  implementation and future transformation must preserve.
+- [[file:docs/design/03-growth.org][Growth]]: how to add ergonomics without silently
+  widening authority.
+- [[file:docs/design/04-etymology.org][Etymology]]: why following, consequence, sign,
+  and seal name the same operational concern.
+- [[file:docs/design/05-cold-cut.org][The Cold Cut]]: human authority outside the
+  agent-writable closure.
+- [[file:docs/design/06-gradient.org][The Gradient]]: review as a deliberate,
+  accounted intervention rather than an escape from human influence.
+
+* Non-claim
+
+Running arbitrary code under an operator's normal OS identity grants that code
+the authority of that identity. Seal can make the approval exact and
+attributable; it cannot make arbitrary approved code harmless. Stronger
+confinement requires a separate OS-enforced boundary such as a restricted
+account, container, VM, or equivalent mechanism.

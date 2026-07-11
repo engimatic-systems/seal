@@ -1,0 +1,116 @@
+#+title: Reference Protocol: Manual Review to Mailbox v0
+
+* Reference semantics: v-negative-one
+
+The reference system is deliberately ordinary:
+
+1. An agent posts a block of code in chat and asks for its result.
+2. The operator reads the code and relevant local facts.
+3. The operator runs it or declines, then tells the agent why.
+4. The operator returns the command's output and status.
+
+This workflow has real toil. Reading arbitrary code is intentional toil: it is
+the point at which someone with consequences at stake makes a judgment. The
+remaining toil is a candidate for automation only when automation preserves the
+same semantic transaction.
+
+* v0 objective
+
+v0 replaces chat copy-and-paste with a mailbox. It does not automate the
+operator's judgment or create a reusable authorization system.
+
+An agent writes a single script file into its outbound mailbox. The host pulls
+that file, lets the operator inspect it, runs the reviewed snapshot once if
+approved, and pushes a result file back. The host initiates both network
+connections; the agent never receives inbound access to the host.
+
+Illustrative layout:
+
+#+begin_example
+agent mailbox/
+  proposals/<request-id>.sh
+  results/<request-id>.toml
+  results/<request-id>.stdout
+  results/<request-id>.stderr
+#+end_example
+
+The host may use any private storage layout. It must treat the remote mailbox as
+untrusted input and copy proposal bytes into host-owned storage before review.
+It must not execute directly from a remotely mutable path.
+
+* v0 proposal
+
+A proposal is one finite UTF-8 text file with a validated unique request ID.
+The file is the code to review. There are no attachments, secondary scripts,
+code references, templates, argument holes, or agent-selected interpreter
+settings in v0.
+
+v0 has no operator-side modify action. Editing a proposal creates a distinct
+host-authored object; Seal does not present that object as the agent's proposal
+or execute it through this flow. Refusal is sufficient: the agent may author a
+new proposal with a new request ID.
+
+Each Seal installation has one explicitly configured runner. Its executable,
+effective OS identity, working directory, environment policy, and resource
+limits are named review facts. The operator sees them with the full proposal
+before deciding. Multiple runtime profiles belong to a later, explicitly
+designed feature.
+
+A proposal that exceeds the configured size limit or cannot be rendered in full
+is refused. Partial display is not review.
+
+* v0 flow
+
+The eventual command names are illustrative. The protocol matters more than the
+interface.
+
+1. Agent writes =proposals/<request-id>.sh= in its mailbox.
+2. Host runs a host-initiated sync. It validates the request ID, streams bounded
+   bytes into a newly created host-owned snapshot, and records its digest.
+3. Operator opens the snapshot through a review command or pager. Seal displays
+   the complete bytes and named runner facts.
+4. Operator refuses with a reason, or approves this exact snapshot once.
+5. Seal marks the attempt started before launching the configured runner against
+   the reviewed snapshot.
+6. Seal records bounded stdout, stderr, exit status, and timing as the result.
+7. Host-initiated sync publishes the result to the agent mailbox. The agent may
+   poll; notification is not an authority mechanism.
+
+The result is durable on the host before publication. A later publication retry
+is safe because it does not rerun the command.
+
+* Deliberate exclusions
+
+v0 excludes the mechanisms most likely to make a small control surface lie:
+
+- local/shared-directory transport;
+- automatic approval or execution;
+- operator-side proposal modification;
+- reusable grants and attestations;
+- multiple scopes or lifetimes;
+- attachment trees and code-bearing arguments;
+- mutable context-change proposals;
+- agent-managed script stores;
+- multiple execution front doors;
+- a TUI requirement.
+
+A plain CLI plus pager is sufficient. Better transport, notification, and review
+presentation can arrive later without altering v0 authority.
+
+* Failure posture
+
+The host records a start transition before process launch. If it crashes or loses
+the ability to determine whether a started command completed, the outcome is
+=unknown=. It is never automatically retried. An operator resolves that case
+with knowledge of the command's potential effects.
+
+Rejected proposals receive an attributable refusal result. Duplicate request IDs
+are terminally rejected and cannot create another execution.
+
+* What v0 does not prove
+
+v0 proves mediation properties: no command should run unless an operator
+approved the exact reviewed host snapshot. It does not prove arbitrary shell
+code is safe. A script run under the operator's account can exercise that
+account's authority. Strong execution confinement is separate work and must be
+provided by the operating system or another enforcement boundary.
