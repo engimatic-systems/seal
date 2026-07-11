@@ -100,8 +100,10 @@ Deliverables:
 - explicit =--config PATH= selection;
 - default selection of =./seal.toml= only;
 - local path resolution relative to the config directory;
-- local or optional SSH peer representation;
-- pinned absolute local tool paths;
+- local or optional SSH peer representation, including a required validated
+  peer rsync executable path for SSH;
+- pinned absolute local tool paths, with the SSH path restricted for safe use
+  in rsync's remote-shell command string;
 - validated =ssh_debug_flags= and =rsync_debug_flags= with =-v= defaults;
 - inspection of the effective fixed transfer profile without making that
   profile configurable;
@@ -127,11 +129,13 @@ Deliverables:
 
 - =seal init=;
 - =seal init PEER_PATH= for a local peer;
-- =seal init PEER_PATH --ssh SSH_DESTINATION= for an SSH peer;
+- =seal init PEER_PATH --ssh SSH_DESTINATION --peer-rsync ABSOLUTE_PATH= for an
+  SSH peer;
 - initial =seal.toml= creation;
 - one local =mailbox/= directory;
 - resolution and recording of the local rsync executable and, for an SSH peer,
   the local SSH executable;
+- recording, without remote discovery, of the required peer rsync executable;
 - preflight and refusal to overwrite existing config;
 - no-partial-change behavior for locally detectable conflicts; and
 - debug output describing selected paths and intended local creation.
@@ -150,9 +154,6 @@ the current directory needs?
 Goal: move the opaque peer mailbox into the local mailbox through one explicit
 operator action.
 
-Contract decision before code: settle whether an SSH peer uses =rsync= from its
-remote =PATH= or an explicit executable through =--rsync-path=.
-
 Deliverables:
 
 - a Rust transfer plan represented as program plus argv;
@@ -163,6 +164,8 @@ Deliverables:
 - direct child-process invocation without local shell interpolation;
 - exact debug rendering of the planned subprocess;
 - pinned local process paths, trailing-slash operands, and an option terminator;
+- validated explicit =--rsync-path= for SSH peers, with no remote =PATH=
+  fallback or arbitrary remote program surface;
 - no deletion flag, source-symlink dereference flag, or configurable ordinary
   transfer flags;
 - validated diagnostic-only flags under =--debug=;
@@ -207,17 +210,22 @@ publication protocol or assigning meaning to outgoing files?
 
 Goal: expose local and peer prerequisites without changing either mailbox.
 
-Contract decisions before code: settle exact non-mutating probe commands and
-required-versus-advisory classification.
-
 Deliverables:
 
 - =seal doctor=;
 - configuration and local-path checks;
 - pinned SSH and rsync executable, version, and current-=PATH= drift checks;
-- local-peer checks or a non-interactive SSH reachability probe as applicable;
-- non-mutating peer mailbox probe through local inspection or rsync;
-- per-check status and aggregate exit status; and
+- ordered local-peer checks or the specified fixed, non-interactive SSH
+  reachability probe as applicable;
+- exact peer rsync version check through its configured absolute path;
+- explicit local rsync >= 3.2.6 and peer rsync >= 3.0.0 version gates;
+- non-mutating peer mailbox probe through local enumeration or rsync
+  =--list-only=;
+- required-error, advisory-=PATH=-drift, skipped-check, and aggregate exit
+  semantics;
+- an informational statement that non-mutating probes do not prove destination
+  write access;
+- no full transfer dry-run, file creation, or repair; and
 - exact probe commands under =--debug=.
 
 Out of scope: repair, directory creation, file transfer, credential management,

@@ -104,11 +104,12 @@ local_mailbox = "mailbox"
 
 [peer]
 path = "/home/agent/mailbox"
-ssh = "dayjob.agent"
+ssh = "experiment.agent"
+rsync = "/run/current-system/sw/bin/rsync"
 
 [tools]
-rsync = "/usr/bin/rsync"
-ssh = "/usr/bin/ssh"
+rsync = "/run/current-system/sw/bin/rsync"
+ssh = "/run/current-system/sw/bin/ssh"
 
 [debug]
 rsync_debug_flags = ["-v"]
@@ -125,15 +126,41 @@ alias from the operator's SSH configuration. Seal does not parse
 configuration contains no passwords, private keys, tokens, or agent
 credentials.
 
+An SSH peer must also name =peer.rsync= as an absolute peer-side executable
+path. A local peer must omit it. Seal does not fall back to peer =PATH= or run
+remote discovery. It passes the validated path through rsync's =--rsync-path=
+option.
+
+=peer.ssh=, =peer.rsync=, and =tools.ssh= are one conditional group: all are
+required for an SSH peer and all are absent for a local peer.
+=debug.ssh_debug_flags= is valid only for an SSH peer; when omitted there, it
+defaults to one =-v=. Unknown configuration fields are errors rather than
+silently ignored future behavior.
+
+Upstream rsync permits =--rsync-path= to contain an arbitrary shell program.
+Seal does not expose that surface: =peer.rsync= is one absolute executable path,
+not a command, argument list, or shell fragment. After the leading slash, each
+nonempty path component may contain only ASCII letters, digits, =.=, =_=, =+=,
+and =-=. The components =.= and =..= are invalid. This excludes whitespace,
+control characters, shell metacharacters, and ambiguous repeated separators.
+
 =tools.rsync= and, for an SSH peer, =tools.ssh= are absolute local executable
 paths resolved and recorded by =seal init=. Seal executes those paths rather
 than resolving tool names through =PATH= on every invocation. Pinning a path
 does not attest the bytes later found at that path.
 
+Rsync receives its remote-shell selection as one command string. To keep the
+pinned SSH executable from becoming an argument-injection surface,
+=tools.ssh= uses the same restricted absolute-path grammar as =peer.rsync=.
+Seal constructs that string only from the validated path, any command-specific
+fixed SSH options, and validated diagnostic flags. It never accepts an
+arbitrary remote-shell command string.
+
 The optional =debug= table controls only diagnostic flags used when global
-=--debug= is present. Missing fields default to one =-v= flag for each tool. An
-empty array disables underlying-tool verbosity. V0 accepts only documented
-diagnostic forms; it does not expose arbitrary SSH or rsync flag passthrough.
+=--debug= is present. Missing applicable fields default to one =-v= flag for
+each configured tool. An empty array disables underlying-tool verbosity. V0
+accepts only documented diagnostic forms; it does not expose arbitrary SSH or
+rsync flag passthrough.
 
 The fixed transfer flags are not configuration. =seal cfg= displays them, but
 the specification and obvious constants in the literate Rust source own their
@@ -161,13 +188,18 @@ to standard error so it does not replace ordinary command output.
 
 #+begin_src sh
 seal init ../other-mailbox
-seal init /home/agent/mailbox --ssh dayjob.agent
-seal init /home/agent/mailbox --ssh rosin@example.test
+seal init /home/agent/mailbox --ssh dayjob.agent \
+  --peer-rsync /run/current-system/sw/bin/rsync
+seal init /home/agent/mailbox --ssh rosin@example.test \
+  --peer-rsync /usr/bin/rsync
 #+end_src
 
 It creates an initial configuration and one local =mailbox/= directory in the
 selected directory, which defaults to the current directory. It resolves and
 records the local rsync path and, for an SSH peer, the local SSH path.
+
+=--peer-rsync PATH= is required with =--ssh= and invalid without it. =init=
+records the supplied path without contacting the peer.
 
 =init= performs no SSH connection and creates no peer directory. It refuses
 to overwrite an existing configuration. It must preflight conflicts before
@@ -179,7 +211,8 @@ making partial local changes.
 
 - selected configuration path;
 - how that path was selected;
-- configured peer path and optional SSH destination;
+- configured peer path, optional SSH destination, and required peer rsync path
+  for an SSH peer;
 - configured and resolved local mailbox;
 - Seal binary version, pinned local tool paths, debug flags, and the fixed
   transfer profile; and
@@ -192,7 +225,8 @@ modify any state.
 
 =pull= invokes rsync with the peer mailbox as source and the local mailbox as
 destination. Rsync uses the pinned SSH executable when the peer has an SSH
-destination.
+destination and passes the configured peer rsync executable through
+=--rsync-path=.
 
 =pull= does not execute mailbox content. It does not automatically invoke
 =push= or =doctor=.
@@ -204,7 +238,8 @@ applying them.
 
 =push= invokes rsync with the local mailbox as source and the peer mailbox as
 destination. Rsync uses the pinned SSH executable when the peer has an SSH
-destination.
+destination and passes the configured peer rsync executable through
+=--rsync-path=.
 
 =push= does not execute mailbox content. It does not automatically invoke
 =pull= or =doctor=.
@@ -214,21 +249,58 @@ applying them.
 
 ** =seal doctor=
 
-=doctor= performs active but non-mutating diagnostics. It checks at least:
+=doctor= performs these active but non-mutating diagnostics in order:
 
-- configuration discovery, parsing, and validation;
-- local mailbox existence and required access;
-- existence, executability, and version of pinned local tools;
-- any drift between pinned tool paths and current =PATH= resolution;
-- non-interactive SSH reachability when the peer uses SSH; and
-- peer mailbox reachability through a non-mutating local or rsync probe.
+1. Select, parse, and validate configuration. Failure is an error.
+2. Check each configured local tool path for existence and executability, then
+   run the pinned rsync =--version= and, for an SSH peer, pinned SSH =-V=.
+   The local rsync version must be at least 3.2.6 because Seal uses the
+   =--secluded-args= long option. Failure or unparseable version output is an
+   error.
+3. Resolve =rsync= and, when applicable, =ssh= through the current =PATH=.
+   A result different from the pinned path is a warning. Missing =PATH= entries
+   are also warnings because Seal still invokes the pinned paths.
+4. Check that the local mailbox exists, is a directory, and can be enumerated.
+   Failure is an error.
+5. For a local peer, check that its mailbox exists, is a directory, and can be
+   enumerated. For an SSH peer, run this fixed reachability probe with the
+   pinned SSH executable:
 
-=doctor= reports each check and returns nonzero when a required check fails. A
-successful probe describes only the facts observed during that invocation; it
-does not attest that a later transfer will succeed.
+   #+begin_example
+   ssh -n -T \
+     -o BatchMode=yes \
+     -o ClearAllForwardings=yes \
+     -o PermitLocalCommand=no \
+     -o RemoteCommand=none \
+     -o ConnectTimeout=10 \
+     PEER true
+   #+end_example
 
-=doctor= must not create directories, transfer mailbox entries, or repair a
-failure.
+   Debug mode inserts only the validated SSH debug flags before =PEER=.
+   Failure is an error.
+6. For an SSH peer, use the same fixed SSH probe profile to run the configured
+   peer rsync executable with =--version=. Require a version that supports
+   secluded arguments: rsync 3.0.0 or newer. Failure or unparseable version
+   output is an error; there is no fallback to peer =PATH=.
+7. Check peer mailbox reachability. A local peer uses another directory
+   enumeration. An SSH peer uses the pinned local rsync with =--list-only=, the
+   pinned SSH executable, =--secluded-args=, the configured =--rsync-path=, and
+   the peer mailbox as its sole source operand. Its remote-shell string uses the
+   fixed SSH options from step 5 except =-n=: rsync requires SSH standard input
+   for its protocol. Failure is an error.
+
+=doctor= reports every independent check it can perform. It marks checks that
+depend on a failed prerequisite as skipped, and returns nonzero when any
+required check fails. Warnings alone leave a zero exit status. Under =--debug=,
+each subprocess probe is shown as a structured program and argv before it runs.
+
+=doctor= must not run a full pull or push dry-run, create directories or files,
+transfer mailbox entries, or repair a failure. A non-mutating check cannot prove
+destination write access. Doctor reports that limitation as information rather
+than treating it as a warning or a successful attestation.
+
+A successful probe describes only the facts observed during that invocation;
+it does not attest that a later transfer will succeed.
 
 * Transfer semantics
 
@@ -255,10 +327,12 @@ the same fixed profile:
 --checksum
 #+end_example
 
-For an SSH peer, the profile also uses =--secluded-args= and names the pinned
-SSH executable through rsync's remote-shell option. =--checksum= selects updates
-by file content rather than rsync's default size-and-modification-time quick
-check. It improves synchronization correctness; it is not an attestation.
+For an SSH peer, the profile also uses =--secluded-args=, names the pinned SSH
+executable through rsync's remote-shell option, and supplies the configured
+peer executable as =--rsync-path=PATH=. Seal never falls back to remote =PATH=.
+=--checksum= selects updates by file content rather than rsync's default
+size-and-modification-time quick check. It improves synchronization correctness;
+it is not an attestation.
 
 The source and destination operands both use trailing slashes so the contents
 of each mailbox root synchronize into the other root. A =--= argument separates
@@ -351,6 +425,7 @@ Seal v0 does not provide:
 - code safety, symlink-target safety, or sandbox escape prevention;
 - assurance that an operator inspected the right material;
 - protection of the local rsync or SSH process from a malicious peer;
+- assurance that a configured executable path still names the same bytes;
 - a daemon, watcher, scheduler, notification system, TUI, or web UI;
 - a global mailbox registry or multiple configured mailboxes; or
 - peer directory provisioning.
@@ -358,15 +433,8 @@ Seal v0 does not provide:
 These omissions define the first implementation boundary. They are not aliases
 for hidden behavior.
 
-* Open decisions
+* Implementation readiness
 
-The implementation plan assigns these remaining decisions to the first car
-that needs them:
-
-1. Whether an SSH peer uses =rsync= from its remote =PATH= or an explicit
-   peer-side executable path through rsync's =--rsync-path= option.
-2. The exact non-mutating probes and required-versus-advisory classification
-   used by =seal doctor=.
-
-No open decision may introduce mailbox interpretation or automatic execution
-without revising this specification first.
+No open contract decision blocks the v0 train. A later discovery that changes
+peer executable selection, diagnostic mutation, mailbox interpretation, or
+automatic execution requires a specification change before implementation.
