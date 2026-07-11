@@ -1,6 +1,6 @@
 // Generated from SEAL.org; edit that file instead.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -142,6 +142,67 @@ pub fn load(selection: &Selection) -> Result<Config, Vec<String>> {
     })
 }
 
+#[derive(Serialize)]
+struct InitialConfig<'a> {
+    local_mailbox: &'static str,
+    peer: InitialPeer<'a>,
+    tools: InitialTools<'a>,
+    debug: InitialDebug,
+}
+
+#[derive(Serialize)]
+struct InitialPeer<'a> {
+    path: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rsync: Option<&'a Path>,
+}
+
+#[derive(Serialize)]
+struct InitialTools<'a> {
+    rsync: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh: Option<&'a Path>,
+}
+
+#[derive(Serialize)]
+struct InitialDebug {
+    rsync_debug_flags: [&'static str; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_debug_flags: Option<[&'static str; 1]>,
+}
+
+pub fn render_initial(
+    peer_path: &Path,
+    ssh_destination: Option<&str>,
+    peer_rsync: Option<&Path>,
+    local_rsync: &Path,
+    local_ssh: Option<&Path>,
+    config_dir: &Path,
+) -> Result<String, Vec<String>> {
+    let initial = InitialConfig {
+        local_mailbox: "mailbox",
+        peer: InitialPeer {
+            path: peer_path,
+            ssh: ssh_destination,
+            rsync: peer_rsync,
+        },
+        tools: InitialTools {
+            rsync: local_rsync,
+            ssh: local_ssh,
+        },
+        debug: InitialDebug {
+            rsync_debug_flags: ["-v"],
+            ssh_debug_flags: ssh_destination.map(|_| ["-v"]),
+        },
+    };
+    let source = toml::to_string_pretty(&initial)
+        .map_err(|error| vec![format!("cannot serialize initial configuration: {error}")])?;
+    parse(&source, config_dir)?;
+    Ok(source)
+}
+
 fn parse(source: &str, config_dir: &Path) -> Result<Config, Vec<String>> {
     let raw: RawConfig =
         toml::from_str(source).map_err(|error| vec![format!("invalid TOML: {error}")])?;
@@ -281,6 +342,15 @@ fn require<T>(value: Option<T>, message: &str, errors: &mut Vec<String>) -> Opti
         errors.push(message.to_owned());
     }
     value
+}
+
+pub fn validate_restricted_executable_path(path: &Path, field: &str) -> Result<(), String> {
+    let mut errors = Vec::new();
+    validate_restricted_executable(path, field, &mut errors);
+    match errors.pop() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn validate_restricted_executable(path: &Path, field: &str, errors: &mut Vec<String>) {
