@@ -1,0 +1,271 @@
+#+title: Seal v0 Specification
+
+* Status
+
+This is the initial specification for review. It defines the first implemented
+Seal, not the full system imagined by the design notes.
+
+Where this document and an earlier design note assign different behavior to v0,
+this document governs the implementation. The =P, W, A, E, R= trace remains a
+useful account of the manual workflow. Seal v0 does not represent or attest
+those objects itself.
+
+* Purpose
+
+Seal v0 moves one opaque mailbox directory between an agent sandbox and an
+operator-controlled machine using rsync over SSH.
+
+It replaces manual file copying. It does not replace human review, decide what
+mailbox entries mean, or execute anything found in the mailbox.
+
+The complete working loop is:
+
+#+begin_example
+agent writes remote mailbox
+operator runs seal pull
+operator inspects arbitrary mailbox material and local circumstances
+operator may manually run or modify material outside Seal
+operator may place arbitrary material in the local mailbox
+operator runs seal push
+agent reads remote mailbox
+#+end_example
+
+* Contract boundary
+
+** Authority direction
+
+- Every SSH and rsync operation is initiated by the operator.
+- Seal exposes no listener, server, callback, approval endpoint, or execution
+  endpoint to the sandbox.
+- The sandbox may mutate its remote mailbox at any time.
+- The sandbox cannot directly mutate the operator's local mailbox.
+- Remote mutation reaches the local mailbox only when the operator invokes
+  =seal pull=.
+- Local mutation reaches the remote mailbox only when the operator invokes
+  =seal push=.
+
+Host initiation limits who can start a transfer. It does not make the remote
+peer or transferred tree trustworthy.
+
+** One mailbox
+
+One Seal configuration names exactly two directory roots:
+
+- one local mailbox;
+- one remote mailbox on one SSH host.
+
+=pull= and =push= reverse the direction between those same roots. Seal does not
+assign inbox, outbox, proposal, result, request, or response roles to entries
+inside either directory.
+
+** Opaque contents
+
+Seal does not parse, lint, normalize, classify, hash, summarize, or format
+mailbox contents. Filenames, directory layout, file contents, and executable
+bits carry no meaning to Seal.
+
+The fixed rsync invocation defines which filesystem object kinds can move.
+Ordinary files, directories, and symbolic links are expected v0 material.
+Seal must not ask rsync to dereference source symbolic links. A transferred
+symbolic link remains a link; Seal makes no claim about its target or the
+consequence of following it later.
+
+Special files, devices, sockets, hard-link identity, ACLs, extended attributes,
+and other filesystem-specific objects are not promised until the fixed rsync
+argument set says otherwise.
+
+* Configuration
+
+** Discovery
+
+By default Seal reads =seal.toml= from the current working directory. An
+explicit =--config PATH= selects another file.
+
+Seal does not search parent directories, user configuration directories, or
+system configuration directories. It does not select a configuration from an
+environment variable in v0.
+
+Relative local paths are resolved relative to the directory containing the
+selected configuration file, not relative to a later subprocess working
+directory.
+
+** Initial fields
+
+The initial configuration represents only transport coordinates:
+
+#+begin_src toml
+ssh_host = "dayjob.agent"
+remote_mailbox = "/home/agent/mailbox"
+local_mailbox = "mailbox"
+#+end_src
+
+The SSH host is an SSH destination, preferably an alias configured in the
+operator's SSH configuration. Seal configuration contains no passwords,
+private keys, tokens, or agent credentials.
+
+Additional fields require concrete pressure from the working executable.
+
+* Command surface
+
+** Global options
+
+=--config PATH= selects configuration as described above.
+
+=--debug= explains Seal's own resolution and subprocess plan. Debug output goes
+to standard error so it does not replace ordinary command output.
+
+** =seal init=
+
+=init= creates an initial configuration and one local =mailbox/= directory in
+the selected directory, which defaults to the current directory.
+
+=init= performs no SSH connection and creates no remote directory. It refuses
+to overwrite an existing configuration. It must preflight conflicts before
+making partial local changes.
+
+The exact v0 interface by which =init= receives or leaves placeholders for the
+SSH host and remote mailbox remains an open decision.
+
+** =seal cfg=
+
+=cfg= is a read-only inspection command. It reports:
+
+- selected configuration path;
+- how that path was selected;
+- configured SSH host and remote mailbox;
+- configured and resolved local mailbox; and
+- validation errors or missing required values.
+
+=cfg= does not inspect local mailbox contents, contact the remote host, or
+modify any state.
+
+** =seal pull=
+
+=pull= invokes rsync over SSH with the remote mailbox as source and the local
+mailbox as destination.
+
+=pull= does not execute mailbox content. It does not automatically invoke
+=push= or =doctor=.
+
+=pull --dry-run= asks the same rsync plan to report intended changes without
+applying them.
+
+** =seal push=
+
+=push= invokes rsync over SSH with the local mailbox as source and the remote
+mailbox as destination.
+
+=push= does not execute mailbox content. It does not automatically invoke
+=pull= or =doctor=.
+
+=push --dry-run= asks the same rsync plan to report intended changes without
+applying them.
+
+** =seal doctor=
+
+=doctor= performs active but non-mutating diagnostics. It checks at least:
+
+- configuration discovery, parsing, and validation;
+- local mailbox existence and required access;
+- availability of the configured or fixed =ssh= and =rsync= executables;
+- non-interactive SSH reachability; and
+- remote mailbox reachability through a non-mutating rsync probe.
+
+=doctor= reports each check and returns nonzero when a required check fails. A
+successful probe describes only the facts observed during that invocation; it
+does not attest that a later transfer will succeed.
+
+=doctor= must not create directories, transfer mailbox entries, or repair a
+failure.
+
+* Transfer semantics
+
+Each transfer is an explicit, one-way update of one directory tree from the
+configured source toward the configured destination.
+
+V0 has:
+
+- no bidirectional reconciliation algorithm;
+- no conflict detection or merge;
+- no automatic retry;
+- no whole-tree atomicity claim;
+- no transfer history or manifest; and
+- no deletion propagation.
+
+Destination-only entries therefore remain after a transfer. When corresponding
+entries differ, the fixed rsync update policy determines whether bytes move.
+The exact update and metadata-preservation flags are an open decision for the
+=pull= train car and must then apply symmetrically to =push=.
+
+Seal invokes rsync directly as a child process. It does not interpolate config
+or mailbox data into a local command shell. Rsync remains responsible for its
+own SSH remote-shell operation.
+
+Seal inherits or relays useful child output. A child failure is visible and
+causes Seal to return nonzero. Seal does not convert partial transfer into
+success, roll it back, or retry it automatically.
+
+* Debug behavior
+
+For every command, =--debug= reports facts useful for inspecting behavior as it
+exists in that train car. As applicable, these include:
+
+- process working directory;
+- selected and resolved configuration path;
+- effective configuration values;
+- resolved local paths;
+- exact subprocess program and argv represented structurally, not as an
+  ambiguous shell command string; and
+- child exit status.
+
+Debug may add fixed diagnostic-only verbosity to SSH or rsync. Any such mapping
+must be documented and tested. Debug must not change source selection,
+destination selection, deletion behavior, symlink handling, or other transfer
+semantics. V0 exposes no arbitrary pass-through argument facility.
+
+* Failure posture
+
+- Invalid or incomplete configuration fails before transfer.
+- Missing local prerequisites fail before transfer when Seal can detect them.
+- SSH, rsync, and remote failures remain failures.
+- A partially changed destination may remain after rsync failure.
+- Recovery is an operator decision: inspect state, then explicitly run another
+  command or repair it with ordinary tools.
+- Seal does not infer that failure means nothing changed.
+
+* Non-claims
+
+Seal v0 does not provide:
+
+- automated command execution;
+- proposal, result, or request schemas;
+- representation of =P=, =W=, =A=, =E=, or =R=;
+- approval records or reusable attestations;
+- shape matching or equivalence between filesystem states;
+- immutable snapshots, digests, or execution attribution;
+- mailbox history, durable delivery, or replay protection;
+- code safety, symlink-target safety, or sandbox escape prevention;
+- assurance that an operator inspected the right material;
+- protection of the local rsync or SSH process from a malicious peer;
+- a daemon, watcher, scheduler, notification system, TUI, or web UI;
+- a global mailbox registry or multiple configured mailboxes; or
+- remote directory provisioning.
+
+These omissions define the first implementation boundary. They are not aliases
+for hidden behavior.
+
+* Open decisions
+
+The implementation plan assigns these decisions to the first car that needs
+them:
+
+1. Whether =seal init= requires remote endpoint arguments or writes an
+   incomplete, editable template.
+2. The fixed rsync recursion, metadata, update-selection, and output flags.
+3. The exact SSH and rsync verbosity added by =--debug=, if any.
+4. The stable human-readable output format for =cfg= and =doctor=.
+5. Whether executable paths are fixed program names resolved through the
+   operator's environment or explicit configuration fields.
+
+No open decision may introduce mailbox interpretation or automatic execution
+without revising this specification first.

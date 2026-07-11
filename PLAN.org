@@ -1,0 +1,290 @@
+#+title: Seal v0 Implementation Plan
+
+* Planning premise
+
+Seal deliberately replaces Bridge and Airlock. Those attempts accumulated
+command shapes, reusable authority, automated execution, and sandbox-reachable
+control surfaces. Shape approval was unsound when mutable filesystem references
+such as symbolic links could resolve to payloads outside the approved shape.
+
+V0 responds by automating only transport. The working artifact should appear
+immediately, but its Rust core must model transfer facts rather than future
+proposal or authorization concepts.
+
+* Pipeline
+
+The primary pipeline is:
+
+#+begin_example
+operator invokes verb
+  -> select and parse local config
+  -> construct one directional transfer plan
+  -> explain plan when debugging or dry-running
+  -> invoke rsync, which invokes SSH
+  -> relay output and status
+#+end_example
+
+Mailbox bytes remain opaque at every stage.
+
+| Stage | Receives | Emits | May mutate | Must not know |
+|-
+| CLI selection | argv and current directory | verb, flags, config selection | nothing | mailbox contents |
+| Configuration | selected config bytes | validated transport coordinates | nothing | proposal or result roles |
+| Planning | verb and coordinates | exact subprocess program and argv | nothing | file meaning |
+| Explanation | plan and resolved facts | human-readable diagnostics | nothing | approval state |
+| Transfer | exact subprocess plan | child output and status | configured destination tree | execution semantics |
+| Reporting | child outcome | Seal exit status | nothing | whether transferred work was good |
+
+=init= owns local bootstrap rather than transfer. =cfg= stops after
+configuration. =doctor= performs explicit non-mutating probes and stops before
+transfer.
+
+* Source and artifacts
+
+=SPEC.org= is the behavioral contract and non-claim record.
+
+=PLAN.org= records sequencing, review questions, and evidence expectations.
+
+=SEAL.org= is the literate implementation source. Reviewer-facing pseudocode
+must immediately precede the source block it explains. Tangled blocks split
+only at stable file or top-level Rust boundaries.
+
+Handwritten implementation, test, and build definitions originate in
+=SEAL.org=. Tangled outputs are checked in and identify =SEAL.org= as their
+source. Generated dependency locks and build artifacts are not literate source.
+
+Every implementation car must:
+
+- retangle successfully;
+- leave no unexplained diff after a second tangle;
+- run all tests accumulated through that car;
+- build the executable; and
+- update =SPEC.org= before code when a contract decision changes.
+
+* PR train
+
+** PR 1: Executable Seed
+
+Goal: produce the smallest inspectable Seal executable and reproducible
+literate build loop.
+
+Deliverables:
+
+- =SEAL.org= with initial narrative, pseudocode, and tangled blocks;
+- Rust package and =seal= binary skeleton;
+- =seal --help= and =seal --version=;
+- accepted global =--debug= flag with useful seed diagnostics such as process
+  working directory and binary version;
+- tangle, build, and test commands; and
+- tests for the initial CLI contract.
+
+Out of scope: configuration loading, mailbox creation, SSH, rsync, and transfer
+verbs.
+
+Evidence: a clean retangle, passing tests, successful build, and captured
+=--help= / =--debug= behavior.
+
+Review question: does the repository produce one small executable from one
+readable literate source without implying behavior it does not have?
+
+** PR 2: Configuration And =cfg=
+
+Goal: make configuration selection and effective transport coordinates directly
+inspectable.
+
+Deliverables:
+
+- initial =seal.toml= data model;
+- explicit =--config PATH= selection;
+- default selection of =./seal.toml= only;
+- local path resolution relative to the config directory;
+- validation that can report all useful field errors together;
+- read-only =seal cfg= output; and
+- expanded =--debug= output showing selection and resolved values.
+
+Out of scope: creating config, creating directories, contacting a remote host,
+and invoking rsync.
+
+Evidence: unit tests for parsing, missing fields, explicit/default selection,
+path resolution, and proof that =cfg= performs no external command.
+
+Review question: can an operator identify exactly which configuration and
+endpoints Seal would use without hidden global discovery?
+
+** PR 3: Local =init=
+
+Goal: create a reviewable current-directory Seal workspace without pretending
+to provision a global or remote mailbox.
+
+Contract decision before code: settle whether remote endpoint values arrive as
+=init= arguments or as explicit placeholders in an editable template.
+
+Deliverables:
+
+- =seal init=;
+- initial =seal.toml= creation;
+- one local =mailbox/= directory;
+- preflight and refusal to overwrite existing config;
+- no-partial-change behavior for locally detectable conflicts; and
+- debug output describing selected paths and intended local creation.
+
+Out of scope: SSH, remote directory creation, transfer, and global config.
+
+Evidence: temporary-directory tests for clean creation, existing config,
+conflicting paths, explicit config path, and absence of remote subprocesses.
+
+Review question: does =init= create only the local, operator-visible state that
+the current directory needs?
+
+** PR 4: =pull=
+
+Goal: move the opaque remote mailbox into the local mailbox through one explicit
+operator action.
+
+Contract decisions before code:
+
+- settle the fixed rsync argument set;
+- settle default update-selection semantics;
+- settle the diagnostic-only rsync and SSH verbosity used by =--debug=; and
+- record these choices in =SPEC.org=.
+
+Deliverables:
+
+- a Rust transfer plan represented as program plus argv;
+- =seal pull=;
+- =seal pull --dry-run=;
+- direct child-process invocation without local shell interpolation;
+- exact debug rendering of the planned subprocess;
+- no deletion flag and no source-symlink dereference flag;
+- relayed rsync output and failure status; and
+- focused command-construction and process-outcome tests.
+
+Out of scope: push, automatic retry, snapshots, content inspection, and any
+execution of mailbox material.
+
+Evidence: plan snapshots, a local/fake-process integration harness, successful
+and failed exit propagation, and a filesystem fixture showing that links are
+not dereferenced by the chosen transfer flags.
+
+Review question: does =pull= do exactly one visible remote-to-local transfer
+without interpreting or executing what arrives?
+
+** PR 5: =push=
+
+Goal: move the opaque local mailbox back to the same configured remote mailbox
+through one explicit operator action.
+
+Deliverables:
+
+- =seal push=;
+- =seal push --dry-run=;
+- reversal of the same validated endpoint pair;
+- the same fixed transfer semantics used by =pull=;
+- exact debug rendering and child-status propagation; and
+- tests that distinguish source and destination direction.
+
+Out of scope: automatic push after another action, result classification,
+delivery records, conflict resolution, and deletion propagation.
+
+Evidence: plan snapshots, process tests, and a fixture proving that =push= uses
+the local mailbox as source and remote mailbox as destination.
+
+Review question: is =push= the precise reverse transfer without becoming a
+publication protocol or assigning meaning to outgoing files?
+
+** PR 6: =doctor=
+
+Goal: expose local and remote prerequisites without changing either mailbox.
+
+Contract decisions before code:
+
+- settle exact non-mutating probe commands;
+- settle required versus advisory checks; and
+- settle stable human-readable check output.
+
+Deliverables:
+
+- =seal doctor=;
+- configuration and local-path checks;
+- SSH and rsync executable discovery;
+- non-interactive SSH reachability probe;
+- non-mutating remote mailbox probe through rsync;
+- per-check status and aggregate exit status; and
+- exact probe commands under =--debug=.
+
+Out of scope: repair, directory creation, file transfer, credential management,
+and promises about future availability.
+
+Evidence: fake-tool tests for success, partial failure, unavailable host,
+missing path, nonzero aggregation, and proof that probes contain no mutating
+operation.
+
+Review question: does =doctor= reveal actionable present-tense facts without
+quietly becoming setup or synchronization?
+
+** PR 7: Live Sandbox Round Trip
+
+Goal: test the complete transport-only claim against a real agent sandbox over
+SSH.
+
+Deliverables:
+
+- a disposable current-directory Seal workspace;
+- documented =init=, edit, =cfg=, and =doctor= transcript;
+- pull of a mailbox containing arbitrary directories, regular files, and
+  symbolic links;
+- operator-side mailbox modification followed by push;
+- dry-run evidence in both directions;
+- expected behavior for a failed remote connection and partial prerequisites;
+  and
+- a concise validation report with cleanup steps.
+
+Out of scope: running pulled code, proving rsync or SSH free of vulnerabilities,
+and adding behavior discovered only as a future possibility.
+
+Evidence: recorded commands, exit statuses, resulting trees on both sides, and
+cleanup confirmation.
+
+Review question: does the live artifact demonstrate host-initiated opaque
+transport, and only that claim?
+
+* Sequencing
+
+The train is linear:
+
+#+begin_example
+PR 1 executable seed
+  -> PR 2 config and cfg
+  -> PR 3 init
+  -> PR 4 pull
+  -> PR 5 push
+  -> PR 6 doctor
+  -> PR 7 live round trip
+#+end_example
+
+Later cars may refine diagnostics exposed by =--debug=. They must not retarget
+or weaken earlier review questions without first updating this plan.
+
+* V0 completion
+
+V0 is complete when an operator can, from an ordinary directory:
+
+1. initialize a local Seal workspace;
+2. inspect the exact effective configuration;
+3. diagnose local and remote prerequisites;
+4. preview and perform an explicit pull;
+5. inspect or manipulate mailbox contents with ordinary tools;
+6. preview and perform an explicit push; and
+7. inspect the commands and resolution decisions Seal made while doing so.
+
+Completion does not require Seal to run, approve, attest, classify, or retain
+history for any mailbox entry.
+
+* Deferred work
+
+No PR in this train may add automated execution, approval state, proposal or
+result schemas, reusable shapes, background synchronization, deletion
+propagation, multiple mailboxes, or another transport.
+
+Such work begins with a new specification question after the v0 executable has
+produced concrete operator experience.
