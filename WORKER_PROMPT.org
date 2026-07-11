@@ -2,18 +2,15 @@
 
 * Purpose
 
-Implement one assigned Seal v0 ticket in one isolated worktree. Produce a small,
-reviewable PR and durable evidence, then stop.
+Implement one assigned Seal v0 ticket in one isolated worktree. Produce the
+smallest clear working artifact for that car, record compact evidence, and stop.
 
-Seal v0 transports one opaque mailbox tree through local or SSH rsync semantics.
-It does not interpret, approve, attest, classify, or execute mailbox content.
-Planning PR #1 is the reviewed contract surface, not an implementation car:
-
-https://github.com/engimatic-systems/seal/pull/1
+Seal transports one opaque mailbox through local or SSH rsync semantics. It
+does not interpret, approve, attest, classify, or execute mailbox content.
 
 * Dispatch record
 
-The coordinator must fill this block before handing work to a worker:
+The coordinator fills this block for each cold worker:
 
 #+begin_example
 epic: sys-cv8p
@@ -26,123 +23,90 @@ expected_base: COMMIT
 pr: unset
 #+end_example
 
-Verify the worktree branch, target, and base commit before editing. Stop and
-report a mismatch; do not repair train topology from a worker task.
+Verify branch, target, and base before editing. Report a mismatch rather than
+repairing train topology.
 
 * Authority
 
-Read these surfaces before implementation, in this order:
+Read, in order:
 
-1. =SPEC.org=: normative v0 behavior and non-claims.
-2. Assigned tko ticket: current car scope, exclusions, acceptance, and evidence.
-3. =PLAN.org=: sequence and review question.
-4. =SEAL.org=: canonical literate implementation source once car 001 creates it.
+1. =SPEC.org= for normative behavior and non-claims.
+2. Assigned tko ticket for current scope and evidence.
+3. =PLAN.org= for sequence and review question.
+4. =SEAL.org= for canonical implementation once car 001 creates it.
 
-Chat, generated Rust files, and implementation convenience do not override
-those sources. When the spec, ticket, and plan conflict or leave a consequential
-contract ambiguous, record the conflict and stop instead of choosing policy in
-code.
+Chat, abandoned branches, generated Rust files, and implementation convenience
+do not override those surfaces. Stop on a consequential conflict.
+
+* Minimality rule
+
+Minimality is part of correctness, not a request for compressed or obscure
+code. Add a field, abstraction, helper, dependency, validation rule, or test
+only when current behavior needs it, a historical exploit boundary requires it,
+or live evidence demonstrates the pain.
+
+- Prefer one clear error over an aggregation framework.
+- Prefer direct control flow over future-facing types or extension points.
+- Prefer clear duplication over an abstraction used once.
+- Test the working path and consequential invariants, not parser-library
+  behavior or every hypothetical failure.
+- Do not add tests merely to increase review confidence numerically.
+- Do not implement later verbs, shared frameworks for later cars, aliases, or
+  compatibility behavior.
+
+When uncertain, omit the behavior and record the question.
 
 * Train topology
 
-The operator first merges planning PR #1. The coordinator then creates
-=integration/v0= from that merged default branch. Do not create the integration
-branch from an unmerged planning head.
+Each branch starts from the operator-approved =integration/v0= tip and targets
+=integration/v0=. Cars remain serial; do not prebuild tail branches.
 
-Cars are serial. Each review branch starts from the then-current
-=integration/v0= only after the preceding car is operator-approved and landed.
-Each PR targets =integration/v0=. Do not prebuild tail branches.
-
-| Car | Ticket | Review branch | Worktree suffix | Goal |
+| Car | Ticket | Branch | Goal |
 |-
-| 001 | sys-ujis | review/001-executable-seed | 001-seal-executable-seed | Literate executable seed |
-| 002 | sys-h2e1 | review/002-configuration-cfg | 002-seal-configuration-cfg | Config model and =cfg= |
-| 003 | sys-pz3f | review/003-local-init | 003-seal-local-init | Local workspace =init= |
-| 004 | sys-av6t | review/004-pull | 004-seal-pull | Explicit peer-to-local transfer |
-| 005 | sys-rx3t | review/005-push | 005-seal-push | Explicit local-to-peer transfer |
-| 006 | sys-nvdk | review/006-doctor | 006-seal-doctor | Non-mutating diagnostics |
-| 007 | sys-4e48 | review/007-live-round-trip | 007-seal-live-round-trip | Local and live SSH validation |
+| 001 | sys-ujis | review/001-executable-seed | Literate executable seed |
+| 002 | sys-h2e1 | review/002-configuration-cfg | Config and =cfg= |
+| 003 | sys-pz3f | review/003-local-init | Local =init= |
+| 004 | sys-av6t | review/004-pull | Peer-to-local transfer |
+| 005 | sys-rx3t | review/005-push | Local-to-peer reversal |
+| 006 | sys-4e48 | review/006-live-ssh-smoke | Tactile SSH round trip |
 
 Do not merge PRs. Do not advance or retarget the train unless the operator asks.
 
-* Role boundary
+=sys-nvdk= defines a possible later =doctor= command. It is not a v0 car.
 
-The operator approves each car and any movement of the train. The coordinator
-creates integration state and worktrees, dispatches one ready ticket, verifies
-integration-critical evidence, updates ticket status, and lands only approved
-work.
+* Literate source
 
-The worker edits only the assigned worktree, implements one ticket, runs
-accumulated checks, commits, pushes, opens a PR against the dispatched target,
-and records evidence. The worker may add a readable evidence note to the ticket
-and run =tko lint TICKET_ID=. The worker does not close the ticket.
-
-* Literate source discipline
-
-- Edit =SEAL.org= first for handwritten implementation, test, and build
-  definitions. Do not hand-edit a tangled output into a divergent source.
-- Put reviewer-facing pseudocode immediately before consequential source blocks.
+- Edit =SEAL.org= before handwritten tangled outputs.
+- Put reviewer-facing pseudocode immediately before consequential blocks.
 - Split blocks only at stable file or top-level Rust boundaries.
-- Make tangled outputs identify =SEAL.org= as their source.
-- Keep =Cargo.lock= as generated dependency output outside literate ownership.
-- Tangle twice. The second tangle must leave no unexplained diff.
-- Add an abstraction or dependency only when the current car needs it. Record
-  the reason when it enlarges the review surface.
+- Keep generated dependency locks outside literate ownership.
+- Tangle twice; the second tangle must leave no unexplained diff.
 
 * Hard boundaries
 
-Every car excludes automated execution, proposal/result schemas, approval,
-attestation, reusable shapes, mailbox interpretation, deletion propagation,
-configurable ordinary transfer flags, background behavior, multiple mailboxes,
-credential management, and any transport other than the specified local/SSH
-rsync path.
+Every car excludes automated execution, approval, attestation, mailbox schemas,
+content interpretation, deletion, background behavior, multiple mailboxes,
+credential management, remote executable discovery or pinning, and transports
+other than local/SSH rsync.
 
-Car-specific boundaries:
+Car boundaries:
 
 - 001: no config, mailbox, SSH, rsync, or later-verb stubs.
-- 002: no filesystem creation, peer contact, or external process execution.
-- 003: no peer contact, peer provisioning, transfer, or global state.
-- 004: pull only; no push, retry, rollback, dereference, delete, or content use.
-- 005: reverse direction only; no publication or result semantics.
-- 006: no transfer dry-run, write probe, setup, repair, or mutation.
-- 007: validation and contract-required defect repair only. Use disposable state,
-  keep =agent-dayjob-01= powered off, and do not claim VM lifecycle authority.
+- 002: no creation, peer contact, subprocess, or aggregate-error framework.
+- 003: no peer contact, remote discovery, transfer, or filesystem transaction
+  framework.
+- 004: pull only; no push, retry, rollback, delete, or source-link dereference.
+- 005: direction reversal only; no separate transport machinery.
+- 006: evidence and contract-required defect repair only. Keep
+  =agent-dayjob-01= powered off.
 
-New config fields, passthrough flags, automatic behavior, mutation in =doctor=,
-or another transport are stop conditions. Update the spec for operator review
-before implementing any contract change.
-
-* Required evidence
-
-Before handing the car back, provide:
-
-- branch, base commit, final commit, PR URL, and PR base;
-- concise changed-file and behavior summary;
-- first-tangle result and clean second-tangle result;
-- formatter, accumulated test, and build commands with exit status;
-- car-specific plan snapshots, CLI transcripts, fixtures, or live observations
-  required by the ticket;
-- explicit residual risks, unsupported claims, and unresolved questions; and
-- clean worktree status apart from intentional committed artifacts.
-
-Mocked process tests do not substitute for car 007 live evidence. Live evidence
-does not expand the behavioral claim beyond =SPEC.org=.
-
-Record durable results from =/home/rosin/sys= with a short titled note:
-
-#+begin_src sh
-PATH=/home/rosin/.local/bin:$PATH \
-  tko add-note --title "Implementation evidence" \
-  --body "BRANCH, COMMIT, PR, COMMANDS, RESULTS, RISKS" TICKET_ID
-PATH=/home/rosin/.local/bin:$PATH tko lint TICKET_ID
-#+end_src
-
-Use readable Org in the actual note body; the example names required content,
-not a literal one-line format.
+Debug config accepts an empty value or one of =-v=, =-vv=, and =-vvv= for each
+tool, defaulting to =-v=. Do not implement rsync =--debug=, =--info=, arbitrary
+flags, or a general diagnostic-argument parser.
 
 * Worker return
 
-Return this compact record to the coordinator:
+Commit, push, open one PR against the dispatched target, and record:
 
 #+begin_example
 ticket:
@@ -152,8 +116,13 @@ commit:
 pr:
 changed:
 checks:
-evidence note:
+representative behavior:
 risks or questions:
 #+end_example
 
-Stop after return. Do not begin the next ticket.
+Required checks are clean second tangle, formatter, current tests, and build.
+Add only the car-specific interaction or fixture named by its ticket. Keep the
+ticket note readable and run =tko lint TICKET_ID=.
+
+Stop after return. Do not review your own work as a separate phase and do not
+begin the next ticket.
