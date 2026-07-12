@@ -726,13 +726,19 @@ absolute_init_path :: proc(path: string) -> (string, bool) {
 
 ** Tool discovery
 
-Pseudocode:
+Example: for =PATH=/usr/bin/:/usr/local/bin:/home/agent/.local/bin= and tool
+=rsync=:
 
-1. Split the supplied =PATH= using platform path-list rules.
-2. Inspect each named candidate without invoking it.
-3. Return the first regular file executable by the current process as an owned
-   absolute path.
-4. Return no candidate when the tool is absent; do not search elsewhere.
+1. Split three entries: =/usr/bin/=, =/usr/local/bin=, and
+   =/home/agent/.local/bin=.
+2. Inspect =/usr/bin/rsync=, =/usr/local/bin/rsync=, then
+   =/home/agent/.local/bin/rsync= in that order.
+3. =stat= follows a symlink and requires a regular target; =X_OK= requires
+   executable access; absolute-path resolution records canonical identity. The
+   first candidate satisfying all three checks wins.
+
+Dangling symlinks and nonregular targets are rejected. An empty =PATH= entry
+means the current directory.
 
 #+begin_src odin :tangle seal/init.odin :name init-tool-discovery
 resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
