@@ -665,27 +665,75 @@ load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
 
 * Local initialization
 
-Initialization owns creation of one configuration file and its sibling
-=mailbox/= directory. It has no peer or transfer behavior.
+Initialization creates one configuration file and its sibling =mailbox/=
+directory without contacting the peer.
 
-** Package, imports, and path lookup
+Expected dataflow and mutation boundary:
 
-Pseudocode:
+#+begin_example
+run_init -> PATH -> initialize_workspace
+  -> resolve config/mailbox paths
+  -> preflight
+  -> validate peer
+  -> resolve rsync / conditional ssh
+  -> render config
+  -> MUTATION: mkdir mailbox
+  -> exclusive config write
+  -> bounded rollback
+  -> report paths
+#+end_example
 
-1. Split the supplied =PATH= using the platform path-list rules.
-2. For each entry, inspect the named candidate without invoking it.
-3. Select the first regular file executable by the current process and record
-   its clean absolute path.
-4. Return no candidate when the tool is absent; do not search elsewhere.
+CLI and =PATH= inputs are borrowed. Initialization returns owned config/mailbox
+paths and owns resolved tool paths plus rendered text while working. After
+mutation begins, rollback removes the new mailbox only when config creation
+fails; it does not alter pre-existing paths or unrelated state.
 
-#+begin_src odin :tangle seal/init.odin :name init-package-path-lookup
+** Package and imports
+
+Initialization uses Odin core filesystem, formatting, string, and POSIX access
+facilities.
+
+#+begin_src odin :tangle seal/init.odin :name init-package-imports
 package main
 
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sys/posix"
+#+end_src
 
+** Output path resolution
+
+=absolute_init_path= returns an owned clean absolute selected configuration path.
+
+#+begin_src odin :tangle seal/init.odin :name init-output-path-resolution
+absolute_init_path :: proc(path: string) -> (string, bool) {
+	if filepath.is_abs(path) {
+		cleaned, clean_error := filepath.clean(path)
+		return cleaned, clean_error == nil
+	}
+	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+	if cwd_error != nil {
+		return "", false
+	}
+	defer delete(cwd)
+	absolute, join_error := filepath.join([]string{cwd, path})
+	return absolute, join_error == nil
+}
+#+end_src
+
+** Tool discovery
+
+Pseudocode:
+
+1. Split the supplied =PATH= using platform path-list rules.
+2. Inspect each named candidate without invoking it.
+3. Return the first regular file executable by the current process as an owned
+   absolute path.
+4. Return no candidate when the tool is absent; do not search elsewhere.
+
+#+begin_src odin :tangle seal/init.odin :name init-tool-discovery
 resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 	directories, split_error := os.split_path_list(path_value, context.allocator)
 	if split_error != nil {
@@ -733,96 +781,81 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 	}
 	return "", false
 }
-
-absolute_init_path :: proc(path: string) -> (string, bool) {
-	if filepath.is_abs(path) {
-		cleaned, clean_error := filepath.clean(path)
-		return cleaned, clean_error == nil
-	}
-	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-	if cwd_error != nil {
-		return "", false
-	}
-	defer delete(cwd)
-	absolute, join_error := filepath.join([]string{cwd, path})
-	return absolute, join_error == nil
-}
 #+end_src
 
-** Plain configuration rendering
+** Configuration projection
 
 Pseudocode:
 
-1. Accept only printable ASCII values excluding double quote and backslash.
-2. Emit each accepted value as one quoted scalar without escapes.
-3. Emit only =local_mailbox=, =[peer]=, and =[tools]= fields, adding both SSH
-   fields together for an SSH peer.
-4. Return owned text that the existing configuration parser can read.
+1. Require each interpolated peer and tool scalar to be printable ASCII without
+   double quote or backslash.
+2. Select the local template when peer SSH is absent; otherwise select the SSH
+   template containing both SSH fields.
+3. Return owned text containing no debug fields and exactly one trailing newline.
 
-#+begin_src odin :tangle seal/init.odin :name init-config-rendering
-write_init_string :: proc(builder: ^strings.Builder, value: string) -> bool {
+#+begin_src odin :tangle seal/init.odin :name init-config-projection
+init_scalar_representable :: proc(value: string) -> bool {
 	for byte_value in transmute([]byte)value {
 		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '"' || byte_value == '\\' {
 			return false
 		}
 	}
-	strings.write_byte(builder, '"')
-	strings.write_string(builder, value)
-	strings.write_byte(builder, '"')
 	return true
 }
+
+INIT_LOCAL_CONFIG_TEMPLATE :: `local_mailbox = "mailbox"
+
+[peer]
+path = "%s"
+
+[tools]
+rsync = "%s"
+`
+
+INIT_SSH_CONFIG_TEMPLATE :: `local_mailbox = "mailbox"
+
+[peer]
+path = "%s"
+ssh = "%s"
+
+[tools]
+rsync = "%s"
+ssh = "%s"
+`
 
 render_init_config :: proc(
 	peer_path, peer_ssh: string,
 	rsync, ssh: string,
 ) -> (string, bool) {
-	builder := strings.builder_make()
-	defer strings.builder_destroy(&builder)
-	ssh_peer := len(peer_ssh) > 0
-
-	strings.write_string(&builder, "local_mailbox = ")
-	if !write_init_string(&builder, "mailbox") {
-		return "", false
-	}
-	strings.write_string(&builder, "\n\n[peer]\npath = ")
-	if !write_init_string(&builder, peer_path) {
-		return "", false
-	}
-	if ssh_peer {
-		strings.write_string(&builder, "\nssh = ")
-		if !write_init_string(&builder, peer_ssh) {
+	values := []string{peer_path, peer_ssh, rsync, ssh}
+	for value in values {
+		if !init_scalar_representable(value) {
 			return "", false
 		}
 	}
-	strings.write_string(&builder, "\n\n[tools]\nrsync = ")
-	if !write_init_string(&builder, rsync) {
-		return "", false
+	if len(peer_ssh) == 0 {
+		return fmt.aprintf(
+			INIT_LOCAL_CONFIG_TEMPLATE,
+			peer_path,
+			rsync,
+		), true
 	}
-	if ssh_peer {
-		strings.write_string(&builder, "\nssh = ")
-		if !write_init_string(&builder, ssh) {
-			return "", false
-		}
-	}
-	strings.write_byte(&builder, '\n')
-	return strings.clone(strings.to_string(builder)), true
+	return fmt.aprintf(
+		INIT_SSH_CONFIG_TEMPLATE,
+		peer_path,
+		peer_ssh,
+		rsync,
+		ssh,
+	), true
 }
 #+end_src
 
-** Workspace creation
+** Filesystem preflight
 
-Pseudocode:
+=path_conflicts= distinguishes an existing path, a missing path, and an
+inspection failure without mutation.
 
-1. Resolve the exact selected configuration path and sibling =mailbox/= path.
-2. Refuse either existing path before resolving tools or mutating the
-   filesystem.
-3. Resolve =rsync= and conditional =ssh= from the supplied =PATH= and render a
-   parser-compatible configuration.
-4. Create the mailbox directory, then exclusively create and write the config.
-5. On a config create/write failure, remove only paths created by this call.
-6. Return both created paths; do not inspect or contact the peer.
-
-#+begin_src odin :tangle seal/init.odin :name init-workspace
+#+begin_src odin :tangle seal/init.odin :name init-filesystem-preflight
 path_conflicts :: proc(path: string) -> (conflicts, inspect_failed: bool) {
 	info, stat_error := os.lstat(path, context.allocator)
 	if stat_error == nil {
@@ -834,7 +867,17 @@ path_conflicts :: proc(path: string) -> (conflicts, inspect_failed: bool) {
 	}
 	return false, true
 }
+#+end_src
 
+** Exclusive config creation
+
+Pseudocode:
+
+1. Open the selected path for exclusive creation.
+2. Write all rendered bytes and close the file.
+3. Remove a partial file when write, close, or byte-count validation fails.
+
+#+begin_src odin :tangle seal/init.odin :name init-exclusive-config-creation
 write_new_config :: proc(path, text: string) -> bool {
 	file, open_error := os.open(
 		path,
@@ -852,7 +895,20 @@ write_new_config :: proc(path, text: string) -> bool {
 	}
 	return true
 }
+#+end_src
 
+** Workspace orchestration
+
+Pseudocode:
+
+1. Resolve the selected config and sibling mailbox paths.
+2. Refuse either existing path, then require a nonempty peer path.
+3. Resolve =rsync= and conditional =ssh= from supplied =PATH= and render config.
+4. Create the mailbox, then exclusively create and write config.
+5. If config creation fails, remove only the mailbox created by this call.
+6. Return both owned paths without inspecting or contacting the peer.
+
+#+begin_src odin :tangle seal/init.odin :name init-workspace-orchestration
 initialize_workspace :: proc(
 	selected_path, peer_path, peer_ssh: string,
 	path_value: string,
@@ -923,11 +979,12 @@ initialize_workspace :: proc(
 }
 #+end_src
 
-** Init command
+** Command adapter
 
-The command supplies the process environment and reports only local paths.
+=run_init= borrows process inputs, supplies =PATH=, reports owned result paths,
+and releases them after reporting.
 
-#+begin_src odin :tangle seal/init.odin :name init-command
+#+begin_src odin :tangle seal/init.odin :name init-command-adapter
 run_init :: proc(cli: Cli) -> int {
 	path_value := os.get_env("PATH", context.allocator)
 	defer delete(path_value)

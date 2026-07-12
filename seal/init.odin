@@ -1,11 +1,28 @@
-// BEGIN org:block init-package-path-lookup
+// BEGIN org:block init-package-imports
 package main
 
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sys/posix"
-
+// END org:block init-package-imports
+// BEGIN org:block init-output-path-resolution
+absolute_init_path :: proc(path: string) -> (string, bool) {
+	if filepath.is_abs(path) {
+		cleaned, clean_error := filepath.clean(path)
+		return cleaned, clean_error == nil
+	}
+	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+	if cwd_error != nil {
+		return "", false
+	}
+	defer delete(cwd)
+	absolute, join_error := filepath.join([]string{cwd, path})
+	return absolute, join_error == nil
+}
+// END org:block init-output-path-resolution
+// BEGIN org:block init-tool-discovery
 resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 	directories, split_error := os.split_path_list(path_value, context.allocator)
 	if split_error != nil {
@@ -53,71 +70,64 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 	}
 	return "", false
 }
-
-absolute_init_path :: proc(path: string) -> (string, bool) {
-	if filepath.is_abs(path) {
-		cleaned, clean_error := filepath.clean(path)
-		return cleaned, clean_error == nil
-	}
-	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-	if cwd_error != nil {
-		return "", false
-	}
-	defer delete(cwd)
-	absolute, join_error := filepath.join([]string{cwd, path})
-	return absolute, join_error == nil
-}
-// END org:block init-package-path-lookup
-// BEGIN org:block init-config-rendering
-write_init_string :: proc(builder: ^strings.Builder, value: string) -> bool {
+// END org:block init-tool-discovery
+// BEGIN org:block init-config-projection
+init_scalar_representable :: proc(value: string) -> bool {
 	for byte_value in transmute([]byte)value {
 		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '"' || byte_value == '\\' {
 			return false
 		}
 	}
-	strings.write_byte(builder, '"')
-	strings.write_string(builder, value)
-	strings.write_byte(builder, '"')
 	return true
 }
+
+INIT_LOCAL_CONFIG_TEMPLATE :: `local_mailbox = "mailbox"
+
+[peer]
+path = "%s"
+
+[tools]
+rsync = "%s"
+`
+
+INIT_SSH_CONFIG_TEMPLATE :: `local_mailbox = "mailbox"
+
+[peer]
+path = "%s"
+ssh = "%s"
+
+[tools]
+rsync = "%s"
+ssh = "%s"
+`
 
 render_init_config :: proc(
 	peer_path, peer_ssh: string,
 	rsync, ssh: string,
 ) -> (string, bool) {
-	builder := strings.builder_make()
-	defer strings.builder_destroy(&builder)
-	ssh_peer := len(peer_ssh) > 0
-
-	strings.write_string(&builder, "local_mailbox = ")
-	if !write_init_string(&builder, "mailbox") {
-		return "", false
-	}
-	strings.write_string(&builder, "\n\n[peer]\npath = ")
-	if !write_init_string(&builder, peer_path) {
-		return "", false
-	}
-	if ssh_peer {
-		strings.write_string(&builder, "\nssh = ")
-		if !write_init_string(&builder, peer_ssh) {
+	values := []string{peer_path, peer_ssh, rsync, ssh}
+	for value in values {
+		if !init_scalar_representable(value) {
 			return "", false
 		}
 	}
-	strings.write_string(&builder, "\n\n[tools]\nrsync = ")
-	if !write_init_string(&builder, rsync) {
-		return "", false
+	if len(peer_ssh) == 0 {
+		return fmt.aprintf(
+			INIT_LOCAL_CONFIG_TEMPLATE,
+			peer_path,
+			rsync,
+		), true
 	}
-	if ssh_peer {
-		strings.write_string(&builder, "\nssh = ")
-		if !write_init_string(&builder, ssh) {
-			return "", false
-		}
-	}
-	strings.write_byte(&builder, '\n')
-	return strings.clone(strings.to_string(builder)), true
+	return fmt.aprintf(
+		INIT_SSH_CONFIG_TEMPLATE,
+		peer_path,
+		peer_ssh,
+		rsync,
+		ssh,
+	), true
 }
-// END org:block init-config-rendering
-// BEGIN org:block init-workspace
+// END org:block init-config-projection
+// BEGIN org:block init-filesystem-preflight
 path_conflicts :: proc(path: string) -> (conflicts, inspect_failed: bool) {
 	info, stat_error := os.lstat(path, context.allocator)
 	if stat_error == nil {
@@ -129,7 +139,8 @@ path_conflicts :: proc(path: string) -> (conflicts, inspect_failed: bool) {
 	}
 	return false, true
 }
-
+// END org:block init-filesystem-preflight
+// BEGIN org:block init-exclusive-config-creation
 write_new_config :: proc(path, text: string) -> bool {
 	file, open_error := os.open(
 		path,
@@ -147,7 +158,8 @@ write_new_config :: proc(path, text: string) -> bool {
 	}
 	return true
 }
-
+// END org:block init-exclusive-config-creation
+// BEGIN org:block init-workspace-orchestration
 initialize_workspace :: proc(
 	selected_path, peer_path, peer_ssh: string,
 	path_value: string,
@@ -216,8 +228,8 @@ initialize_workspace :: proc(
 	}
 	return config_path, mailbox_path, "", true
 }
-// END org:block init-workspace
-// BEGIN org:block init-command
+// END org:block init-workspace-orchestration
+// BEGIN org:block init-command-adapter
 run_init :: proc(cli: Cli) -> int {
 	path_value := os.get_env("PATH", context.allocator)
 	defer delete(path_value)
@@ -243,4 +255,4 @@ run_init :: proc(cli: Cli) -> int {
 	info("mailbox", mailbox_path)
 	return 0
 }
-// END org:block init-command
+// END org:block init-command-adapter
