@@ -53,12 +53,12 @@ aggregation system. =init= writes the same plain subset.
 
 | Car | Ticket | Branch | Goal |
 |-
-| 001 | assigned Odin seed ticket | =review/odin-v0/001-executable-seed= | Literate Odin executable |
-| 002 | assigned Odin config ticket | =review/odin-v0/002-configuration-cfg= | Subset parser and =cfg= |
-| 003 | assigned Odin init ticket | =review/odin-v0/003-local-init= | Local =init= |
-| 004 | assigned Odin pull ticket | =review/odin-v0/004-pull= | Peer-to-local transfer |
-| 005 | assigned Odin push ticket | =review/odin-v0/005-push= | Direction reversal |
-| 006 | assigned Odin smoke ticket | =review/odin-v0/006-live-ssh-smoke= | Live SSH evidence |
+| 001 | =sys-cqph= | =review/odin-v0/001-executable-seed= | Literate Odin executable |
+| 002 | =sys-431a= | =review/odin-v0/002-configuration-cfg= | Subset parser and =cfg= |
+| 003 | =sys-vjl0= | =review/odin-v0/003-local-init= | Local =init= |
+| 004 | =sys-9j00= | =review/odin-v0/004-pull= | Peer-to-local transfer |
+| 005 | =sys-v0as= | =review/odin-v0/005-push= | Direction reversal |
+| 006 | =sys-qebr= | =review/odin-v0/006-live-ssh-smoke= | Live SSH evidence |
 
 Car 001 targets =integration/v0-odin=. Each later PR targets its predecessor
 branch. Construct the complete stack before operator review. Workers are cold:
