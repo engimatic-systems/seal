@@ -1,0 +1,5 @@
+# BEGIN org:block gitignore
+# Generated from SEAL.org. Edit the Org source.
+/.ephemera/
+/seal.bin
+# END org:block gitignore
