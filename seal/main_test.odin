@@ -22,11 +22,21 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, invalid.invalid, "pull")
 
 	testing.expect_value(t, VERSION, "0.1.0")
-	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS] cfg"))
+	testing.expect(t, strings.contains(HELP_TEXT, "seal [OPTIONS] cfg"))
 
 	cfg := parse_args([]string{"--config", "elsewhere.toml", "cfg"})
 	testing.expect_value(t, cfg.action, Cli_Action.Cfg)
 	testing.expect_value(t, cfg.config, "elsewhere.toml")
 	testing.expect(t, cfg.explicit_config)
+
+	init := parse_args([]string{"--config", "workspace/seal.toml", "init", "peer/mailbox"})
+	testing.expect_value(t, init.action, Cli_Action.Init)
+	testing.expect_value(t, init.peer_path, "peer/mailbox")
+	testing.expect(t, !init.explicit_peer_ssh)
+
+	ssh_init := parse_args([]string{"init", "/home/agent/mailbox", "--ssh", "experiment.agent"})
+	testing.expect_value(t, ssh_init.action, Cli_Action.Init)
+	testing.expect_value(t, ssh_init.peer_ssh, "experiment.agent")
+	testing.expect(t, ssh_init.explicit_peer_ssh)
 }
 // END org:block visible-seed-test

@@ -22,7 +22,9 @@ SSH_TRANSFER_FLAG :: "--secluded-args"
 HELP_TEXT :: `Seal
 Operator-initiated opaque mailbox transport
 
-Usage: seal [OPTIONS] cfg
+Usage:
+  seal [OPTIONS] cfg
+  seal [OPTIONS] init PEER_PATH [--ssh SSH_DESTINATION]
 
 Options:
   --config PATH Select configuration instead of ./seal.toml
@@ -56,17 +58,21 @@ debug :: proc(label, value: string) {
 Cli_Action :: enum {
 	Run,
 	Cfg,
+	Init,
 	Help,
 	Version,
 	Invalid,
 }
 
 Cli :: struct {
-	action:   Cli_Action,
-	debug:    bool,
-	config:   string,
+	action:          Cli_Action,
+	debug:           bool,
+	config:          string,
 	explicit_config: bool,
-	invalid:  string,
+	peer_path:       string,
+	peer_ssh:        string,
+	explicit_peer_ssh: bool,
+	invalid:         string,
 }
 // END org:block cli-state
 // BEGIN org:block parse-args
@@ -89,6 +95,23 @@ parse_args :: proc(args: []string) -> Cli {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.action = .Cfg
+		case "init":
+			if cli.action != .Run || i + 1 >= len(args) {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.action = .Init
+			i += 1
+			cli.peer_path = args[i]
+		case "--ssh":
+			if cli.action != .Init || cli.explicit_peer_ssh || i + 1 >= len(args) {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			i += 1
+			if len(args[i]) == 0 {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.peer_ssh = args[i]
+			cli.explicit_peer_ssh = true
 		case "-h", "--help":
 			cli.action = .Help
 		case "-V", "--version":
@@ -219,6 +242,8 @@ run :: proc(args: []string) -> int {
 		return 2
 	case .Cfg:
 		return run_cfg(cli)
+	case .Init:
+		return run_init(cli)
 	case .Run:
 	}
 
