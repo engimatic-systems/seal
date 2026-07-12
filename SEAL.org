@@ -978,6 +978,8 @@ VERSION :: "0.1.0"
 
 DEFAULT_CONFIG_PATH :: "./seal.toml"
 
+INIT_USAGE :: "seal init PEER_PATH [--ssh SSH_DESTINATION]"
+
 TRANSFER_FLAGS := [?]string{
 	"--recursive",
 	"--links",
@@ -1039,6 +1041,7 @@ Cli_Action :: enum {
 	Run,
 	Cfg,
 	Init,
+	Init_Usage,
 	Help,
 	Version,
 	Invalid,
@@ -1064,8 +1067,8 @@ Pseudocode:
 2. Record global =--debug= and the one =--config PATH= value.
 3. Select =cfg=, =init PEER_PATH=, help, or version for their exact spellings.
 4. Accept =--ssh SSH_DESTINATION= only once and only after =init=.
-5. Reject missing values, repeated actions, and unknown arguments with the
-   first offending spelling.
+5. Classify a missing init peer as init usage; reject other missing values,
+   repeated actions, and unknown arguments with the first offending spelling.
 6. Otherwise retain the seed's empty successful run.
 
 #+begin_src odin :tangle seal/main.odin :name parse-args
@@ -1089,8 +1092,11 @@ parse_args :: proc(args: []string) -> Cli {
 			}
 			cli.action = .Cfg
 		case "init":
-			if cli.action != .Run || i + 1 >= len(args) {
+			if cli.action != .Run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			if i + 1 >= len(args) {
+				return Cli{action = .Init_Usage, debug = cli.debug}
 			}
 			cli.action = .Init
 			i += 1
@@ -1232,7 +1238,8 @@ run_cfg :: proc(cli: Cli) -> int {
 Pseudocode:
 
 1. Parse arguments and service help or version without filesystem access.
-2. Reject an unknown argument with a plain error and nonzero status.
+2. Report malformed init shape as usage; reject unknown arguments with a plain
+   error and nonzero status.
 3. Dispatch =cfg= to read-only configuration display and =init= to local
    workspace creation.
 4. For an ordinary run without debug, retain seed success without output.
@@ -1250,6 +1257,9 @@ run :: proc(args: []string) -> int {
 	case .Version:
 		fmt.printfln("seal %s", VERSION)
 		return 0
+	case .Init_Usage:
+		error("usage", INIT_USAGE)
+		return 2
 	case .Invalid:
 		error("unexpected argument", cli.invalid)
 		return 2
@@ -1335,6 +1345,13 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, ssh_init.action, Cli_Action.Init)
 	testing.expect_value(t, ssh_init.peer_ssh, "experiment.agent")
 	testing.expect(t, ssh_init.explicit_peer_ssh)
+}
+
+@(test)
+test_missing_init_peer_uses_init_usage :: proc(t: ^testing.T) {
+	missing_peer := parse_args([]string{"init"})
+	testing.expect_value(t, missing_peer.action, Cli_Action.Init_Usage)
+	testing.expect_value(t, INIT_USAGE, "seal init PEER_PATH [--ssh SSH_DESTINATION]")
 }
 #+end_src
 

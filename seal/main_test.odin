@@ -39,4 +39,11 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, ssh_init.peer_ssh, "experiment.agent")
 	testing.expect(t, ssh_init.explicit_peer_ssh)
 }
+
+@(test)
+test_missing_init_peer_uses_init_usage :: proc(t: ^testing.T) {
+	missing_peer := parse_args([]string{"init"})
+	testing.expect_value(t, missing_peer.action, Cli_Action.Init_Usage)
+	testing.expect_value(t, INIT_USAGE, "seal init PEER_PATH [--ssh SSH_DESTINATION]")
+}
 // END org:block visible-seed-test

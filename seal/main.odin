@@ -10,6 +10,8 @@ VERSION :: "0.1.0"
 
 DEFAULT_CONFIG_PATH :: "./seal.toml"
 
+INIT_USAGE :: "seal init PEER_PATH [--ssh SSH_DESTINATION]"
+
 TRANSFER_FLAGS := [?]string{
 	"--recursive",
 	"--links",
@@ -60,6 +62,7 @@ Cli_Action :: enum {
 	Run,
 	Cfg,
 	Init,
+	Init_Usage,
 	Help,
 	Version,
 	Invalid,
@@ -97,8 +100,11 @@ parse_args :: proc(args: []string) -> Cli {
 			}
 			cli.action = .Cfg
 		case "init":
-			if cli.action != .Run || i + 1 >= len(args) {
+			if cli.action != .Run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			if i + 1 >= len(args) {
+				return Cli{action = .Init_Usage, debug = cli.debug}
 			}
 			cli.action = .Init
 			i += 1
@@ -234,6 +240,9 @@ run :: proc(args: []string) -> int {
 	case .Version:
 		fmt.printfln("seal %s", VERSION)
 		return 0
+	case .Init_Usage:
+		error("usage", INIT_USAGE)
+		return 2
 	case .Invalid:
 		error("unexpected argument", cli.invalid)
 		return 2
