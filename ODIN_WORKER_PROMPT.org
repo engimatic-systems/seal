@@ -1,0 +1,79 @@
+#+title: Seal v0 Odin Worker Handoff
+
+* Assignment
+
+Implement exactly one dispatched Odin car. Return one committed, pushed,
+incremental PR and stop.
+
+The coordinator supplies:
+
+#+begin_example
+epic: ODIN_EPIC_ID
+ticket: TICKET_ID
+car: CAR_NUMBER
+worktree: WORKTREE
+branch: BRANCH
+target: TARGET
+expected_base: COMMIT
+#+end_example
+
+Verify topology before editing. Report mismatch; do not repair it.
+
+* Authority
+
+Read =SPEC.org=, assigned ticket, =ODIN_PLAN.org=, relevant car in =PLAN.org=,
+then =SEAL.org= when it exists. The Rust train is neither a source tree nor an
+implementation template. Operator-visible behavior must match; Odin code shape
+must stand on its own.
+
+* Minimality
+
+Build smallest clear artifact for current car. Add fields, types, procedures,
+files, validation, and tests only for current behavior, historical safety
+boundaries in =SPEC.org=, or observed smoke friction.
+
+- Direct control flow over future-facing abstractions.
+- Clear duplication over a one-use abstraction.
+- One useful error over aggregated diagnostics.
+- Consequential behavior tests over parser or standard-library enumeration.
+- No later verb stubs or tail prebuilding.
+
+Car 002 implements exactly the TOML subset in =ODIN_PLAN.org=. Keep it inside
+=seal/config.odin=; it is not a general parser package.
+
+* Source and checks
+
+Edit =SEAL.org= first. Tangled Odin files identify their literate ownership.
+Use reviewer-facing pseudocode before consequential blocks and stable top-level
+block boundaries. Follow 8x16's plain package organization, named constants,
+direct procedures, tabs, =-vet-style=, and =-vet-tabs=.
+
+Run two tangles, require clean generated output after the second, then:
+
+#+begin_src sh
+odin check seal -vet-style -vet-tabs
+odin test seal -vet-style -vet-tabs
+odin build seal -out:./seal.bin -vet-style -vet-tabs
+#+end_src
+
+Use =nix shell nixpkgs#odin= when Odin is absent from =PATH=. Add rsync and
+OpenSSH only for transfer or smoke evidence.
+
+* Return
+
+Commit, push, open one PR against assigned target, add compact evidence to the
+ticket, run =tko lint TICKET_ID=, and return:
+
+#+begin_example
+ticket:
+branch:
+base:
+commit:
+pr:
+changed:
+checks:
+representative behavior:
+risks or questions:
+#+end_example
+
+Do not merge PRs. Do not dispatch later cars. Do not advance or retarget train.

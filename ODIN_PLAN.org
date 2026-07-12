@@ -1,0 +1,87 @@
+#+title: Seal v0 Odin Implementation Plan
+
+* Purpose
+
+This train implements the accepted =SPEC.org= in Odin so the operator can
+compare a complete Odin artifact with the independent Rust train. It changes
+implementation language and dependency shape, not Seal behavior.
+
+The Rust integration branch, review branches, pull requests, and generated
+files are reference material only. Odin work starts from =origin/main= on
+=integration/v0-odin= and must not modify or retarget Rust refs.
+
+* Implementation shape
+
+=SEAL.org= is canonical. It tangles a small executable package under =seal/=,
+following the visible structure of =engimatic-systems/8x16=: explicit package
+files, Odin core-library imports, named constants, direct procedures, nearby
+tests, tabs, =-vet-style=, and =-vet-tabs=. Do not reproduce 8x16 abstractions;
+copy its legible source organization.
+
+Expected generated files may include:
+
+- =seal/main.odin=: arguments, command dispatch, diagnostics;
+- =seal/config.odin=: configuration types, subset parser, resolution;
+- =seal/config_test.odin=: consequential parser/config behavior;
+- =seal/transfer.odin=: process plan and rsync invocation once pull exists.
+
+Files appear only when current behavior needs them. No package manager or
+third-party library is required. Use the pinned Nix =odin= package for checks.
+
+* TOML subset
+
+Car 002 owns a parser for only the syntax Seal consumes. It is not a reusable
+TOML package and must not claim general TOML conformance.
+
+Accepted syntax:
+
+- UTF-8 text split into ordinary single lines;
+- blank lines and comments whose first non-whitespace byte is =#=;
+- table headers =[peer]=, =[tools]=, and =[debug]=;
+- known bare keys separated from values by === with surrounding whitespace;
+- basic quoted string values with =\\=, =\"=, =\n=, =\r=, and =\t= escapes;
+- debug arrays =[]= or one quoted verbosity string such as =["-v"]=; and
+- an optional trailing comment after a string, array, or table header.
+
+Reject unknown tables, unknown keys, duplicate fields, missing required fields,
+malformed escapes, multiline values, dotted keys, inline tables, arrays with
+more than one value, and other TOML syntax with one useful path-and-line error.
+Do not build tokens, a generic value tree, serializer framework, or error
+aggregation system. =init= writes the same plain subset.
+
+* Train
+
+| Car | Ticket | Branch | Goal |
+|-
+| 001 | assigned Odin seed ticket | =review/odin-v0/001-executable-seed= | Literate Odin executable |
+| 002 | assigned Odin config ticket | =review/odin-v0/002-configuration-cfg= | Subset parser and =cfg= |
+| 003 | assigned Odin init ticket | =review/odin-v0/003-local-init= | Local =init= |
+| 004 | assigned Odin pull ticket | =review/odin-v0/004-pull= | Peer-to-local transfer |
+| 005 | assigned Odin push ticket | =review/odin-v0/005-push= | Direction reversal |
+| 006 | assigned Odin smoke ticket | =review/odin-v0/006-live-ssh-smoke= | Live SSH evidence |
+
+Car 001 targets =integration/v0-odin=. Each later PR targets its predecessor
+branch. Construct the complete stack before operator review. Workers are cold:
+each receives this plan, =SPEC.org=, its ticket, predecessor commit, and the
+minimality rule, not conversation history.
+
+Required implementation checks:
+
+#+begin_src sh
+.ephemera/tangle-org.sh SEAL.org
+.ephemera/tangle-org.sh SEAL.org
+odin check seal -vet-style -vet-tabs
+odin test seal -vet-style -vet-tabs
+odin build seal -out:./seal.bin -vet-style -vet-tabs
+#+end_src
+
+Second tangle must leave no generated-file diff. Car-specific evidence remains
+the evidence named by =PLAN.org=. Test count is not a quality measure.
+
+After car 006, dispatch one cold reduction reviewer over the complete Odin
+train. Reviewer looks first for deletable code, accidental generality, parser
+scope creep, behavioral drift, and missing consequential evidence. Reviewer
+does not expand test surface by default.
+
+Workers and coordinator do not merge, advance, or retarget PRs. Operator reviews
+the completed Odin train serially.
