@@ -469,3 +469,104 @@ virsh -c qemu:///system list --all
 
 All cleanup and absence checks returned status 0. Final VM state matched the
 initial state: =agent-experiment-01= running and =agent-arch-01= shut off.
+
+* TOML facade propagation revalidation
+
+This bounded replay supersedes the earlier parser-specific construction claims.
+The Odin tail was rebased onto amended car 002 source
+=94b51267395a43297e212018b734f0464f56736c=. Final implementation source before
+this evidence-only commit was
+=66fe747e6737545983bcb261a7b809e22ee36c8e= on
+=review/odin-v0/006-live-ssh-smoke=, based on amended car 005
+=54c93c4=. No Rust ref or worktree participated.
+
+** Backend and package boundary
+
+Car 002 vendors exact =Up05/toml_parser= commit
+=10aee3739d1a144efe79e95d8a094e9c1563bb03= under =vendor/toml/= with its MIT
+=LICENSE= and =UPSTREAM.md= provenance. Seal-owned =config_toml= exposes an
+opaque owned document, normalized owned parse error,
+=Found=/=Missing=/=Wrong_Type= status, table enumeration, and owned string and
+string-array queries. =odin doc config_toml -short= exposed no upstream type.
+
+=config_toml= owns TOML syntax only. =seal/config.odin= owns explicit table and
+key names, required values, type and unknown-name rejection, SSH pairing,
+absolute tool paths, debug whitelist/defaults, and local path resolution. Tail
+code derives SSH mode from nonempty =config.peer_ssh=; no handwritten parser,
+=Config_Table=, =Config_Seen=, or durable presence flag remains. Car 003 keeps
+its schema-specific writer because the backend has no encoder.
+
+** Checks and artifact
+
+#+begin_src sh
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+git diff --check
+nix shell nixpkgs#odin -c odin check vendor/toml
+nix shell nixpkgs#odin -c odin test vendor/toml/tests
+nix shell nixpkgs#odin -c odin test config_toml \
+  -vet-style -vet-tabs -vet-packages:config_toml
+nix shell nixpkgs#odin -c odin check seal \
+  -vet-style -vet-tabs -vet-packages:main,config_toml
+nix shell nixpkgs#odin -c odin test seal \
+  -vet-style -vet-tabs -vet-packages:main,config_toml
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin \
+  -vet-style -vet-tabs -vet-packages:main,config_toml
+sha256sum ./seal.bin
+#+end_src
+
+Both tangles produced identical generated-file hashes and =git diff --check=
+passed. Upstream check and seven tests passed without Seal style policy. Three
+facade tests and fourteen Seal tests passed with scoped vet policy and memory
+tracking clean. Seal check and build passed. The fixed live binary was:
+
+#+begin_example
+fc9b05ee303c311edb0209921d917a9239946950a90a052589407a894a2b7931  seal.bin
+#+end_example
+
+** Bounded SSH replay
+
+Local and peer roots were
+=/tmp/seal-odin-toml-facade-20260712T1259Z=. =init --debug= created the
+workspace and printed shared effective configuration. =cfg= parsed the written
+TOML through the facade and reported =experiment.agent= plus the exact remote
+mailbox path and pinned local rsync/SSH executables.
+
+The peer fixture contained nested regular files, a mode-755
+=nested/do-not-run.sh= payload, and relative link
+=nested/root-link -> ../root.txt=. A destination-only local file existed before
+pull. Both non-debug and debug pull dry-runs returned 0, reported itemized
+changes, and left the destination unchanged. Representative output was:
+
+#+begin_example
+>f+++++++++ root.txt
+cL+++++++++ nested/root-link -> ../root.txt
+#+end_example
+
+Ordinary pull returned 0, retained =local-only.txt=, preserved the relative
+symlink and executable mode, transferred nested bytes, and left the payload's
+execution marker absent.
+
+After local modification, a destination-only =remote-only.txt= was created on
+the peer. Both non-debug and debug push dry-runs returned 0, reported
+=<f+++++++++ operator-reply.txt=, and left peer files unchanged. Ordinary push
+returned 0, applied the changed root and reply, retained =remote-only.txt=,
+preserved =../root.txt= as a symlink, and left the execution marker absent.
+
+An isolated configuration for =seal-unreachable.invalid= initialized locally.
+Its guarded debug pull completed before the 15-second timeout and returned 255;
+shared debug reported =child status: 255=.
+
+All bounded local and peer roots were removed and absence-checked. Final VM
+state was:
+
+#+begin_example
+ Id   Name                  State
+--------------------------------------
+ 3    agent-experiment-01   running
+ -    agent-arch-01         shut off
+#+end_example
+
+Residual parser risk remains narrow: some incomplete TOML constructs are
+located by the pinned backend at the following EOF line. The facade preserves a
+positive location while removing backend-specific path formatting.
