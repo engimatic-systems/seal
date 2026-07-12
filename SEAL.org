@@ -8,9 +8,9 @@ first, then tangle the ordinary files used by Odin and reviewers.
 The complete generated-file boundary is =.gitignore=, =seal/main.odin=,
 =seal/main_test.odin=, =seal/config/config.odin=,
 =seal/config/config_document.odin=, =seal/config/config_syntax.odin=,
-=seal/config/config_test.odin=, and =seal/config/config_syntax_test.odin=.
-Generated files identify their source blocks so compiler diagnostics can be
-mapped back here.
+=seal/config/config_test.odin=, =seal/config/config_syntax_test.odin=,
+=seal/init.odin=, and =seal/init_test.odin=. Generated files identify their
+source blocks so compiler diagnostics can be mapped back here.
 
 Tangle twice, then check, test, and build from the repository root:
 
@@ -663,6 +663,298 @@ load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
 }
 #+end_src
 
+* Local initialization
+
+Initialization owns creation of one configuration file and its sibling
+=mailbox/= directory. It has no peer or transfer behavior.
+
+** Package, imports, and path lookup
+
+Pseudocode:
+
+1. Split the supplied =PATH= using the platform path-list rules.
+2. For each entry, inspect the named candidate without invoking it.
+3. Select the first regular file executable by the current process and record
+   its clean absolute path.
+4. Return no candidate when the tool is absent; do not search elsewhere.
+
+#+begin_src odin :tangle seal/init.odin :name init-package-path-lookup
+package main
+
+import "core:os"
+import "core:path/filepath"
+import "core:strings"
+import "core:sys/posix"
+
+resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
+	directories, split_error := os.split_path_list(path_value, context.allocator)
+	if split_error != nil {
+		return "", false
+	}
+	defer {
+		for directory in directories {
+			delete(directory)
+		}
+		delete(directories)
+	}
+
+	for path_directory in directories {
+		directory := path_directory
+		if len(path_directory) == 0 {
+			directory = "."
+		}
+		candidate, join_error := filepath.join([]string{directory, name})
+		if join_error != nil {
+			continue
+		}
+		info, stat_error := os.stat(candidate, context.allocator)
+		if stat_error != nil {
+			delete(candidate)
+			continue
+		}
+		candidate_cstring, cstring_error := strings.clone_to_cstring(
+			candidate,
+			context.temp_allocator,
+		)
+		executable := info.type == .Regular &&
+			cstring_error == nil &&
+			posix.access(candidate_cstring, {.X_OK}) == .OK
+		os.file_info_delete(info, context.allocator)
+		if !executable {
+			delete(candidate)
+			continue
+		}
+
+		absolute, absolute_error := os.get_absolute_path(candidate, context.allocator)
+		delete(candidate)
+		if absolute_error == nil {
+			return absolute, true
+		}
+	}
+	return "", false
+}
+
+absolute_init_path :: proc(path: string) -> (string, bool) {
+	if filepath.is_abs(path) {
+		cleaned, clean_error := filepath.clean(path)
+		return cleaned, clean_error == nil
+	}
+	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+	if cwd_error != nil {
+		return "", false
+	}
+	defer delete(cwd)
+	absolute, join_error := filepath.join([]string{cwd, path})
+	return absolute, join_error == nil
+}
+#+end_src
+
+** Plain configuration rendering
+
+Pseudocode:
+
+1. Accept only printable ASCII values excluding double quote and backslash.
+2. Emit each accepted value as one quoted scalar without escapes.
+3. Emit only =local_mailbox=, =[peer]=, and =[tools]= fields, adding both SSH
+   fields together for an SSH peer.
+4. Return owned text that the existing configuration parser can read.
+
+#+begin_src odin :tangle seal/init.odin :name init-config-rendering
+write_init_string :: proc(builder: ^strings.Builder, value: string) -> bool {
+	for byte_value in transmute([]byte)value {
+		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '"' || byte_value == '\\' {
+			return false
+		}
+	}
+	strings.write_byte(builder, '"')
+	strings.write_string(builder, value)
+	strings.write_byte(builder, '"')
+	return true
+}
+
+render_init_config :: proc(
+	peer_path, peer_ssh: string,
+	rsync, ssh: string,
+) -> (string, bool) {
+	builder := strings.builder_make()
+	defer strings.builder_destroy(&builder)
+	ssh_peer := len(peer_ssh) > 0
+
+	strings.write_string(&builder, "local_mailbox = ")
+	if !write_init_string(&builder, "mailbox") {
+		return "", false
+	}
+	strings.write_string(&builder, "\n\n[peer]\npath = ")
+	if !write_init_string(&builder, peer_path) {
+		return "", false
+	}
+	if ssh_peer {
+		strings.write_string(&builder, "\nssh = ")
+		if !write_init_string(&builder, peer_ssh) {
+			return "", false
+		}
+	}
+	strings.write_string(&builder, "\n\n[tools]\nrsync = ")
+	if !write_init_string(&builder, rsync) {
+		return "", false
+	}
+	if ssh_peer {
+		strings.write_string(&builder, "\nssh = ")
+		if !write_init_string(&builder, ssh) {
+			return "", false
+		}
+	}
+	strings.write_byte(&builder, '\n')
+	return strings.clone(strings.to_string(builder)), true
+}
+#+end_src
+
+** Workspace creation
+
+Pseudocode:
+
+1. Resolve the exact selected configuration path and sibling =mailbox/= path.
+2. Refuse either existing path before resolving tools or mutating the
+   filesystem.
+3. Resolve =rsync= and conditional =ssh= from the supplied =PATH= and render a
+   parser-compatible configuration.
+4. Create the mailbox directory, then exclusively create and write the config.
+5. On a config create/write failure, remove only paths created by this call.
+6. Return both created paths; do not inspect or contact the peer.
+
+#+begin_src odin :tangle seal/init.odin :name init-workspace
+path_conflicts :: proc(path: string) -> (conflicts, inspect_failed: bool) {
+	info, stat_error := os.lstat(path, context.allocator)
+	if stat_error == nil {
+		os.file_info_delete(info, context.allocator)
+		return true, false
+	}
+	if stat_error == .Not_Exist {
+		return false, false
+	}
+	return false, true
+}
+
+write_new_config :: proc(path, text: string) -> bool {
+	file, open_error := os.open(
+		path,
+		{.Write, .Create, .Excl},
+		os.Permissions_Read_All + {.Write_User},
+	)
+	if open_error != nil {
+		return false
+	}
+	written, write_error := os.write(file, transmute([]byte)text)
+	close_error := os.close(file)
+	if write_error != nil || close_error != nil || written != len(text) {
+		_ = os.remove(path)
+		return false
+	}
+	return true
+}
+
+initialize_workspace :: proc(
+	selected_path, peer_path, peer_ssh: string,
+	path_value: string,
+) -> (config_path, mailbox_path, problem: string, ok: bool) {
+	resolved: bool
+	config_path, resolved = absolute_init_path(selected_path)
+	if !resolved {
+		return "", "", "cannot resolve configuration path", false
+	}
+	directory := filepath.dir(config_path)
+	path_error: os.Error
+	mailbox_path, path_error = filepath.join([]string{directory, "mailbox"})
+	if path_error != nil {
+		return config_path, "", "cannot resolve mailbox path", false
+	}
+
+	config_exists, inspect_failed := path_conflicts(config_path)
+	if inspect_failed {
+		return config_path, mailbox_path, "cannot inspect configuration path", false
+	}
+	if config_exists {
+		return config_path, mailbox_path, "configuration path already exists", false
+	}
+	mailbox_exists: bool
+	mailbox_exists, inspect_failed = path_conflicts(mailbox_path)
+	if inspect_failed {
+		return config_path, mailbox_path, "cannot inspect mailbox path", false
+	}
+	if mailbox_exists {
+		return config_path, mailbox_path, "mailbox path already exists", false
+	}
+	if len(peer_path) == 0 {
+		return config_path, mailbox_path, "peer values must not be empty", false
+	}
+
+	rsync, found_rsync := resolve_path_tool("rsync", path_value)
+	if !found_rsync {
+		return config_path, mailbox_path, "cannot find executable rsync in PATH", false
+	}
+	defer delete(rsync)
+	ssh := ""
+	if len(peer_ssh) > 0 {
+		found_ssh: bool
+		ssh, found_ssh = resolve_path_tool("ssh", path_value)
+		if !found_ssh {
+			return config_path, mailbox_path, "cannot find executable ssh in PATH", false
+		}
+	}
+	defer {
+		if len(ssh) > 0 {
+			delete(ssh)
+		}
+	}
+
+	text, rendered := render_init_config(peer_path, peer_ssh, rsync, ssh)
+	if !rendered {
+		return config_path, mailbox_path, "peer or tool path cannot be represented", false
+	}
+	defer delete(text)
+	if directory_error := os.make_directory(mailbox_path); directory_error != nil {
+		return config_path, mailbox_path, "cannot create mailbox directory", false
+	}
+	if !write_new_config(config_path, text) {
+		_ = os.remove(mailbox_path)
+		return config_path, mailbox_path, "cannot create configuration", false
+	}
+	return config_path, mailbox_path, "", true
+}
+#+end_src
+
+** Init command
+
+The command supplies the process environment and reports only local paths.
+
+#+begin_src odin :tangle seal/init.odin :name init-command
+run_init :: proc(cli: Cli) -> int {
+	path_value := os.get_env("PATH", context.allocator)
+	defer delete(path_value)
+	config_path, mailbox_path, problem, ok := initialize_workspace(
+		cli.config,
+		cli.peer_path,
+		cli.peer_ssh,
+		path_value,
+	)
+	defer {
+		if len(config_path) > 0 {
+			delete(config_path)
+		}
+		if len(mailbox_path) > 0 {
+			delete(mailbox_path)
+		}
+	}
+	if !ok {
+		error("init", problem)
+		return 1
+	}
+	info("configuration", config_path)
+	info("mailbox", mailbox_path)
+	return 0
+}
+#+end_src
+
 * Executable
 
 ** Package and imports
@@ -699,7 +991,9 @@ SSH_TRANSFER_FLAG :: "--secluded-args"
 HELP_TEXT :: `Seal
 Operator-initiated opaque mailbox transport
 
-Usage: seal [OPTIONS] cfg
+Usage:
+  seal [OPTIONS] cfg
+  seal [OPTIONS] init PEER_PATH [--ssh SSH_DESTINATION]
 
 Options:
   --config PATH Select configuration instead of ./seal.toml
@@ -744,17 +1038,21 @@ Only current seed actions exist. Later verbs are not represented.
 Cli_Action :: enum {
 	Run,
 	Cfg,
+	Init,
 	Help,
 	Version,
 	Invalid,
 }
 
 Cli :: struct {
-	action:   Cli_Action,
-	debug:    bool,
-	config:   string,
+	action:          Cli_Action,
+	debug:           bool,
+	config:          string,
 	explicit_config: bool,
-	invalid:  string,
+	peer_path:       string,
+	peer_ssh:        string,
+	explicit_peer_ssh: bool,
+	invalid:         string,
 }
 #+end_src
 
@@ -764,10 +1062,11 @@ Pseudocode:
 
 1. Read each supplied argument once.
 2. Record global =--debug= and the one =--config PATH= value.
-3. Select =cfg=, help, or version for their exact spellings.
-4. Reject a missing or repeated configuration path and preserve the first
-   unknown argument for one useful error.
-5. Otherwise retain the seed's empty successful run.
+3. Select =cfg=, =init PEER_PATH=, help, or version for their exact spellings.
+4. Accept =--ssh SSH_DESTINATION= only once and only after =init=.
+5. Reject missing values, repeated actions, and unknown arguments with the
+   first offending spelling.
+6. Otherwise retain the seed's empty successful run.
 
 #+begin_src odin :tangle seal/main.odin :name parse-args
 parse_args :: proc(args: []string) -> Cli {
@@ -789,6 +1088,23 @@ parse_args :: proc(args: []string) -> Cli {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.action = .Cfg
+		case "init":
+			if cli.action != .Run || i + 1 >= len(args) {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.action = .Init
+			i += 1
+			cli.peer_path = args[i]
+		case "--ssh":
+			if cli.action != .Init || cli.explicit_peer_ssh || i + 1 >= len(args) {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			i += 1
+			if len(args[i]) == 0 {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.peer_ssh = args[i]
+			cli.explicit_peer_ssh = true
 		case "-h", "--help":
 			cli.action = .Help
 		case "-V", "--version":
@@ -917,7 +1233,8 @@ Pseudocode:
 
 1. Parse arguments and service help or version without filesystem access.
 2. Reject an unknown argument with a plain error and nonzero status.
-3. Dispatch =cfg= to read-only configuration display.
+3. Dispatch =cfg= to read-only configuration display and =init= to local
+   workspace creation.
 4. For an ordinary run without debug, retain seed success without output.
 5. For a debug run, resolve the process working directory.
 6. Report cwd and version to standard error, or report cwd failure and return
@@ -938,6 +1255,8 @@ run :: proc(args: []string) -> int {
 		return 2
 	case .Cfg:
 		return run_cfg(cli)
+	case .Init:
+		return run_init(cli)
 	case .Run:
 	}
 
@@ -1000,12 +1319,22 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, invalid.invalid, "pull")
 
 	testing.expect_value(t, VERSION, "0.1.0")
-	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS] cfg"))
+	testing.expect(t, strings.contains(HELP_TEXT, "seal [OPTIONS] cfg"))
 
 	cfg := parse_args([]string{"--config", "elsewhere.toml", "cfg"})
 	testing.expect_value(t, cfg.action, Cli_Action.Cfg)
 	testing.expect_value(t, cfg.config, "elsewhere.toml")
 	testing.expect(t, cfg.explicit_config)
+
+	init := parse_args([]string{"--config", "workspace/seal.toml", "init", "peer/mailbox"})
+	testing.expect_value(t, init.action, Cli_Action.Init)
+	testing.expect_value(t, init.peer_path, "peer/mailbox")
+	testing.expect(t, !init.explicit_peer_ssh)
+
+	ssh_init := parse_args([]string{"init", "/home/agent/mailbox", "--ssh", "experiment.agent"})
+	testing.expect_value(t, ssh_init.action, Cli_Action.Init)
+	testing.expect_value(t, ssh_init.peer_ssh, "experiment.agent")
+	testing.expect(t, ssh_init.explicit_peer_ssh)
 }
 #+end_src
 
@@ -1167,5 +1496,232 @@ rsync = "/bin/rsync"
 	testing.expect_value(t, config.local_mailbox, "/work/mailbox")
 	testing.expect_value(t, config.peer_path, "/work/final-peer")
 	testing.expect_value(t, config.rsync, "/bin/rsync")
+}
+#+end_src
+
+** Init test package and fixture helpers
+
+Tests create executable placeholders without invoking them. Each fixture owns
+one temporary directory and removes it after its claim.
+
+#+begin_src odin :tangle seal/init_test.odin :name init-test-package-helpers
+package main
+
+import "core:os"
+import "core:path/filepath"
+import "core:testing"
+import seal_config "config"
+
+test_path :: proc(parts: ..string) -> string {
+	path, _ := filepath.join(parts[:])
+	return path
+}
+
+make_test_tool :: proc(path: string) -> bool {
+	if write_error := os.write_entire_file_from_string(path, "test tool\n"); write_error != nil {
+		return false
+	}
+	permissions := os.Permissions_Read_All + os.Permissions_Execute_All + {.Write_User}
+	return os.change_mode(path, permissions) == nil
+}
+
+make_init_fixture :: proc() -> (root, tools: string, ok: bool) {
+	temp_error: os.Error
+	root, temp_error = os.make_directory_temp("", "seal-init-*", context.allocator)
+	if temp_error != nil {
+		return "", "", false
+	}
+	tools = test_path(root, "tools")
+	rsync := test_path(tools, "rsync")
+	defer delete(rsync)
+	ssh := test_path(tools, "ssh")
+	defer delete(ssh)
+	if os.make_directory(tools) != nil || !make_test_tool(rsync) || !make_test_tool(ssh) {
+		_ = os.remove_all(root)
+		delete(root)
+		delete(tools)
+		return "", "", false
+	}
+	return root, tools, true
+}
+#+end_src
+
+** Local init and configuration round-trip
+
+Pseudocode:
+
+1. Initialize a selected config directory with a local peer and fixture
+   =rsync= on =PATH=.
+2. Require the config and empty mailbox at the expected paths.
+3. Load the written config through car 002 and require resolved local
+   coordinates plus the pinned fixture executable.
+
+#+begin_src odin :tangle seal/init_test.odin :name local-init-test
+@(test)
+test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
+	root, tools, fixture_ok := make_init_fixture()
+	testing.expect(t, fixture_ok)
+	if !fixture_ok {
+		return
+	}
+	defer delete(root)
+	defer delete(tools)
+	defer { _ = os.remove_all(root) }
+
+	workspace := test_path(root, "workspace")
+	defer delete(workspace)
+	testing.expect(t, os.make_directory(workspace) == nil)
+	selected := test_path(workspace, "seal.toml")
+	defer delete(selected)
+	config_path, mailbox_path, problem, ok := initialize_workspace(
+		selected,
+		"../peer/mailbox",
+		"",
+		tools,
+	)
+	defer delete(config_path)
+	defer delete(mailbox_path)
+	testing.expect(t, ok, problem)
+	testing.expect(t, os.exists(config_path))
+	mailbox_info, mailbox_error := os.stat(mailbox_path, context.allocator)
+	testing.expect(t, mailbox_error == nil)
+	if mailbox_error == nil {
+		defer os.file_info_delete(mailbox_info, context.allocator)
+		testing.expect_value(t, mailbox_info.type, os.File_Type.Directory)
+	}
+
+	config, config_problem, loaded := seal_config.load_config(config_path)
+	defer seal_config.destroy_config(&config)
+	defer seal_config.destroy_config_error(&config_problem)
+	testing.expect(t, loaded, config_problem.message)
+	testing.expect_value(t, config.local_mailbox, mailbox_path)
+	expected_peer := test_path(root, "peer/mailbox")
+	defer delete(expected_peer)
+	testing.expect_value(t, config.peer_path, expected_peer)
+	expected_rsync := test_path(tools, "rsync")
+	defer delete(expected_rsync)
+	testing.expect_value(t, config.rsync, expected_rsync)
+	testing.expect_value(t, config.peer_ssh, "")
+}
+#+end_src
+
+** SSH init
+
+Pseudocode:
+
+1. Initialize with an opaque SSH destination and remote peer path.
+2. Load the generated config through the existing parser.
+3. Require the untouched remote path and both pinned fixture tools.
+
+#+begin_src odin :tangle seal/init_test.odin :name ssh-init-test
+@(test)
+test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
+	root, tools, fixture_ok := make_init_fixture()
+	testing.expect(t, fixture_ok)
+	if !fixture_ok {
+		return
+	}
+	defer delete(root)
+	defer delete(tools)
+	defer { _ = os.remove_all(root) }
+
+	selected := test_path(root, "seal.toml")
+	defer delete(selected)
+	config_path, mailbox_path, problem, ok := initialize_workspace(
+		selected,
+		"/home/agent/mailbox",
+		"experiment.agent",
+		tools,
+	)
+	defer delete(config_path)
+	defer delete(mailbox_path)
+	testing.expect(t, ok, problem)
+
+	config, config_problem, loaded := seal_config.load_config(config_path)
+	defer seal_config.destroy_config(&config)
+	defer seal_config.destroy_config_error(&config_problem)
+	testing.expect(t, loaded, config_problem.message)
+	testing.expect_value(t, config.peer_path, "/home/agent/mailbox")
+	testing.expect_value(t, config.peer_ssh, "experiment.agent")
+	expected_rsync := test_path(tools, "rsync")
+	defer delete(expected_rsync)
+	expected_ssh := test_path(tools, "ssh")
+	defer delete(expected_ssh)
+	testing.expect_value(t, config.rsync, expected_rsync)
+	testing.expect_value(t, config.ssh, expected_ssh)
+}
+#+end_src
+
+** Known conflict refusal
+
+Pseudocode:
+
+1. Present an existing config and require refusal before mailbox creation while
+   preserving the config bytes.
+2. Present an existing mailbox in another workspace and require refusal before
+   config creation while preserving the mailbox marker.
+3. Exercise no generalized rollback or unrelated filesystem behavior.
+
+#+begin_src odin :tangle seal/init_test.odin :name init-conflict-test
+@(test)
+test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
+	root, tools, fixture_ok := make_init_fixture()
+	testing.expect(t, fixture_ok)
+	if !fixture_ok {
+		return
+	}
+	defer delete(root)
+	defer delete(tools)
+	defer { _ = os.remove_all(root) }
+
+	config_conflict := test_path(root, "config-conflict")
+	defer delete(config_conflict)
+	testing.expect(t, os.make_directory(config_conflict) == nil)
+	selected := test_path(config_conflict, "seal.toml")
+	testing.expect(t, os.write_entire_file_from_string(selected, "keep config\n") == nil)
+	config_path, mailbox_path, problem, ok := initialize_workspace(
+		selected,
+		"peer",
+		"",
+		tools,
+	)
+	delete(config_path)
+	delete(mailbox_path)
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem, "configuration path already exists")
+	mailbox := test_path(config_conflict, "mailbox")
+	testing.expect(t, !os.exists(mailbox))
+	delete(mailbox)
+	contents, read_error := os.read_entire_file(selected, context.allocator)
+	testing.expect(t, read_error == nil)
+	if read_error == nil {
+		defer delete(contents)
+		testing.expect_value(t, string(contents), "keep config\n")
+	}
+	delete(selected)
+
+	mailbox_conflict := test_path(root, "mailbox-conflict")
+	defer delete(mailbox_conflict)
+	testing.expect(t, os.make_directory(mailbox_conflict) == nil)
+	mailbox = test_path(mailbox_conflict, "mailbox")
+	testing.expect(t, os.make_directory(mailbox) == nil)
+	marker := test_path(mailbox, "keep")
+	testing.expect(t, os.write_entire_file_from_string(marker, "keep\n") == nil)
+	selected = test_path(mailbox_conflict, "seal.toml")
+	config_path, mailbox_path, problem, ok = initialize_workspace(
+		selected,
+		"peer",
+		"",
+		tools,
+	)
+	delete(config_path)
+	delete(mailbox_path)
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem, "mailbox path already exists")
+	testing.expect(t, !os.exists(selected))
+	testing.expect(t, os.exists(marker))
+	delete(selected)
+	delete(marker)
+	delete(mailbox)
 }
 #+end_src
