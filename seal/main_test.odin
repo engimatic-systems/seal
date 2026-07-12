@@ -20,9 +20,9 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, debug_run.action, Cli_Action.Run)
 	testing.expect(t, debug_run.debug)
 
-	invalid := parse_args([]string{"pull"})
+	invalid := parse_args([]string{"push"})
 	testing.expect_value(t, invalid.action, Cli_Action.Invalid)
-	testing.expect_value(t, invalid.invalid, "pull")
+	testing.expect_value(t, invalid.invalid, "push")
 
 	testing.expect_value(t, VERSION, "0.1.0")
 	testing.expect(t, strings.contains(HELP_TEXT, "seal [OPTIONS] cfg"))
@@ -41,6 +41,11 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, ssh_init.action, Cli_Action.Init)
 	testing.expect_value(t, ssh_init.peer_ssh, "experiment.agent")
 	testing.expect(t, ssh_init.explicit_peer_ssh)
+
+	pull := parse_args([]string{"--debug", "pull", "--dry-run"})
+	testing.expect_value(t, pull.action, Cli_Action.Pull)
+	testing.expect(t, pull.debug)
+	testing.expect(t, pull.dry_run)
 }
 
 @(test)

@@ -11,23 +11,13 @@ VERSION :: "0.1.0"
 DEFAULT_CONFIG_PATH :: "./seal.toml"
 
 INIT_USAGE :: "seal init PEER_PATH [--ssh SSH_DESTINATION]"
-
-TRANSFER_FLAGS := [?]string{
-	"--recursive",
-	"--links",
-	"--perms",
-	"--times",
-	"--checksum",
-}
-
-SSH_TRANSFER_FLAG :: "--secluded-args"
-
 HELP_TEXT :: `Seal
 Operator-initiated opaque mailbox transport
 
 Usage:
   seal [OPTIONS] cfg
   seal [OPTIONS] init PEER_PATH [--ssh SSH_DESTINATION]
+  seal [OPTIONS] pull [--dry-run]
 
 Options:
   --config PATH Select configuration instead of ./seal.toml
@@ -64,20 +54,22 @@ Cli_Action :: enum {
 	Cfg,
 	Init,
 	Init_Usage,
+	Pull,
 	Help,
 	Version,
 	Invalid,
 }
 
 Cli :: struct {
-	action:          Cli_Action,
-	debug:           bool,
-	config:          string,
-	explicit_config: bool,
-	peer_path:       string,
-	peer_ssh:        string,
+	action:            Cli_Action,
+	debug:             bool,
+	config:            string,
+	explicit_config:   bool,
+	peer_path:         string,
+	peer_ssh:          string,
 	explicit_peer_ssh: bool,
-	invalid:         string,
+	dry_run:           bool,
+	invalid:           string,
 }
 // END org:block cli-state
 // BEGIN org:block parse-args
@@ -113,6 +105,16 @@ parse_args :: proc(args: []string) -> Cli {
 			cli.action = .Init
 			i += 1
 			cli.peer_path = args[i]
+		case "pull":
+			if cli.action != .Usage && cli.action != .Run {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.action = .Pull
+		case "--dry-run":
+			if cli.action != .Pull || cli.dry_run {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.dry_run = true
 		case "--ssh":
 			if cli.action != .Init || cli.explicit_peer_ssh || i + 1 >= len(args) {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
@@ -254,6 +256,8 @@ run :: proc(args: []string) -> int {
 		return run_cfg(cli)
 	case .Init:
 		return run_init(cli)
+	case .Pull:
+		return run_pull(cli)
 	case .Run:
 	}
 
