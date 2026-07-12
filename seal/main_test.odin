@@ -22,6 +22,11 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, invalid.invalid, "pull")
 
 	testing.expect_value(t, VERSION, "0.1.0")
-	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS]"))
+	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS] cfg"))
+
+	cfg := parse_args([]string{"--config", "elsewhere.toml", "cfg"})
+	testing.expect_value(t, cfg.action, Cli_Action.Cfg)
+	testing.expect_value(t, cfg.config, "elsewhere.toml")
+	testing.expect(t, cfg.explicit_config)
 }
 // END org:block visible-seed-test
