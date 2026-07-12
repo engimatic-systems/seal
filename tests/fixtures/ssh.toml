@@ -1,0 +1,9 @@
+local_mailbox = "operator-mailbox"
+
+[peer]
+path = "/home/agent/mailbox"
+ssh = "experiment.agent"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+ssh = "/run/current-system/sw/bin/ssh"

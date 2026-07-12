@@ -5,8 +5,9 @@
 This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary Rust files used by Cargo and reviewers.
 
-The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=, and
-=tests/cli.rs=. =Cargo.lock= is Cargo-generated and is not literate source.
+The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=,
+=src/config.rs=, =tests/cli.rs=, and the three files under =tests/fixtures/=.
+=Cargo.lock= is Cargo-generated and is not literate source.
 
 Tangle, format, test, and build from the repository root:
 
@@ -41,6 +42,8 @@ description = "Operator-initiated opaque mailbox transport"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
 #+end_src
 
 * Executable
@@ -49,18 +52,24 @@ clap = { version = "4.5", features = ["derive"] }
 
 Pseudocode:
 
-1. Parse conventional global options.
-2. When debug is absent, exit successfully without additional output.
-3. When debug is present, read the process working directory.
-4. Report working directory and binary version on standard error using Seal's
-   plain debug label.
-5. If the working directory cannot be read, report one plain error and fail.
+1. Parse the global debug and optional configuration path, plus the current
+   =cfg= command.
+2. Preserve the seed's no-command behavior: without debug, exit silently; with
+   debug, report current directory and version.
+3. For =cfg=, select only the explicit path or =./seal.toml=, then read and
+   display it.
+4. Report the first current-directory or configuration failure with one plain
+   error and fail.
 
 #+begin_src rust :tangle src/main.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
-use std::{env, fmt::Display, process::ExitCode};
+mod config;
 
-use clap::Parser;
+use std::{env, fmt::Display, path::PathBuf, process::ExitCode};
+
+use clap::{Parser, Subcommand};
+
+use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -68,23 +77,50 @@ struct Cli {
     /// Report process facts on standard error
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Read configuration from PATH
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print the effective configuration
+    Cfg,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if !cli.debug {
+    if !cli.debug && cli.command.is_none() {
         return ExitCode::SUCCESS;
     }
 
-    match env::current_dir() {
-        Ok(cwd) => {
-            debug("cwd", cwd.display());
-            debug("version", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
         Err(error) => {
             eprintln!("[error] :: cannot determine current directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if cli.debug {
+        debug("cwd", cwd.display());
+        debug("version", env!("CARGO_PKG_VERSION"));
+    }
+
+    let result = match cli.command {
+        Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref()).and_then(print_config),
+        None => Ok(()),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("[error] :: {error}");
             ExitCode::FAILURE
         }
     }
@@ -95,6 +131,229 @@ fn debug(label: &str, value: impl Display) {
 }
 #+end_src
 
+** Configuration
+
+The deserialized types mirror the four TOML tables. Optional fields retain the
+difference between omission and an explicitly empty debug array; effective
+defaults are applied only while printing.
+
+Pseudocode:
+
+1. Deserialize exactly the documented fields.
+2. Require pinned local tools to be absolute and require SSH tool coordinates
+   only for an SSH peer.
+3. Accept each supplied debug array only when empty or when it contains exactly
+   one supported verbosity flag.
+4. Stop at the first useful validation error.
+
+#+begin_src rust :tangle src/config.rs :mkdirp yes
+// Generated from SEAL.org; edit the literate source instead.
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Config {
+    pub(crate) local_mailbox: PathBuf,
+    pub(crate) peer: Peer,
+    pub(crate) tools: Tools,
+    #[serde(default)]
+    pub(crate) debug: DebugConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Peer {
+    pub(crate) path: PathBuf,
+    pub(crate) ssh: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Tools {
+    pub(crate) rsync: PathBuf,
+    pub(crate) ssh: Option<PathBuf>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DebugConfig {
+    pub(crate) rsync_debug_flags: Option<Vec<String>>,
+    pub(crate) ssh_debug_flags: Option<Vec<String>>,
+}
+
+impl Config {
+    fn validate(&self) -> Result<(), String> {
+        if !self.tools.rsync.is_absolute() {
+            return Err("tools.rsync must be an absolute path".into());
+        }
+        validate_debug_flags(
+            "debug.rsync_debug_flags",
+            self.debug.rsync_debug_flags.as_deref(),
+        )?;
+
+        match (&self.peer.ssh, &self.tools.ssh) {
+            (Some(_), Some(ssh)) if !ssh.is_absolute() => {
+                return Err("tools.ssh must be an absolute path".into());
+            }
+            (Some(_), None) => return Err("an SSH peer requires tools.ssh".into()),
+            (None, Some(_)) => return Err("a local peer must omit tools.ssh".into()),
+            _ => {}
+        }
+
+        if self.peer.ssh.is_some() {
+            validate_debug_flags(
+                "debug.ssh_debug_flags",
+                self.debug.ssh_debug_flags.as_deref(),
+            )?;
+        } else if self.debug.ssh_debug_flags.is_some() {
+            return Err("a local peer must omit debug.ssh_debug_flags".into());
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), String> {
+    let valid = match flags {
+        None | Some([]) => true,
+        Some([flag]) => matches!(flag.as_str(), "-v" | "-vv" | "-vvv"),
+        Some(_) => false,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must be empty or contain exactly one of -v, -vv, or -vvv"
+        ))
+    }
+}
+#+end_src
+
+** Configuration loading and display
+
+Configuration selection is explicit and local. Seal makes the selected path
+absolute from the process working directory without resolving filesystem
+links. Its parent is the directory against which local mailbox coordinates are
+resolved; peer-side SSH paths remain unchanged.
+
+Pseudocode:
+
+1. Loading chooses the supplied absolute path, the supplied path joined to the
+   working directory, or =seal.toml= in the working directory. It reads,
+   deserializes, and validates that one file, then returns its typed values,
+   selected path, and selection reason.
+2. Display receives that loaded configuration. It resolves the local mailbox
+   and a local peer path from the configuration directory, leaves an SSH peer
+   path untouched, and prints the effective values. It performs no other I/O.
+
+#+begin_src rust :tangle src/config.rs
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    pub(crate) path: PathBuf,
+    pub(crate) selection: &'static str,
+}
+
+pub(crate) fn load_config(
+    cwd: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<LoadedConfig, String> {
+    let (config_path, selection) = match explicit_path {
+        Some(path) if path.is_absolute() => (path.to_path_buf(), "explicit --config PATH"),
+        Some(path) => (cwd.join(path), "explicit --config PATH"),
+        None => (cwd.join("seal.toml"), "default ./seal.toml"),
+    };
+    let source = fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "cannot read configuration {}: {error}",
+            config_path.display()
+        )
+    })?;
+    let config: Config = toml::from_str(&source)
+        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
+    config
+        .validate()
+        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
+
+    Ok(LoadedConfig {
+        config,
+        path: config_path,
+        selection,
+    })
+}
+
+pub(crate) fn resolve_local(config_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    }
+}
+
+pub(crate) fn effective_debug_flags(flags: Option<&[String]>) -> String {
+    match flags {
+        Some(flags) => format!("{flags:?}"),
+        None => "[\"-v\"]".into(),
+    }
+}
+#+end_src
+
+#+begin_src rust :tangle src/main.rs
+const FIXED_TRANSFER_PROFILE: &[&str] =
+    &["--recursive", "--links", "--perms", "--times", "--checksum"];
+
+fn print_config(loaded: LoadedConfig) -> Result<(), String> {
+    let LoadedConfig {
+        config,
+        path,
+        selection,
+    } = loaded;
+    let config_dir = path
+        .parent()
+        .ok_or_else(|| format!("configuration has no parent directory: {}", path.display()))?;
+    let local_mailbox = resolve_local(config_dir, &config.local_mailbox);
+
+    println!("config selection: {selection}");
+    println!("config path: {}", path.display());
+    println!("local mailbox: {}", local_mailbox.display());
+    match &config.peer.ssh {
+        Some(destination) => {
+            println!("peer kind: ssh");
+            println!("peer ssh: {destination}");
+            println!("peer path: {}", config.peer.path.display());
+        }
+        None => {
+            println!("peer kind: local");
+            println!(
+                "peer path: {}",
+                resolve_local(config_dir, &config.peer.path).display()
+            );
+        }
+    }
+    println!("rsync tool: {}", config.tools.rsync.display());
+    println!(
+        "rsync debug flags: {}",
+        effective_debug_flags(config.debug.rsync_debug_flags.as_deref())
+    );
+    if let Some(ssh) = &config.tools.ssh {
+        println!("ssh tool: {}", ssh.display());
+        println!(
+            "ssh debug flags: {}",
+            effective_debug_flags(config.debug.ssh_debug_flags.as_deref())
+        );
+    }
+    println!("version: {}", env!("CARGO_PKG_VERSION"));
+    println!("fixed transfer profile: {FIXED_TRANSFER_PROFILE:?}");
+
+    Ok(())
+}
+#+end_src
+
 * Tests
 
 ** Visible seed behavior
@@ -102,7 +361,7 @@ fn debug(label: &str, value: impl Display) {
 Pseudocode:
 
 1. Run the built binary for help and version; require successful, recognizable
-   output.
+   output. Account only for the current =cfg= command appearing in usage.
 2. Run it with debug from a known directory; require current directory and
    package version on standard error.
 3. Do not duplicate Clap's option-parser test matrix.
@@ -117,7 +376,7 @@ fn visible_seed_behavior() {
 
     let help = Command::new(binary).arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: seal [OPTIONS]"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: seal [OPTIONS] [COMMAND]"));
 
     let version = Command::new(binary).arg("--version").output().unwrap();
     assert!(version.status.success());
@@ -134,5 +393,110 @@ fn visible_seed_behavior() {
         String::from_utf8_lossy(&debug.stderr),
         format!("[debug] :: cwd: {cwd}\n[debug] :: version: 0.1.0\n")
     );
+}
+#+end_src
+
+** Configuration fixtures
+
+The local fixture exercises default selection and an explicit empty debug
+array. The SSH fixture exercises an explicit path and omitted debug defaults.
+The invalid fixture represents the one consequential custom validation rule.
+
+#+begin_src toml :tangle tests/fixtures/local/seal.toml :mkdirp yes
+local_mailbox = "mailbox"
+
+[peer]
+path = "peer-mailbox"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+
+[debug]
+rsync_debug_flags = []
+#+end_src
+
+#+begin_src toml :tangle tests/fixtures/ssh.toml :mkdirp yes
+local_mailbox = "operator-mailbox"
+
+[peer]
+path = "/home/agent/mailbox"
+ssh = "experiment.agent"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+ssh = "/run/current-system/sw/bin/ssh"
+#+end_src
+
+#+begin_src toml :tangle tests/fixtures/invalid.toml :mkdirp yes
+local_mailbox = "mailbox"
+
+[peer]
+path = "peer-mailbox"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+
+[debug]
+rsync_debug_flags = ["-vvvv"]
+#+end_src
+
+** Configuration inspection
+
+Pseudocode:
+
+1. Run =cfg= from the local fixture directory and require default selection,
+   resolved local paths, the pinned rsync path, and the explicit empty flags.
+2. Select the SSH fixture explicitly and require unchanged peer-side path,
+   pinned SSH tool, and both omitted-field defaults.
+3. Select the invalid fixture and require one nonzero, recognizable validation
+   error.
+
+#+begin_src rust :tangle tests/cli.rs
+
+#[test]
+fn configuration_inspection() {
+    let binary = env!("CARGO_BIN_EXE_seal");
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+
+    let local = Command::new(binary)
+        .arg("cfg")
+        .current_dir(format!("{fixtures}/local"))
+        .output()
+        .unwrap();
+    assert!(local.status.success());
+    let stdout = String::from_utf8_lossy(&local.stdout);
+    assert!(stdout.contains("config selection: default ./seal.toml"));
+    assert!(stdout.contains(&format!("local mailbox: {fixtures}/local/mailbox")));
+    assert!(stdout.contains(&format!("peer path: {fixtures}/local/peer-mailbox")));
+    assert!(stdout.contains("rsync tool: /run/current-system/sw/bin/rsync"));
+    assert!(stdout.contains("rsync debug flags: []"));
+
+    let ssh = Command::new(binary)
+        .args(["--config", "ssh.toml", "cfg"])
+        .current_dir(&fixtures)
+        .output()
+        .unwrap();
+    assert!(ssh.status.success());
+    let stdout = String::from_utf8_lossy(&ssh.stdout);
+    assert!(stdout.contains("config selection: explicit --config PATH"));
+    assert!(stdout.contains("peer kind: ssh"));
+    assert!(stdout.contains("peer ssh: experiment.agent"));
+    assert!(stdout.contains("peer path: /home/agent/mailbox"));
+    assert!(stdout.contains("ssh tool: /run/current-system/sw/bin/ssh"));
+    assert!(stdout.contains("rsync debug flags: [\"-v\"]"));
+    assert!(stdout.contains("ssh debug flags: [\"-v\"]"));
+    assert!(stdout.contains(
+        "fixed transfer profile: [\"--recursive\", \"--links\", \"--perms\", \"--times\", \"--checksum\"]"
+    ));
+
+    let invalid = Command::new(binary)
+        .args(["--config", "invalid.toml", "cfg"])
+        .current_dir(&fixtures)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains(
+        "debug.rsync_debug_flags must be empty or contain exactly one of -v, -vv, or -vvv"
+    ));
 }
 #+end_src
