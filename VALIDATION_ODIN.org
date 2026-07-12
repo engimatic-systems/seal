@@ -426,6 +426,34 @@ Both local and peer roots were removed. Final VM state remained
 supersedes the earlier dry-run evidence for final non-debug reporting behavior;
 an unchanged tree may produce no itemized output.
 
+* Explicit configuration debug repair
+
+Final output review found that shared debug presentation named explicit
+selection only as =--config=, discarding the operator's selected path spelling.
+=debug_config= now reports =--config <cli.config>= while retaining the separate
+resolved path. The default presentation remains =default ./seal.toml=.
+
+After two clean tangles, check, all 11 tests, and build with =-vet-style
+-vet-tabs= returned 0, a disposable local fixture exercised =init=, =cfg=, and
+pull dry-run with the lexical path =./sub/../seal.toml=. Each shared debug call
+reported:
+
+#+begin_example
+[debug] :: configuration selection: --config ./sub/../seal.toml
+[debug] :: configuration path: /tmp/seal-odin-config-spelling-20260712T0517Z/seal.toml
+#+end_example
+
+Default =cfg --debug= still reported:
+
+#+begin_example
+[debug] :: configuration selection: default ./seal.toml
+#+end_example
+
+Pull dry-run reported the structured rsync executable and argv, itemized
+=raw-spelling-proof.txt=, and child status 0; the destination remained
+unchanged. Fixture cleanup and absence checks returned 0. This local evidence
+supersedes earlier explicit-selection debug transcripts. No VM was contacted.
+
 * Cleanup and final state
 
 #+begin_src sh

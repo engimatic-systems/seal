@@ -147,7 +147,7 @@ debug_config :: proc(cli: Cli, config: Config) -> bool {
 	defer delete(cwd)
 	debug("cwd", cwd)
 	if cli.explicit_config {
-		debug("configuration selection", "--config")
+		debug("configuration selection", fmt.tprintf("--config %s", cli.config))
 	} else {
 		debug("configuration selection", "default ./seal.toml")
 	}
