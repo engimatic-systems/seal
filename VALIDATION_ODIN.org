@@ -1,0 +1,299 @@
+#+title: Seal Odin v0 Live SSH Validation
+
+* Scope
+
+This record validates the Odin artifact from
+=review/odin-v0/006-live-ssh-smoke= against the disposable
+=agent-experiment-01= guest. It is independent of the Rust train's validation
+record.
+
+The smoke used only operator-initiated SSH and Seal transfers. Mailbox content
+was created and inspected as opaque data; the executable payload was never run.
+=agent-arch-01= remained shut off.
+
+* Topology and artifact
+
+#+begin_src sh
+git rev-parse HEAD
+git branch --show-current
+virsh -c qemu:///system list --all
+ssh -G experiment.agent | sed -n '1,12p'
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
+sha256sum ./seal.bin
+#+end_src
+
+Before this car's commit, the branch base was
+=6820a9784ffb40c6c5d98f3f57af0395eb7215f6= and the branch was
+=review/odin-v0/006-live-ssh-smoke=. Initial libvirt state was:
+
+#+begin_example
+ Id   Name                  State
+--------------------------------------
+ 3    agent-experiment-01   running
+ -    agent-arch-01         shut off
+#+end_example
+
+The SSH alias resolved to =agent@192.168.126.180= with identity file
+=/home/rosin/sys/.ephemera/keys/agent-arch-01_ed25519=. The fixed Odin binary
+used for every live transfer had SHA-256:
+
+#+begin_example
+9d8461d3438ec875c9d5e4298987c13de1830893cd0ebe34923748565554fc6f  ./seal.bin
+#+end_example
+
+* Required checks
+
+The worktree did not contain its ignored tangle helper. The identical helper
+from the Odin car 003 worktree was therefore invoked directly, twice, against
+this car's =SEAL.org=:
+
+#+begin_src sh
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+git diff --check
+nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
+#+end_src
+
+All commands returned status 0. The second tangle produced no additional diff.
+The test runner reported:
+
+#+begin_example
+Finished 12 tests in 2.962891ms. All tests were successful.
+#+end_example
+
+A final check/test/build after the validation record was written also returned
+status 0 and reported all 12 tests successful. That same-source build produced
+=b0acf35e077bd2225e07ac850f2d54db66e25d2eebec2f9ef4ee0b0d0d0b1d9d=;
+the Odin build was not byte-reproducible across these two invocations.
+
+* Workspace initialization
+
+The bounded local and peer roots were both
+=/tmp/seal-odin-live-20260712T0440Z= on their respective machines.
+
+#+begin_src sh
+LOCAL=/tmp/seal-odin-live-20260712T0440Z
+REMOTE=/tmp/seal-odin-live-20260712T0440Z
+rm -rf "$LOCAL"
+ssh -o BatchMode=yes experiment.agent "rm -rf '$REMOTE'"
+mkdir -p "$LOCAL"
+./seal.bin --config "$LOCAL/seal.toml" \
+  init "$REMOTE/mailbox" --ssh experiment.agent
+./seal.bin --config "$LOCAL/seal.toml" cfg
+#+end_src
+
+Both Seal commands returned status 0. =init= reported intact owned paths after
+the car 006 repair:
+
+#+begin_example
+[info] :: configuration: /tmp/seal-odin-live-20260712T0440Z/seal.toml
+[info] :: mailbox: /tmp/seal-odin-live-20260712T0440Z/mailbox
+#+end_example
+
+=cfg= reported:
+
+#+begin_example
+configuration selection: --config /tmp/seal-odin-live-20260712T0440Z/seal.toml
+configuration path: /tmp/seal-odin-live-20260712T0440Z/seal.toml
+configuration directory: /tmp/seal-odin-live-20260712T0440Z
+local mailbox: /tmp/seal-odin-live-20260712T0440Z/mailbox
+peer kind: ssh
+peer ssh: experiment.agent
+peer path: /tmp/seal-odin-live-20260712T0440Z/mailbox
+rsync: /nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync
+ssh: /nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh
+rsync debug flags: ["-v"]
+ssh debug flags: ["-v"]
+binary version: 0.1.0
+transfer profile:
+  --recursive
+  --links
+  --perms
+  --times
+  --checksum
+  --secluded-args
+#+end_example
+
+* Peer fixture
+
+This command created data only. In particular, it wrote but did not invoke
+=do-not-run.sh=.
+
+#+begin_src sh
+ssh -o BatchMode=yes experiment.agent \
+  "set -eu; \
+   mkdir -p '$REMOTE/mailbox/nested/deeper'; \
+   printf 'peer root\n' > '$REMOTE/mailbox/root.txt'; \
+   printf 'peer nested\n' > '$REMOTE/mailbox/nested/deeper/note.txt'; \
+   printf '#!/bin/sh\nprintf executed > $REMOTE/executed-marker\n' \
+     > '$REMOTE/mailbox/nested/do-not-run.sh'; \
+   chmod 755 '$REMOTE/mailbox/nested/do-not-run.sh'; \
+   ln -s ../root.txt '$REMOTE/mailbox/nested/root-link'"
+printf 'local retained before pull\n' > "$LOCAL/mailbox/local-only.txt"
+ssh -o BatchMode=yes experiment.agent \
+  "find '$REMOTE/mailbox' -printf '%y %P -> %l\n' | LC_ALL=C sort; \
+   test ! -e '$REMOTE/executed-marker'"
+#+end_src
+
+Status was 0. Initial peer tree:
+
+#+begin_example
+d  ->
+d nested ->
+d nested/deeper ->
+f nested/deeper/note.txt ->
+f nested/do-not-run.sh ->
+f root.txt ->
+l nested/root-link -> ../root.txt
+#+end_example
+
+* Pull
+
+#+begin_src sh
+./seal.bin --debug --config "$LOCAL/seal.toml" pull --dry-run
+./seal.bin --config "$LOCAL/seal.toml" pull
+#+end_src
+
+Both commands returned status 0. Dry-run exposed this exact structured plan:
+
+#+begin_example
+[debug] :: process executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: process argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "--dry-run", "-v", "--secluded-args", "--rsh", "/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh -v", "--", "experiment.agent:/tmp/seal-odin-live-20260712T0440Z/mailbox/", "/tmp/seal-odin-live-20260712T0440Z/mailbox/"]
+[debug] :: child status: 0
+#+end_example
+
+Rsync's dry-run output named =root.txt=, =nested/do-not-run.sh=,
+=nested/root-link -> ../root.txt=, and =nested/deeper/note.txt= and ended with
+=(DRY RUN)=. After the ordinary pull:
+
+#+begin_example
+d  ->
+d nested ->
+d nested/deeper ->
+f local-only.txt ->
+f nested/deeper/note.txt ->
+f nested/do-not-run.sh ->
+f root.txt ->
+l nested/root-link -> ../root.txt
+
+root=peer root
+nested=peer nested
+retained=local retained before pull
+symlink=../root.txt
+payload-mode=755
+non-execution-status=0
+#+end_example
+
+Thus pull retained the destination-only local file, preserved link identity and
+relative target, preserved the ordinary executable mode, and did not run it.
+
+* Push
+
+#+begin_src sh
+printf 'operator changed root\n' > "$LOCAL/mailbox/root.txt"
+printf 'operator reply\n' > "$LOCAL/mailbox/operator-reply.txt"
+ssh -o BatchMode=yes experiment.agent \
+  "printf 'remote retained before push\n' > '$REMOTE/mailbox/remote-only.txt'"
+./seal.bin --debug --config "$LOCAL/seal.toml" push --dry-run
+ssh -o BatchMode=yes experiment.agent \
+  "cat '$REMOTE/mailbox/root.txt'; \
+   test ! -e '$REMOTE/mailbox/operator-reply.txt'; \
+   cat '$REMOTE/mailbox/remote-only.txt'"
+./seal.bin --config "$LOCAL/seal.toml" push
+#+end_src
+
+Every command returned status 0. Dry-run used the reversed operands:
+
+#+begin_example
+[debug] :: process executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: process argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "--dry-run", "-v", "--secluded-args", "--rsh", "/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh -v", "--", "/tmp/seal-odin-live-20260712T0440Z/mailbox/", "experiment.agent:/tmp/seal-odin-live-20260712T0440Z/mailbox/"]
+[debug] :: child status: 0
+#+end_example
+
+Before apply, peer =root.txt= still contained =peer root=, the reply was absent,
+and =remote-only.txt= still contained =remote retained before push=. After apply:
+
+#+begin_example
+d  ->
+d nested ->
+d nested/deeper ->
+f local-only.txt ->
+f nested/deeper/note.txt ->
+f nested/do-not-run.sh ->
+f operator-reply.txt ->
+f remote-only.txt ->
+f root.txt ->
+l nested/root-link -> ../root.txt
+root=operator changed root
+reply=operator reply
+retained=remote retained before push
+symlink=../root.txt
+non-execution-status=0
+#+end_example
+
+Push therefore applied ordinary local changes, retained a destination-only peer
+entry, preserved the relative symlink, and did not execute mailbox content.
+
+* Unreachable peer
+
+#+begin_src sh
+FAIL=/tmp/seal-odin-unreachable-20260712T0440Z
+rm -rf "$FAIL"
+mkdir -p "$FAIL"
+./seal.bin --config "$FAIL/seal.toml" \
+  init /tmp/seal-odin-no-peer/mailbox --ssh seal-unreachable.invalid
+timeout 15 ./seal.bin --debug --config "$FAIL/seal.toml" pull
+#+end_src
+
+=init= returned 0. The guarded transfer completed without reaching the timeout
+and returned 255, preserving recognizable child failure:
+
+#+begin_example
+ssh: Could not resolve hostname seal-unreachable.invalid: Name or service not known
+rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]
+rsync error: unexplained error (code 255) at io.c(232) [Receiver=3.4.1]
+[debug] :: child status: 255
+status=255
+#+end_example
+
+* Contract repair and friction
+
+The first live =init= attempt exposed a contract-blocking lifetime defect:
+successful initialization printed corrupted prefixes for both returned paths.
+Odin =defer= is block scoped; cleanup deferred inside two completed =if= blocks
+freed the paths before the following diagnostics used them. Car 006 moves the
+conditional deletes into one procedure-scoped deferred block in =SEAL.org= and
+the tangled =seal/init.odin=. The fixed transcript above proves the repair.
+
+Observed non-blocking friction:
+
+- Global =--debug= applies the specified default =-v= to both rsync and SSH, so
+  exact-plan evidence includes substantial OpenSSH diagnostic output.
+- The peer's ordinary environment found rsync at
+  =/run/current-system/sw/bin/rsync=; no =--rsync-path= expansion was needed.
+- The ignored tangle helper was absent from this later-car worktree, requiring
+  an explicit path to the existing Odin helper.
+- Rebuilding unchanged source produced a different binary SHA-256. Live
+  behavior and required compiler/test results were stable, but binary-byte
+  reproducibility was not established.
+
+No command, option, transfer flag, VM machinery, or mailbox interpretation was
+added.
+
+* Cleanup and final state
+
+#+begin_src sh
+ssh -o BatchMode=yes experiment.agent \
+  'rm -rf /tmp/seal-odin-live-20260712T0440Z && \
+   test ! -e /tmp/seal-odin-live-20260712T0440Z'
+rm -rf /tmp/seal-odin-live-20260712T0440Z \
+  /tmp/seal-odin-unreachable-20260712T0440Z
+test ! -e /tmp/seal-odin-live-20260712T0440Z
+test ! -e /tmp/seal-odin-unreachable-20260712T0440Z
+virsh -c qemu:///system list --all
+#+end_src
+
+All cleanup and absence checks returned status 0. Final VM state matched the
+initial state: =agent-experiment-01= running and =agent-arch-01= shut off.

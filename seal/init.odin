@@ -240,11 +240,13 @@ run_init :: proc(cli: Cli) -> int {
 		cli.peer_ssh,
 		path_value,
 	)
-	if len(config_path) > 0 {
-		defer delete(config_path)
-	}
-	if len(mailbox_path) > 0 {
-		defer delete(mailbox_path)
+	defer {
+		if len(config_path) > 0 {
+			delete(config_path)
+		}
+		if len(mailbox_path) > 0 {
+			delete(mailbox_path)
+		}
 	}
 	if !ok {
 		error("init", problem)
