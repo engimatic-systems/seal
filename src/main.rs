@@ -1,10 +1,12 @@
 // Generated from SEAL.org; edit the literate source instead.
 mod config;
 mod init;
+mod transfer;
 
 use std::{
     env,
-    fmt::Display,
+    fmt::{self, Display},
+    io,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -13,6 +15,7 @@ use clap::{Parser, Subcommand};
 
 use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
 use init::{InitializedWorkspace, initialize_workspace};
+use transfer::{FIXED_TRANSFER_FLAGS, PlanError, plan_pull};
 
 #[derive(Parser)]
 #[command(version, about, arg_required_else_help = true)]
@@ -44,6 +47,13 @@ enum Command {
         #[arg(long, value_name = "SSH_DESTINATION")]
         ssh: Option<String>,
     },
+
+    /// Pull the peer mailbox into the local mailbox
+    Pull {
+        /// Report changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -63,15 +73,20 @@ fn main() -> ExitCode {
     }
 
     let result = match cli.command {
-        Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref()).and_then(print_config),
+        Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref())
+            .and_then(print_config)
+            .map(|()| ExitCode::SUCCESS),
         Some(Command::Init { peer_path, ssh }) => {
-            run_init(&cwd, cli.config.as_deref(), peer_path, ssh)
+            run_init(&cwd, cli.config.as_deref(), peer_path, ssh).map(|()| ExitCode::SUCCESS)
         }
-        None => Ok(()),
+        Some(Command::Pull { dry_run }) => {
+            pull(&cwd, cli.config.as_deref(), cli.debug, dry_run).map_err(|error| error.to_string())
+        }
+        None => Ok(ExitCode::SUCCESS),
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("[error] :: {error}");
             ExitCode::FAILURE
@@ -87,19 +102,14 @@ fn info(label: &str, value: impl Display) {
     eprintln!("[info] :: {label}: {value}");
 }
 
-const FIXED_TRANSFER_PROFILE: &[&str] =
-    &["--recursive", "--links", "--perms", "--times", "--checksum"];
-
 fn print_config(loaded: LoadedConfig) -> Result<(), String> {
     let LoadedConfig {
         config,
         path,
+        directory,
         selection,
     } = loaded;
-    let config_dir = path
-        .parent()
-        .ok_or_else(|| format!("configuration has no parent directory: {}", path.display()))?;
-    let local_mailbox = resolve_local(config_dir, &config.local_mailbox);
+    let local_mailbox = resolve_local(&directory, &config.local_mailbox);
 
     println!("config selection: {selection}");
     println!("config path: {}", path.display());
@@ -114,7 +124,7 @@ fn print_config(loaded: LoadedConfig) -> Result<(), String> {
             println!("peer kind: local");
             println!(
                 "peer path: {}",
-                resolve_local(config_dir, &config.peer.path).display()
+                resolve_local(&directory, &config.peer.path).display()
             );
         }
     }
@@ -131,7 +141,7 @@ fn print_config(loaded: LoadedConfig) -> Result<(), String> {
         );
     }
     println!("version: {}", env!("CARGO_PKG_VERSION"));
-    println!("fixed transfer profile: {FIXED_TRANSFER_PROFILE:?}");
+    println!("fixed transfer profile: {FIXED_TRANSFER_FLAGS:?}");
 
     Ok(())
 }
@@ -156,4 +166,74 @@ fn run_init(
         info("pinned ssh", ssh.display());
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum TransferError {
+    Configuration(String),
+    Planning(PlanError),
+    CannotStart {
+        executable: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for TransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(error) => formatter.write_str(error),
+            Self::Planning(error) => write!(formatter, "cannot plan transfer: {error}"),
+            Self::CannotStart { executable, source } => {
+                write!(
+                    formatter,
+                    "cannot run rsync {}: {source}",
+                    executable.display()
+                )
+            }
+        }
+    }
+}
+
+fn pull(
+    cwd: &Path,
+    requested_config_path: Option<&Path>,
+    debug_enabled: bool,
+    dry_run: bool,
+) -> Result<ExitCode, TransferError> {
+    let LoadedConfig {
+        config,
+        path,
+        directory,
+        selection,
+    } = load_config(cwd, requested_config_path).map_err(TransferError::Configuration)?;
+    let local_mailbox = resolve_local(&directory, &config.local_mailbox);
+    let peer_path = match config.peer.ssh {
+        Some(_) => config.peer.path.clone(),
+        None => resolve_local(&directory, &config.peer.path),
+    };
+    let plan = plan_pull(&config, &peer_path, &local_mailbox, debug_enabled, dry_run)
+        .map_err(TransferError::Planning)?;
+
+    if debug_enabled {
+        debug("config selection", selection);
+        debug("config path", path.display());
+        debug("effective configuration", format!("{config:?}"));
+        debug("local mailbox", local_mailbox.display());
+        debug("rsync executable", format!("{:?}", plan.executable()));
+        debug("rsync argv", format!("{:?}", plan.argv()));
+    }
+
+    let status = plan
+        .execute()
+        .map_err(|source| TransferError::CannotStart {
+            executable: plan.executable().to_path_buf(),
+            source,
+        })?;
+    if debug_enabled {
+        debug("child exit status", status);
+    }
+    match status.code() {
+        Some(code @ 0..=255) => Ok(ExitCode::from(code as u8)),
+        _ => Ok(ExitCode::FAILURE),
+    }
 }

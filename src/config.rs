@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) local_mailbox: PathBuf,
@@ -16,7 +16,7 @@ pub(crate) struct Config {
     pub(crate) debug: DebugConfig,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Peer {
     pub(crate) path: PathBuf,
@@ -24,7 +24,7 @@ pub(crate) struct Peer {
     pub(crate) ssh: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tools {
     pub(crate) rsync: PathBuf,
@@ -32,7 +32,7 @@ pub(crate) struct Tools {
     pub(crate) ssh: Option<PathBuf>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DebugConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +131,7 @@ fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), Str
 pub(crate) struct LoadedConfig {
     pub(crate) config: Config,
     pub(crate) path: PathBuf,
+    pub(crate) directory: PathBuf,
     pub(crate) selection: &'static str,
 }
 
@@ -161,10 +162,20 @@ pub(crate) fn load_config(
             resolved_config_path.display()
         )
     })?;
+    let config_directory = resolved_config_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "configuration has no parent directory: {}",
+                resolved_config_path.display()
+            )
+        })?
+        .to_path_buf();
 
     Ok(LoadedConfig {
         config,
         path: resolved_config_path,
+        directory: config_directory,
         selection,
     })
 }
@@ -178,8 +189,17 @@ pub(crate) fn resolve_local(config_dir: &Path, path: &Path) -> PathBuf {
 }
 
 pub(crate) fn effective_debug_flags(flags: Option<&[String]>) -> String {
+    format!(
+        "{:?}",
+        effective_debug_flag(flags).into_iter().collect::<Vec<_>>()
+    )
+}
+
+pub(crate) fn effective_debug_flag(flags: Option<&[String]>) -> Option<&str> {
     match flags {
-        Some(flags) => format!("{flags:?}"),
-        None => "[\"-v\"]".into(),
+        None => Some("-v"),
+        Some([]) => None,
+        Some([flag]) => Some(flag),
+        Some(_) => unreachable!("configuration debug flags were validated"),
     }
 }

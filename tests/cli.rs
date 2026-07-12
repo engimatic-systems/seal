@@ -257,6 +257,207 @@ fn initialization_refuses_known_conflicts() {
     );
 }
 
+#[test]
+fn exact_local_and_ssh_pull_plans() {
+    let root = test_root("pull-plans");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let rsync = write_tool(&tools, "rsync");
+    fs::write(&rsync, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    let ssh = write_tool(&tools, "ssh");
+
+    let local = root.join("local");
+    fs::create_dir(&local).unwrap();
+    fs::write(
+        local.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n\n[debug]\nrsync_debug_flags = [\"-vv\"]\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let local_output = run_seal(&local, &tools, &["--debug", "pull", "--dry-run"]);
+    assert_success(&local_output);
+    let local_args = vec![
+        "--recursive".to_string(),
+        "--links".to_string(),
+        "--perms".to_string(),
+        "--times".to_string(),
+        "--checksum".to_string(),
+        "-vv".to_string(),
+        "--dry-run".to_string(),
+        "--".to_string(),
+        format!("{}/peer/", local.display()),
+        format!("{}/mailbox/", local.display()),
+    ];
+    assert_eq!(
+        String::from_utf8_lossy(&local_output.stdout),
+        format!("{}\n", local_args.join("\n"))
+    );
+    assert!(
+        String::from_utf8_lossy(&local_output.stderr).contains(&format!(
+            "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
+            rsync, local_args
+        ))
+    );
+
+    let remote = root.join("remote");
+    fs::create_dir(&remote).unwrap();
+    fs::write(
+        remote.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"/peer/mailbox\"\nssh = \"-v\"\n\n[tools]\nrsync = {:?}\nssh = {:?}\n\n[debug]\nrsync_debug_flags = [\"-vvv\"]\nssh_debug_flags = [\"-vv\"]\n",
+            rsync.to_string_lossy(),
+            ssh.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let remote_output = run_seal(&remote, &tools, &["--debug", "pull"]);
+    assert_success(&remote_output);
+    let remote_args = vec![
+        "--recursive".to_string(),
+        "--links".to_string(),
+        "--perms".to_string(),
+        "--times".to_string(),
+        "--checksum".to_string(),
+        "-vvv".to_string(),
+        "--secluded-args".to_string(),
+        "--rsh".to_string(),
+        format!("'{}' -vv --", ssh.display()),
+        "--".to_string(),
+        "-v:/peer/mailbox/".to_string(),
+        format!("{}/mailbox/", remote.display()),
+    ];
+    assert_eq!(
+        String::from_utf8_lossy(&remote_output.stdout),
+        format!("{}\n", remote_args.join("\n"))
+    );
+    assert!(
+        String::from_utf8_lossy(&remote_output.stderr).contains(&format!(
+            "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
+            rsync, remote_args
+        ))
+    );
+}
+
+#[test]
+fn pull_preserves_child_failure_status() {
+    let root = test_root("pull-failure");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let rsync = write_tool(&tools, "rsync");
+    fs::write(&rsync, "#!/bin/sh\nexit 23\n").unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = run_seal(&root, &tools, &["pull"]);
+    assert_eq!(output.status.code(), Some(23));
+}
+
+#[test]
+fn real_rsync_decodes_quoted_ssh_and_terminates_its_options() {
+    let root = test_root("quoted-ssh");
+    let ssh_tools = root.join("ssh tools '\"quoted");
+    fs::create_dir(&ssh_tools).unwrap();
+    let ssh = write_tool(&ssh_tools, "ssh");
+    let captured = root.join("ssh-argv");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {:?}\nexit 42\n",
+            captured.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let rsync = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("rsync"))
+        .find(|candidate| candidate.is_file())
+        .expect("rsync must be present for the remote-shell probe")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"/peer\"\nssh = \"agent.example\"\n\n[tools]\nrsync = {:?}\nssh = {:?}\n",
+            rsync.to_string_lossy(),
+            ssh.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::create_dir(root.join("mailbox")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .arg("pull")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let argv = fs::read_to_string(captured).unwrap_or_else(|error| {
+        panic!(
+            "fake SSH was not invoked: {error}; rsync stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert!(
+        argv.starts_with("--\nagent.example\nrsync\n--server\n"),
+        "{argv}"
+    );
+}
+
+#[test]
+fn real_local_pull_preserves_symlink() {
+    let root = test_root("real-pull");
+    let source = root.join("peer");
+    let destination = root.join("mailbox");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("target.txt"), "opaque mailbox bytes\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", source.join("link.txt")).unwrap();
+
+    let rsync = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("rsync"))
+        .find(|candidate| candidate.is_file())
+        .expect("rsync must be present for the real transfer fixture")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .arg("pull")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(destination.join("target.txt")).unwrap(),
+        "opaque mailbox bytes\n"
+    );
+    assert!(
+        fs::symlink_metadata(destination.join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_link(destination.join("link.txt")).unwrap(),
+        PathBuf::from("target.txt")
+    );
+}
+
 fn test_root(name: &str) -> PathBuf {
     let root = env::temp_dir().join(format!("seal-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

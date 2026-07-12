@@ -6,7 +6,8 @@ This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary Rust files used by Cargo and reviewers.
 
 The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=,
-=src/config.rs=, =src/init.rs=, =tests/cli.rs=, and the three files under
+=src/config.rs=, =src/init.rs=, =src/transfer.rs=, =tests/cli.rs=, and the three
+files under
 =tests/fixtures/=.
 =Cargo.lock= is Cargo-generated and is not literate source.
 
@@ -54,23 +55,29 @@ toml = "0.9"
 
 Pseudocode:
 
-1. Parse the global debug and optional configuration path, plus the current
-   =cfg= and =init= commands.
-2. Let clap show ordinary help when invoked without arguments. A global debug
-   invocation without a command still reports current directory and version.
-3. For =cfg=, select only the explicit path or =./seal.toml=, then read and
-   display it. For =init=, create the selected local workspace.
-4. Report the first current-directory or configuration failure with one plain
-   error and fail.
+#+begin_example
+parse global options + cfg | init | pull
+determine current directory; report and fail here if unavailable
+report requested process debug facts
+
+cfg  -> load + display configuration -> success
+init -> initialize workspace         -> success
+pull -> typed transfer orchestration -> child outcome
+none -> success after clap handles ordinary no-argument help
+
+convert command error to one plain diagnostic -> failure
+#+end_example
 
 #+begin_src rust :tangle src/main.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
 mod config;
 mod init;
+mod transfer;
 
 use std::{
     env,
-    fmt::Display,
+    fmt::{self, Display},
+    io,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -79,6 +86,7 @@ use clap::{Parser, Subcommand};
 
 use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
 use init::{InitializedWorkspace, initialize_workspace};
+use transfer::{FIXED_TRANSFER_FLAGS, PlanError, plan_pull};
 
 #[derive(Parser)]
 #[command(version, about, arg_required_else_help = true)]
@@ -110,6 +118,13 @@ enum Command {
         #[arg(long, value_name = "SSH_DESTINATION")]
         ssh: Option<String>,
     },
+
+    /// Pull the peer mailbox into the local mailbox
+    Pull {
+        /// Report changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -129,15 +144,20 @@ fn main() -> ExitCode {
     }
 
     let result = match cli.command {
-        Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref()).and_then(print_config),
+        Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref())
+            .and_then(print_config)
+            .map(|()| ExitCode::SUCCESS),
         Some(Command::Init { peer_path, ssh }) => {
-            run_init(&cwd, cli.config.as_deref(), peer_path, ssh)
+            run_init(&cwd, cli.config.as_deref(), peer_path, ssh).map(|()| ExitCode::SUCCESS)
         }
-        None => Ok(()),
+        Some(Command::Pull { dry_run }) => {
+            pull(&cwd, cli.config.as_deref(), cli.debug, dry_run).map_err(|error| error.to_string())
+        }
+        None => Ok(ExitCode::SUCCESS),
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("[error] :: {error}");
             ExitCode::FAILURE
@@ -180,7 +200,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) local_mailbox: PathBuf,
@@ -190,7 +210,7 @@ pub(crate) struct Config {
     pub(crate) debug: DebugConfig,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Peer {
     pub(crate) path: PathBuf,
@@ -198,7 +218,7 @@ pub(crate) struct Peer {
     pub(crate) ssh: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tools {
     pub(crate) rsync: PathBuf,
@@ -206,7 +226,7 @@ pub(crate) struct Tools {
     pub(crate) ssh: Option<PathBuf>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DebugConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,18 +332,24 @@ resolved; peer-side SSH paths remain unchanged.
 
 Pseudocode:
 
-1. Loading chooses the supplied absolute path, the supplied path joined to the
-   working directory, or =seal.toml= in the working directory. It reads,
-   deserializes, and validates that one file, then returns its typed values,
-   selected path, and selection reason.
-2. Display receives that loaded configuration. It resolves the local mailbox
-   and a local peer path from the configuration directory, leaves an SSH peer
-   path untouched, and prints the effective values. It performs no other I/O.
+#+begin_example
+load:
+  select absolute config path from CLI path and current directory
+  read -> deserialize -> validate; fail at the operation that rejects input
+  derive configuration directory from validated file path; fail if absent
+  return values + path + directory + selection reason
+
+display:
+  resolve local mailbox and local peer against stored directory
+  leave SSH peer path opaque
+  print effective values; perform no other I/O
+#+end_example
 
 #+begin_src rust :tangle src/config.rs
 pub(crate) struct LoadedConfig {
     pub(crate) config: Config,
     pub(crate) path: PathBuf,
+    pub(crate) directory: PathBuf,
     pub(crate) selection: &'static str,
 }
 
@@ -354,10 +380,20 @@ pub(crate) fn load_config(
             resolved_config_path.display()
         )
     })?;
+    let config_directory = resolved_config_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "configuration has no parent directory: {}",
+                resolved_config_path.display()
+            )
+        })?
+        .to_path_buf();
 
     Ok(LoadedConfig {
         config,
         path: resolved_config_path,
+        directory: config_directory,
         selection,
     })
 }
@@ -371,27 +407,31 @@ pub(crate) fn resolve_local(config_dir: &Path, path: &Path) -> PathBuf {
 }
 
 pub(crate) fn effective_debug_flags(flags: Option<&[String]>) -> String {
+    format!(
+        "{:?}",
+        effective_debug_flag(flags).into_iter().collect::<Vec<_>>()
+    )
+}
+
+pub(crate) fn effective_debug_flag(flags: Option<&[String]>) -> Option<&str> {
     match flags {
-        Some(flags) => format!("{flags:?}"),
-        None => "[\"-v\"]".into(),
+        None => Some("-v"),
+        Some([]) => None,
+        Some([flag]) => Some(flag),
+        Some(_) => unreachable!("configuration debug flags were validated"),
     }
 }
 #+end_src
 
 #+begin_src rust :tangle src/main.rs
-const FIXED_TRANSFER_PROFILE: &[&str] =
-    &["--recursive", "--links", "--perms", "--times", "--checksum"];
-
 fn print_config(loaded: LoadedConfig) -> Result<(), String> {
     let LoadedConfig {
         config,
         path,
+        directory,
         selection,
     } = loaded;
-    let config_dir = path
-        .parent()
-        .ok_or_else(|| format!("configuration has no parent directory: {}", path.display()))?;
-    let local_mailbox = resolve_local(config_dir, &config.local_mailbox);
+    let local_mailbox = resolve_local(&directory, &config.local_mailbox);
 
     println!("config selection: {selection}");
     println!("config path: {}", path.display());
@@ -406,7 +446,7 @@ fn print_config(loaded: LoadedConfig) -> Result<(), String> {
             println!("peer kind: local");
             println!(
                 "peer path: {}",
-                resolve_local(config_dir, &config.peer.path).display()
+                resolve_local(&directory, &config.peer.path).display()
             );
         }
     }
@@ -423,7 +463,7 @@ fn print_config(loaded: LoadedConfig) -> Result<(), String> {
         );
     }
     println!("version: {}", env!("CARGO_PKG_VERSION"));
-    println!("fixed transfer profile: {FIXED_TRANSFER_PROFILE:?}");
+    println!("fixed transfer profile: {FIXED_TRANSFER_FLAGS:?}");
 
     Ok(())
 }
@@ -670,6 +710,362 @@ fn run_init(
         info("pinned ssh", ssh.display());
     }
     Ok(())
+}
+#+end_src
+
+** Pull transport
+
+*** Pull dataflow
+
+#+begin_example
+pull -> load configuration -> resolve endpoints -> plan_pull -> debug plan
+     -> start child -> debug status -> propagate child exit code
+
+failures:
+  load configuration -> TransferError::Configuration
+  plan_pull          -> TransferError::Planning
+  start child        -> TransferError::CannotStart
+  child exit code    -> ordinary pull outcome
+#+end_example
+
+The command adapter owns configuration selection, endpoint resolution,
+diagnostics, and classification of configuration, planning, and child-start
+failures. The transfer module owns only the structured pull plan and direct
+child execution.
+
+*** Transfer module and profile
+
+Fixed ordinary and SSH-only flags are visible constants rather than
+configuration. The module imports only configuration values needed to plan one
+pull; it does not anticipate push.
+
+#+begin_src rust :tangle src/transfer.rs :mkdirp yes
+// Generated from SEAL.org; edit the literate source instead.
+use std::{
+    ffi::{OsStr, OsString},
+    fmt, io,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus},
+};
+
+use crate::config::{Config, effective_debug_flag};
+
+pub(crate) const FIXED_TRANSFER_FLAGS: &[&str] =
+    &["--recursive", "--links", "--perms", "--times", "--checksum"];
+const SSH_TRANSFER_FLAGS: &[&str] = &["--secluded-args"];
+const REMOTE_SHELL_FLAG: &str = "--rsh";
+#+end_src
+
+*** Process plan
+
+A process plan keeps the pinned executable distinct from structured argv,
+exposes both for diagnostics, and invokes the child directly with inherited
+output.
+
+#+begin_src rust :tangle src/transfer.rs
+
+pub(crate) struct ProcessPlan {
+    executable: PathBuf,
+    argv: Vec<OsString>,
+}
+
+impl ProcessPlan {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) fn argv(&self) -> &[OsString] {
+        &self.argv
+    }
+
+    pub(crate) fn execute(&self) -> io::Result<ExitStatus> {
+        Command::new(&self.executable).args(&self.argv).status()
+    }
+}
+#+end_src
+
+*** Planning errors
+
+Planning errors retain the specific invalid state until the command adapter can
+add pull context.
+
+#+begin_src rust :tangle src/transfer.rs
+
+#[derive(Debug)]
+pub(crate) enum PlanError {
+    MissingSshTool,
+    UnrepresentableSshTool,
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSshTool => formatter.write_str("an SSH peer requires tools.ssh"),
+            Self::UnrepresentableSshTool => formatter.write_str("tools.ssh contains a null byte"),
+        }
+    }
+}
+#+end_src
+
+*** Remote-shell encoding helper
+
+The helper encodes one pinned SSH executable as one rsync remote-shell word.
+Rsync groups quoted bytes itself, represents an embedded quote by doubling it,
+and cannot represent a null byte; this is not POSIX shell quoting.
+
+#+begin_src rust :tangle src/transfer.rs
+
+// Rsync splits --rsh itself: quotes group one word and a doubled quote emits
+// that quote. This is deliberately rsync grammar, not POSIX shell quoting.
+fn quote_remote_shell_word(value: &OsStr) -> Result<OsString, PlanError> {
+    if value.as_bytes().contains(&0) {
+        return Err(PlanError::UnrepresentableSshTool);
+    }
+
+    let mut quoted = Vec::with_capacity(value.as_bytes().len() + 2);
+    quoted.push(b'\'');
+    for byte in value.as_bytes() {
+        quoted.push(*byte);
+        if *byte == b'\'' {
+            quoted.push(b'\'');
+        }
+    }
+    quoted.push(b'\'');
+    Ok(OsString::from_vec(quoted))
+}
+#+end_src
+
+*** Mailbox operand helpers
+
+=trailing_slash= appends only a missing directory-content suffix.
+=has_trailing_slash= tests encoded bytes because ASCII slash retains its byte
+identity in the platform string encoding; neither helper requires Unicode.
+
+#+begin_src rust :tangle src/transfer.rs
+
+fn trailing_slash(path: &Path) -> OsString {
+    let mut value = path.as_os_str().to_os_string();
+    if !has_trailing_slash(&value) {
+        value.push("/");
+    }
+    value
+}
+
+// Encoded bytes preserve ASCII slash identity without requiring Unicode paths.
+fn has_trailing_slash(value: &OsStr) -> bool {
+    value.as_encoded_bytes().ends_with(b"/")
+}
+#+end_src
+
+*** Pull plan construction
+
+Pseudocode:
+
+#+begin_example
+inputs:
+  config, resolved peer path, resolved local mailbox
+  debug enabled, dry-run enabled
+
+argv = fixed transfer flags
+
+if debug is enabled:
+  append effective rsync debug flag, if any
+
+if dry-run is enabled:
+  append --dry-run
+
+if peer uses SSH:
+  append SSH-specific rsync flags
+  require pinned SSH executable; otherwise fail
+  encode SSH executable for rsync's remote-shell grammar; fail on NUL
+
+  if debug is enabled:
+    append effective SSH debug flag, if any, to remote-shell value
+
+  append SSH option terminator to remote-shell value
+  append --rsh and remote-shell value to argv
+  source = SSH destination + ":" + peer path with trailing slash
+else:
+  source = peer path with trailing slash
+
+append rsync option terminator
+append source
+append local mailbox with trailing slash
+
+return process plan using pinned rsync executable and argv
+#+end_example
+
+#+begin_src rust :tangle src/transfer.rs
+
+pub(crate) fn plan_pull(
+    config: &Config,
+    peer_path: &Path,
+    local_mailbox: &Path,
+    debug_enabled: bool,
+    dry_run: bool,
+) -> Result<ProcessPlan, PlanError> {
+    // Profile controls precede transport-specific arguments.
+    let mut argv: Vec<OsString> = FIXED_TRANSFER_FLAGS.iter().map(OsString::from).collect();
+    if debug_enabled {
+        if let Some(flag) = effective_debug_flag(config.debug.rsync_debug_flags.as_deref()) {
+            argv.push(flag.into());
+        }
+    }
+    if dry_run {
+        argv.push("--dry-run".into());
+    }
+
+    // SSH coordinates stay opaque here; rsync owns their remote interpretation.
+    let source = match &config.peer.ssh {
+        Some(destination) => {
+            argv.extend(SSH_TRANSFER_FLAGS.iter().map(OsString::from));
+            let ssh = config
+                .tools
+                .ssh
+                .as_deref()
+                .ok_or(PlanError::MissingSshTool)?;
+            let mut remote_shell = quote_remote_shell_word(ssh.as_os_str())?;
+            if debug_enabled {
+                if let Some(flag) = effective_debug_flag(config.debug.ssh_debug_flags.as_deref()) {
+                    remote_shell.push(" ");
+                    remote_shell.push(flag);
+                }
+            }
+            remote_shell.push(" --");
+            argv.push(REMOTE_SHELL_FLAG.into());
+            argv.push(remote_shell);
+
+            let mut source = OsString::from(destination);
+            source.push(":");
+            source.push(trailing_slash(peer_path));
+            source
+        }
+        None => trailing_slash(peer_path),
+    };
+
+    // The terminator fixes the remaining operands as pull source then destination.
+    argv.push("--".into());
+    argv.push(source);
+    argv.push(trailing_slash(local_mailbox));
+    Ok(ProcessPlan {
+        executable: config.tools.rsync.clone(),
+        argv,
+    })
+}
+#+end_src
+
+*** Pull command adapter
+
+Pull resolves configuration-relative endpoints and classifies failures only
+where their operator context is known. Its error type is shared transfer
+orchestration vocabulary rather than pull-specific policy.
+
+#+begin_src rust :tangle src/main.rs
+
+#[derive(Debug)]
+enum TransferError {
+    Configuration(String),
+    Planning(PlanError),
+    CannotStart {
+        executable: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for TransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(error) => formatter.write_str(error),
+            Self::Planning(error) => write!(formatter, "cannot plan transfer: {error}"),
+            Self::CannotStart { executable, source } => {
+                write!(
+                    formatter,
+                    "cannot run rsync {}: {source}",
+                    executable.display()
+                )
+            }
+        }
+    }
+}
+#+end_src
+
+Pseudocode:
+
+#+begin_example
+inputs:
+  current directory, optional config path
+  debug enabled, dry-run enabled
+
+load selected configuration; classify failure as Configuration
+resolve local mailbox relative to stored configuration directory
+
+if peer uses SSH:
+  peer path = configured remote path
+else:
+  resolve peer path relative to stored configuration directory
+
+construct pull process plan; classify failure as Planning
+
+if debug is enabled:
+  report config selection and path
+  report effective configuration and local mailbox
+  report rsync executable and argv
+
+start process plan once; classify failure as CannotStart with executable + io error
+
+if debug is enabled:
+  report child exit status
+
+if child has an ordinary exit code from 0 through 255:
+  return that exit code as an ordinary outcome
+else:
+  return ordinary failure outcome
+#+end_example
+
+#+begin_src rust :tangle src/main.rs
+fn pull(
+    cwd: &Path,
+    requested_config_path: Option<&Path>,
+    debug_enabled: bool,
+    dry_run: bool,
+) -> Result<ExitCode, TransferError> {
+    let LoadedConfig {
+        config,
+        path,
+        directory,
+        selection,
+    } = load_config(cwd, requested_config_path).map_err(TransferError::Configuration)?;
+    let local_mailbox = resolve_local(&directory, &config.local_mailbox);
+    let peer_path = match config.peer.ssh {
+        Some(_) => config.peer.path.clone(),
+        None => resolve_local(&directory, &config.peer.path),
+    };
+    let plan = plan_pull(&config, &peer_path, &local_mailbox, debug_enabled, dry_run)
+        .map_err(TransferError::Planning)?;
+
+    if debug_enabled {
+        debug("config selection", selection);
+        debug("config path", path.display());
+        debug("effective configuration", format!("{config:?}"));
+        debug("local mailbox", local_mailbox.display());
+        debug("rsync executable", format!("{:?}", plan.executable()));
+        debug("rsync argv", format!("{:?}", plan.argv()));
+    }
+
+    let status = plan
+        .execute()
+        .map_err(|source| TransferError::CannotStart {
+            executable: plan.executable().to_path_buf(),
+            source,
+        })?;
+    if debug_enabled {
+        debug("child exit status", status);
+    }
+    match status.code() {
+        Some(code @ 0..=255) => Ok(ExitCode::from(code as u8)),
+        _ => Ok(ExitCode::FAILURE),
+    }
 }
 #+end_src
 
@@ -1028,6 +1424,253 @@ fn initialization_refuses_known_conflicts() {
         "keep me\n"
     );
 }
+#+end_src
+
+** Pull process plans
+
+One focused interaction uses an inert rsync child that prints its structured
+arguments. This pins both local and SSH plans, including debug-only verbosity,
+dry-run placement, secluded arguments, the quoted pinned remote shell and its
+option terminator, rsync's option terminator, direction, and trailing slashes.
+
+Pseudocode:
+
+1. Configure a local peer with =-vv= rsync verbosity and run a debug dry-run;
+   require the exact child argv and structured debug plan.
+2. Configure an option-shaped SSH destination with =-vvv= rsync and =-vv= SSH
+   verbosity; require the exact child argv and structured debug plan, including
+   the opaque destination, quoted executable, and remote-shell =--=.
+
+#+begin_src rust :tangle tests/cli.rs
+
+#[test]
+fn exact_local_and_ssh_pull_plans() {
+    let root = test_root("pull-plans");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let rsync = write_tool(&tools, "rsync");
+    fs::write(&rsync, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    let ssh = write_tool(&tools, "ssh");
+
+    let local = root.join("local");
+    fs::create_dir(&local).unwrap();
+    fs::write(
+        local.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n\n[debug]\nrsync_debug_flags = [\"-vv\"]\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let local_output = run_seal(&local, &tools, &["--debug", "pull", "--dry-run"]);
+    assert_success(&local_output);
+    let local_args = vec![
+        "--recursive".to_string(),
+        "--links".to_string(),
+        "--perms".to_string(),
+        "--times".to_string(),
+        "--checksum".to_string(),
+        "-vv".to_string(),
+        "--dry-run".to_string(),
+        "--".to_string(),
+        format!("{}/peer/", local.display()),
+        format!("{}/mailbox/", local.display()),
+    ];
+    assert_eq!(
+        String::from_utf8_lossy(&local_output.stdout),
+        format!("{}\n", local_args.join("\n"))
+    );
+    assert!(
+        String::from_utf8_lossy(&local_output.stderr).contains(&format!(
+            "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
+            rsync, local_args
+        ))
+    );
+
+    let remote = root.join("remote");
+    fs::create_dir(&remote).unwrap();
+    fs::write(
+        remote.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"/peer/mailbox\"\nssh = \"-v\"\n\n[tools]\nrsync = {:?}\nssh = {:?}\n\n[debug]\nrsync_debug_flags = [\"-vvv\"]\nssh_debug_flags = [\"-vv\"]\n",
+            rsync.to_string_lossy(),
+            ssh.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let remote_output = run_seal(&remote, &tools, &["--debug", "pull"]);
+    assert_success(&remote_output);
+    let remote_args = vec![
+        "--recursive".to_string(),
+        "--links".to_string(),
+        "--perms".to_string(),
+        "--times".to_string(),
+        "--checksum".to_string(),
+        "-vvv".to_string(),
+        "--secluded-args".to_string(),
+        "--rsh".to_string(),
+        format!("'{}' -vv --", ssh.display()),
+        "--".to_string(),
+        "-v:/peer/mailbox/".to_string(),
+        format!("{}/mailbox/", remote.display()),
+    ];
+    assert_eq!(
+        String::from_utf8_lossy(&remote_output.stdout),
+        format!("{}\n", remote_args.join("\n"))
+    );
+    assert!(
+        String::from_utf8_lossy(&remote_output.stderr).contains(&format!(
+            "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
+            rsync, remote_args
+        ))
+    );
+}
+#+end_src
+
+** Pull execution
+
+The failure fixture proves Seal returns the recognizable rsync status. The
+remote-shell probe proves real rsync decodes its command-string grammar and
+passes a destination after =--=. The exact-plan fixture above covers the
+option-shaped destination because current rsync rejects such a hostname before
+starting SSH. The real local transfer proves ordinary content moves and a
+source symlink remains a symlink.
+
+Pseudocode:
+
+#+begin_example
+pinned child exits 23 -> Seal exits 23 without orchestration failure
+real rsync + fake SSH -> fake SSH receives -- then configured destination
+real local rsync      -> file and relative symlink arrive unchanged
+#+end_example
+
+#+begin_src rust :tangle tests/cli.rs
+
+#[test]
+fn pull_preserves_child_failure_status() {
+    let root = test_root("pull-failure");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let rsync = write_tool(&tools, "rsync");
+    fs::write(&rsync, "#!/bin/sh\nexit 23\n").unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = run_seal(&root, &tools, &["pull"]);
+    assert_eq!(output.status.code(), Some(23));
+}
+
+#[test]
+fn real_rsync_decodes_quoted_ssh_and_terminates_its_options() {
+    let root = test_root("quoted-ssh");
+    let ssh_tools = root.join("ssh tools '\"quoted");
+    fs::create_dir(&ssh_tools).unwrap();
+    let ssh = write_tool(&ssh_tools, "ssh");
+    let captured = root.join("ssh-argv");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {:?}\nexit 42\n",
+            captured.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let rsync = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("rsync"))
+        .find(|candidate| candidate.is_file())
+        .expect("rsync must be present for the remote-shell probe")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"/peer\"\nssh = \"agent.example\"\n\n[tools]\nrsync = {:?}\nssh = {:?}\n",
+            rsync.to_string_lossy(),
+            ssh.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::create_dir(root.join("mailbox")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .arg("pull")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let argv = fs::read_to_string(captured).unwrap_or_else(|error| {
+        panic!(
+            "fake SSH was not invoked: {error}; rsync stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert!(
+        argv.starts_with("--\nagent.example\nrsync\n--server\n"),
+        "{argv}"
+    );
+}
+
+#[test]
+fn real_local_pull_preserves_symlink() {
+    let root = test_root("real-pull");
+    let source = root.join("peer");
+    let destination = root.join("mailbox");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("target.txt"), "opaque mailbox bytes\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", source.join("link.txt")).unwrap();
+
+    let rsync = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("rsync"))
+        .find(|candidate| candidate.is_file())
+        .expect("rsync must be present for the real transfer fixture")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .arg("pull")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(destination.join("target.txt")).unwrap(),
+        "opaque mailbox bytes\n"
+    );
+    assert!(
+        fs::symlink_metadata(destination.join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_link(destination.join("link.txt")).unwrap(),
+        PathBuf::from("target.txt")
+    );
+}
+#+end_src
+
+** Test support
+
+Fixtures use process-scoped temporary roots and small executable tools. Helpers
+centralize only repeated setup and success diagnostics.
+
+#+begin_src rust :tangle tests/cli.rs
 
 fn test_root(name: &str) -> PathBuf {
     let root = env::temp_dir().join(format!("seal-{}-{name}", std::process::id()));
