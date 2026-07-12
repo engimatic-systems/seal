@@ -35,15 +35,20 @@ boundaries in =SPEC.org=, or observed smoke friction.
 - Direct control flow over future-facing abstractions.
 - Clear duplication over a one-use abstraction.
 - One useful error over aggregated diagnostics.
-- Consequential behavior tests over parser or standard-library enumeration.
+- Consequential behavior tests over standard-library enumeration.
 - No later verb stubs or tail prebuilding.
 
-Car 002 implements exactly the TOML subset in =ODIN_PLAN.org=. Keep it inside
-=seal/config.odin=; it is not a general parser package.
+Car 002 vendors the exact parser snapshot named in =ODIN_PLAN.org= and keeps its
+types private behind Seal's =config_toml= package facade. Syntax parsing belongs
+to that facade; explicit Seal tables, keys, values, and policy belong in
+=seal/config.odin=. Do not add runtime backend selection, reflection unmarshal,
+a generic schema validator, or serialization.
 
 * Source and checks
 
-Edit =SEAL.org= first. Tangled Odin files identify their literate ownership.
+Edit =SEAL.org= first. Tangled Seal-owned Odin files identify their literate ownership.
+Vendored upstream source has commit/license provenance and is excluded from
+=SEAL.org= ownership.
 Use reviewer-facing pseudocode before consequential blocks and stable top-level
 block boundaries. Follow 8x16's plain package organization, named constants,
 direct procedures, tabs, =-vet-style=, and =-vet-tabs=.
@@ -51,9 +56,12 @@ direct procedures, tabs, =-vet-style=, and =-vet-tabs=.
 Run two tangles, require clean generated output after the second, then:
 
 #+begin_src sh
-odin check seal -vet-style -vet-tabs
-odin test seal -vet-style -vet-tabs
-odin build seal -out:./seal.bin -vet-style -vet-tabs
+odin check vendor/toml
+odin test vendor/toml/tests
+odin test config_toml -vet-style -vet-tabs -vet-packages:config_toml
+odin check seal -vet-style -vet-tabs -vet-packages:main,config_toml
+odin test seal -vet-style -vet-tabs -vet-packages:main,config_toml
+odin build seal -out:./seal.bin -vet-style -vet-tabs -vet-packages:main,config_toml
 #+end_src
 
 Use =nix shell nixpkgs#odin= when Odin is absent from =PATH=. Add rsync and

@@ -5,19 +5,26 @@
 This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary files used by Odin and reviewers.
 
-The complete generated-file boundary is =.gitignore=, =seal/main.odin=,
+The complete generated-file boundary is =.gitignore=,
+=config_toml/config.odin=, =config_toml/config_test.odin=, =seal/main.odin=,
 =seal/config.odin=, =seal/main_test.odin=, and =seal/config_test.odin=.
 Generated files identify their source blocks so compiler diagnostics can be
 mapped back here.
+
+Pinned source under =vendor/toml/= is upstream material with separate
+provenance. It is deliberately outside Seal's literate ownership boundary.
 
 Tangle twice, then check, test, and build from the repository root:
 
 #+begin_src sh
 .ephemera/tangle-org.sh SEAL.org
 .ephemera/tangle-org.sh SEAL.org
-nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
-nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
-nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin check vendor/toml
+nix shell nixpkgs#odin -c odin test vendor/toml/tests
+nix shell nixpkgs#odin -c odin test config_toml -vet-style -vet-tabs -vet-packages:config_toml
+nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs -vet-packages:main,config_toml
+nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs -vet-packages:main,config_toml
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs -vet-packages:main,config_toml
 #+end_src
 
 The second tangle must leave no generated-file diff.
@@ -32,34 +39,315 @@ Build output and local tangle machinery are not source artifacts.
 /seal.bin
 #+end_src
 
+* TOML facade
+
+** Contract and implementation
+
+The =config_toml= package is Seal-owned. Its public surface owns an opaque
+=Document=, normalized parse errors, and cloned query results. Upstream TOML
+types remain private to this package. Callers destroy documents, parse errors,
+returned strings, and returned string slices after use.
+
+Pseudocode:
+
+1. Parse TOML syntax through the pinned backend and normalize any backend error.
+2. Keep the backend table behind opaque document state and destroy it recursively.
+3. Traverse tables without exposing backend types; distinguish missing paths from
+   values of the wrong type.
+4. Clone every returned key, string, and string-array item so results are owned by
+   the caller and independent of document lifetime.
+
+#+begin_src odin :tangle config_toml/config.odin :name config-toml-package
+package config_toml
+
+import "core:strings"
+import toml "../vendor/toml"
+
+@private
+Backend_State :: struct {
+	table: ^toml.Table,
+}
+
+// Document owns private backend state and its parser tree.
+Document :: struct {
+	state: ^Backend_State,
+}
+
+Parse_Error :: struct {
+	line:    int,
+	message: string,
+}
+
+Lookup_Status :: enum {
+	Found,
+	Missing,
+	Wrong_Type,
+}
+
+@private
+backend_table :: proc(document: ^Document) -> ^toml.Table {
+	if document.state == nil {
+		return nil
+	}
+	return document.state.table
+}
+
+parse :: proc(text, source: string) -> (Document, Parse_Error, bool) {
+	table, upstream_error := toml.parse(text, source)
+	if upstream_error.type == .None {
+		state := new(Backend_State)
+		state.table = table
+		return Document{state = state}, Parse_Error{}, true
+	}
+	defer toml.delete_error(&upstream_error)
+	formatted, _ := toml.format_error(&upstream_error)
+	message := formatted
+	if len(formatted) >= len(source) {
+		separator := strings.index_byte(formatted[len(source):], ' ')
+		if separator >= 0 {
+			message = formatted[len(source) + separator + 1:]
+		}
+	}
+	return Document{}, Parse_Error{
+		line = upstream_error.line,
+		message = strings.clone(strings.trim_space(message)),
+	}, false
+}
+
+destroy :: proc(document: ^Document) {
+	if document.state != nil {
+		_ = toml.deep_delete(backend_table(document))
+		free(document.state)
+	}
+	document^ = {}
+}
+
+destroy_parse_error :: proc(problem: ^Parse_Error) {
+	if len(problem.message) > 0 {
+		delete(problem.message)
+	}
+	problem^ = {}
+}
+
+@private
+lookup :: proc(document: ^Document, path: []string) -> (toml.Type, Lookup_Status) {
+	table := backend_table(document)
+	if table == nil || len(path) == 0 {
+		return nil, .Missing
+	}
+	for component in path[:len(path) - 1] {
+		value, present := table[component]
+		if !present {
+			return nil, .Missing
+		}
+		next, is_table := value.(^toml.Table)
+		if !is_table {
+			return nil, .Wrong_Type
+		}
+		table = next
+	}
+	value, present := table[path[len(path) - 1]]
+	if !present {
+		return nil, .Missing
+	}
+	return value, .Found
+}
+
+@private
+table_at :: proc(document: ^Document, path: []string) -> (^toml.Table, Lookup_Status) {
+	if len(path) == 0 {
+		table := backend_table(document)
+		if table == nil {
+			return nil, .Missing
+		}
+		return table, .Found
+	}
+	value, status := lookup(document, path)
+	if status != .Found {
+		return nil, status
+	}
+	table, ok := value.(^toml.Table)
+	if !ok {
+		return nil, .Wrong_Type
+	}
+	return table, .Found
+}
+
+table_keys :: proc(document: ^Document, path: ..string) -> ([]string, Lookup_Status) {
+	table, status := table_at(document, path)
+	if status != .Found {
+		return nil, status
+	}
+	keys := make([]string, len(table))
+	i := 0
+	for key in table {
+		keys[i] = strings.clone(key)
+		i += 1
+	}
+	return keys, .Found
+}
+
+get_string :: proc(document: ^Document, path: ..string) -> (string, Lookup_Status) {
+	value, status := lookup(document, path)
+	if status != .Found {
+		return "", status
+	}
+	result, ok := value.(string)
+	if !ok {
+		return "", .Wrong_Type
+	}
+	return strings.clone(result), .Found
+}
+
+get_string_array :: proc(document: ^Document, path: ..string) -> ([]string, Lookup_Status) {
+	value, status := lookup(document, path)
+	if status != .Found {
+		return nil, status
+	}
+	list, ok := value.(^toml.List)
+	if !ok {
+		return nil, .Wrong_Type
+	}
+	result := make([]string, len(list))
+	for item, i in list {
+		string_item, is_string := item.(string)
+		if !is_string {
+			destroy_string_items(result[:i])
+			delete(result)
+			return nil, .Wrong_Type
+		}
+		result[i] = strings.clone(string_item)
+	}
+	return result, .Found
+}
+
+@private
+destroy_string_items :: proc(values: []string) {
+	for value in values {
+		delete(value)
+	}
+}
+
+destroy_string_array :: proc(values: []string) {
+	destroy_string_items(values)
+	delete(values)
+}
+#+end_src
+
+** Facade behavior
+
+Tests exercise valid enumeration and lookup, missing versus wrong type, parse
+error normalization, and explicit destruction of all owned results.
+
+#+begin_src odin :tangle config_toml/config_test.odin :name config-toml-tests
+package config_toml
+
+import "core:strings"
+import "core:testing"
+
+@(test)
+test_valid_queries_and_enumeration_are_owned :: proc(t: ^testing.T) {
+	document, problem, ok := parse(`name = "seal"
+[debug]
+flags = ["-v"]
+`, "valid.toml")
+	defer destroy(&document)
+	defer destroy_parse_error(&problem)
+	testing.expect(t, ok, problem.message)
+
+	keys, status := table_keys(&document)
+	defer destroy_string_array(keys)
+	testing.expect_value(t, status, Lookup_Status.Found)
+	testing.expect_value(t, len(keys), 2)
+
+	name, name_status := get_string(&document, "name")
+	defer delete(name)
+	testing.expect_value(t, name_status, Lookup_Status.Found)
+	testing.expect_value(t, name, "seal")
+
+	flags, flags_status := get_string_array(&document, "debug", "flags")
+	defer destroy_string_array(flags)
+	testing.expect_value(t, flags_status, Lookup_Status.Found)
+	testing.expect_value(t, flags[0], "-v")
+
+	destroy(&document)
+	testing.expect_value(t, name, "seal")
+	testing.expect_value(t, flags[0], "-v")
+	found_name, found_debug := false, false
+	for key in keys {
+		found_name = found_name || key == "name"
+		found_debug = found_debug || key == "debug"
+	}
+	testing.expect(t, found_name)
+	testing.expect(t, found_debug)
+}
+
+@(test)
+test_queries_distinguish_missing_and_wrong_type :: proc(t: ^testing.T) {
+	document, problem, ok := parse(`name = "seal"
+count = 1
+`, "types.toml")
+	defer destroy(&document)
+	defer destroy_parse_error(&problem)
+	testing.expect(t, ok, problem.message)
+
+	_, missing := get_string(&document, "absent")
+	_, wrong := get_string(&document, "count")
+	_, through_scalar := get_string(&document, "name", "child")
+	testing.expect_value(t, missing, Lookup_Status.Missing)
+	testing.expect_value(t, wrong, Lookup_Status.Wrong_Type)
+	testing.expect_value(t, through_scalar, Lookup_Status.Wrong_Type)
+}
+
+@(test)
+test_syntax_error_is_normalized_and_owned :: proc(t: ^testing.T) {
+	document, problem, ok := parse("name = [\n", "broken.toml")
+	defer destroy(&document)
+	defer destroy_parse_error(&problem)
+	testing.expect(t, !ok)
+	testing.expect(t, problem.line > 0)
+	testing.expect(t, !strings.contains(problem.message, "broken.toml"))
+}
+#+end_src
+
 * Configuration
 
-** Package, imports, and types
+** Schema and resolution
 
-Configuration owns only Seal's fields. Empty debug strings represent an empty
-debug array; booleans distinguish absent optional SSH coordinates.
+Seal owns schema policy. Explicit root, peer, tools, and debug key sets reject
+unknown names after syntax parsing. Durable configuration stores semantic values
+only; SSH mode follows from a nonempty =peer_ssh= value.
 
-#+begin_src odin :tangle seal/config.odin :name config-package-types
+Pseudocode:
+
+1. Parse syntax through =config_toml= and stop on its normalized error.
+2. Enumerate every allowed table, require peer and tools, reject unknown names,
+   and distinguish missing values from wrong types.
+3. Clone required and optional strings; accept only empty or one whitelisted debug
+   flag and apply defaults.
+4. Reject empty SSH values, mismatched peer/tool SSH settings, relative tool paths,
+   and SSH debug flags for a local peer.
+5. Resolve the local mailbox and local peer path from the configuration directory;
+   preserve the remote path for SSH peers.
+
+#+begin_src odin :tangle seal/config.odin :name config-schema-and-resolution
 package main
 
+import config_toml "../config_toml"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:unicode/utf8"
 
 Config :: struct {
-	path:               string,
-	directory:          string,
-	local_mailbox:      string,
-	peer_path:          string,
-	peer_ssh:           string,
-	has_peer_ssh:       bool,
-	rsync:              string,
-	ssh:                string,
-	has_ssh:            bool,
-	rsync_debug_flag:   string,
-	ssh_debug_flag:     string,
-	has_ssh_debug_flag: bool,
+	path:             string,
+	directory:        string,
+	local_mailbox:    string,
+	peer_path:        string,
+	peer_ssh:         string,
+	rsync:            string,
+	ssh:              string,
+	rsync_debug_flag: string,
+	ssh_debug_flag:   string,
 }
 
 Config_Error :: struct {
@@ -68,262 +356,121 @@ Config_Error :: struct {
 	message: string,
 }
 
-Config_Table :: enum {
-	Root,
-	Peer,
-	Tools,
-	Debug,
-}
+ROOT_KEYS := [?]string{"local_mailbox", "peer", "tools", "debug"}
+PEER_KEYS := [?]string{"path", "ssh"}
+TOOLS_KEYS := [?]string{"rsync", "ssh"}
+DEBUG_KEYS := [?]string{"rsync_debug_flags", "ssh_debug_flags"}
 
-Config_Seen :: struct {
-	peer_table:       bool,
-	tools_table:      bool,
-	debug_table:      bool,
-	local_mailbox:    bool,
-	peer_path:        bool,
-	peer_ssh:         bool,
-	rsync:            bool,
-	ssh:              bool,
-	rsync_debug_flag: bool,
-	ssh_debug_flag:   bool,
-}
-#+end_src
-
-** Basic values
-
-Pseudocode:
-
-1. Require an opening quote and scan one physical line byte by byte.
-2. Copy ordinary UTF-8 bytes and decode only the five accepted escapes.
-3. Reject control bytes, malformed escapes, and an absent closing quote.
-4. Return an owned decoded string plus the unconsumed suffix.
-
-#+begin_src odin :tangle seal/config.odin :name config-basic-values
-parse_basic_string :: proc(input: string) -> (value, rest, problem: string) {
-	if len(input) == 0 || input[0] != '"' {
-		return "", "", "expected quoted string"
-	}
-
-	builder := strings.builder_make()
-	defer strings.builder_destroy(&builder)
-	for i := 1; i < len(input); i += 1 {
-		byte_value := input[i]
-		if byte_value == '"' {
-			return strings.clone(strings.to_string(builder)), input[i + 1:], ""
-		}
-		if byte_value < 0x20 {
-			return "", "", "control byte in quoted string"
-		}
-		if byte_value != '\\' {
-			strings.write_byte(&builder, byte_value)
-			continue
-		}
-
-		i += 1
-		if i >= len(input) {
-			return "", "", "unterminated escape"
-		}
-		switch input[i] {
-		case '\\':
-			strings.write_byte(&builder, '\\')
-		case '"':
-			strings.write_byte(&builder, '"')
-		case 'n':
-			strings.write_byte(&builder, '\n')
-		case 'r':
-			strings.write_byte(&builder, '\r')
-		case 't':
-			strings.write_byte(&builder, '\t')
-		case:
-			return "", "", "unsupported string escape"
-		}
-	}
-	return "", "", "unterminated quoted string"
-}
-
-trailing_comment_or_empty :: proc(input: string) -> bool {
-	rest := strings.trim_space(input)
-	return len(rest) == 0 || rest[0] == '#'
-}
-
-parse_string_value :: proc(input: string) -> (value, problem: string) {
-	rest: string
-	value, rest, problem = parse_basic_string(input)
-	if len(problem) != 0 {
-		return "", problem
-	}
-	if !trailing_comment_or_empty(rest) {
-		delete(value)
-		return "", "unexpected syntax after string"
-	}
-	return value, ""
-}
-
-valid_debug_flag :: proc(value: string) -> bool {
-	return value == "-v" || value == "-vv" || value == "-vvv"
-}
-
-parse_debug_value :: proc(input: string) -> (value, problem: string) {
-	if len(input) == 0 || input[0] != '[' {
-		return "", "expected debug flag array"
-	}
-	rest := strings.trim_left_space(input[1:])
-	if len(rest) > 0 && rest[0] == ']' {
-		if !trailing_comment_or_empty(rest[1:]) {
-			return "", "unexpected syntax after debug flag array"
-		}
-		return "", ""
-	}
-
-	suffix: string
-	value, suffix, problem = parse_basic_string(rest)
-	if len(problem) != 0 {
-		return "", problem
-	}
-	suffix = strings.trim_left_space(suffix)
-	if len(suffix) == 0 || suffix[0] != ']' {
-		delete(value)
-		return "", "debug flag array must contain one value"
-	}
-	if !trailing_comment_or_empty(suffix[1:]) {
-		delete(value)
-		return "", "unexpected syntax after debug flag array"
-	}
-	if !valid_debug_flag(value) {
-		delete(value)
-		return "", "debug flag must be -v, -vv, or -vvv"
-	}
-	return value, ""
-}
-#+end_src
-
-** Strict line parser
-
-Pseudocode:
-
-1. Start in the root table with debug defaults of =-v=.
-2. Skip blank and comment lines; accept each known table header once.
-3. Split assignments at the first equals byte and dispatch only exact bare keys
-   allowed in the current table.
-4. Reject the first unknown or duplicate field with its source line.
-5. Require the three unconditional fields and the SSH/local field combinations.
-6. Resolve local peer and mailbox paths lexically from the config directory;
-   leave an SSH peer path untouched.
-
-#+begin_src odin :tangle seal/config.odin :name config-line-parser
 config_error :: proc(path: string, line: int, message: string) -> Config_Error {
-	return Config_Error{path = strings.clone(path), line = line, message = message}
+	return Config_Error{
+		path = strings.clone(path),
+		line = line,
+		message = strings.clone(message),
+	}
 }
 
 destroy_config_error :: proc(problem: ^Config_Error) {
 	if len(problem.path) > 0 {
 		delete(problem.path)
 	}
+	if len(problem.message) > 0 {
+		delete(problem.message)
+	}
 	problem^ = {}
 }
 
-parse_table :: proc(line: string, seen: ^Config_Seen) -> (Config_Table, string) {
-	closing := strings.index_byte(line, ']')
-	if closing < 0 || !trailing_comment_or_empty(line[closing + 1:]) {
-		return .Root, "malformed table header"
+contains_key :: proc(allowed: []string, candidate: string) -> bool {
+	for key in allowed {
+		if key == candidate {
+			return true
+		}
 	}
-	name := line[1:closing]
-	switch name {
-	case "peer":
-		if seen.peer_table {
-			return .Root, "duplicate table [peer]"
-		}
-		seen.peer_table = true
-		return .Peer, ""
-	case "tools":
-		if seen.tools_table {
-			return .Root, "duplicate table [tools]"
-		}
-		seen.tools_table = true
-		return .Tools, ""
-	case "debug":
-		if seen.debug_table {
-			return .Root, "duplicate table [debug]"
-		}
-		seen.debug_table = true
-		return .Debug, ""
-	case:
-		return .Root, "unknown table"
-	}
+	return false
 }
 
-assign_string :: proc(destination: ^string, present: ^bool, input: string) -> string {
-	if present^ {
-		return "duplicate field"
+validate_table :: proc(
+	document: ^config_toml.Document,
+	path: []string,
+	allowed: []string,
+	required: bool,
+	missing_message: string,
+	wrong_type_message: string,
+	unknown_message: string,
+) -> (config_toml.Lookup_Status, string) {
+	keys, status := config_toml.table_keys(document, ..path)
+	if status == .Missing && !required {
+		return status, ""
 	}
-	value, problem := parse_string_value(input)
-	if len(problem) != 0 {
-		return problem
+	if status == .Missing {
+		return status, missing_message
 	}
-	destination^ = value
-	present^ = true
-	return ""
+	if status == .Wrong_Type {
+		return status, wrong_type_message
+	}
+	defer config_toml.destroy_string_array(keys)
+	for key in keys {
+		if !contains_key(allowed, key) {
+			return status, unknown_message
+		}
+	}
+	return status, ""
 }
 
-assign_debug :: proc(destination: ^string, present: ^bool, input: string) -> string {
-	if present^ {
-		return "duplicate field"
+required_string :: proc(
+	document: ^config_toml.Document,
+	path: []string,
+	missing_message, wrong_type_message: string,
+) -> (string, string) {
+	value, status := config_toml.get_string(document, ..path)
+	switch status {
+	case .Found:
+		return value, ""
+	case .Missing:
+		return "", missing_message
+	case .Wrong_Type:
+		return "", wrong_type_message
 	}
-	value, problem := parse_debug_value(input)
-	if len(problem) != 0 {
-		return problem
-	}
-	destination^ = value
-	present^ = true
-	return ""
+	return "", wrong_type_message
 }
 
-parse_assignment :: proc(
-	config: ^Config,
-	seen: ^Config_Seen,
-	table: Config_Table,
-	line: string,
-) -> string {
-	equals := strings.index_byte(line, '=')
-	if equals < 0 {
-		return "expected key = value"
+optional_string :: proc(
+	document: ^config_toml.Document,
+	path: []string,
+	wrong_type_message: string,
+) -> (string, config_toml.Lookup_Status, string) {
+	value, status := config_toml.get_string(document, ..path)
+	if status == .Wrong_Type {
+		return "", status, wrong_type_message
 	}
-	key := strings.trim_space(line[:equals])
-	value := strings.trim_left_space(line[equals + 1:])
-	switch table {
-	case .Root:
-		if key == "local_mailbox" {
-			return assign_string(&config.local_mailbox, &seen.local_mailbox, value)
-		}
-	case .Peer:
-		switch key {
-		case "path":
-			return assign_string(&config.peer_path, &seen.peer_path, value)
-		case "ssh":
-			problem := assign_string(&config.peer_ssh, &seen.peer_ssh, value)
-			config.has_peer_ssh = len(problem) == 0
-			return problem
-		}
-	case .Tools:
-		switch key {
-		case "rsync":
-			return assign_string(&config.rsync, &seen.rsync, value)
-		case "ssh":
-			problem := assign_string(&config.ssh, &seen.ssh, value)
-			config.has_ssh = len(problem) == 0
-			return problem
-		}
-	case .Debug:
-		switch key {
-		case "rsync_debug_flags":
-			return assign_debug(&config.rsync_debug_flag, &seen.rsync_debug_flag, value)
-		case "ssh_debug_flags":
-			problem := assign_debug(&config.ssh_debug_flag, &seen.ssh_debug_flag, value)
-			config.has_ssh_debug_flag = len(problem) == 0
-			return problem
-		}
+	return value, status, ""
+}
+
+valid_debug_flag :: proc(value: string) -> bool {
+	return value == "-v" || value == "-vv" || value == "-vvv"
+}
+
+debug_flag :: proc(
+	document: ^config_toml.Document,
+	key, wrong_type_message: string,
+) -> (string, config_toml.Lookup_Status, string) {
+	values, status := config_toml.get_string_array(document, "debug", key)
+	if status == .Missing {
+		return "", status, ""
 	}
-	return "unknown key in current table"
+	if status == .Wrong_Type {
+		return "", status, wrong_type_message
+	}
+	defer config_toml.destroy_string_array(values)
+	if len(values) > 1 {
+		return "", status, "debug flag array must contain at most one value"
+	}
+	if len(values) == 0 {
+		return "", status, ""
+	}
+	if !valid_debug_flag(values[0]) {
+		return "", status, "debug flag must be -v, -vv, or -vvv"
+	}
+	return strings.clone(values[0]), status, ""
 }
 
 resolve_local_path :: proc(directory, path: string) -> string {
@@ -339,74 +486,141 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		path = strings.clone(path),
 		directory = strings.clone(directory),
 	}
-	seen := Config_Seen{}
-	table := Config_Table.Root
-	if !utf8.valid_string(text) {
-		return config, config_error(path, 1, "configuration is not valid UTF-8"), false
+	document, parse_problem, parsed := config_toml.parse(text, path)
+	defer config_toml.destroy(&document)
+	defer config_toml.destroy_parse_error(&parse_problem)
+	if !parsed {
+		return config, config_error(path, parse_problem.line, parse_problem.message), false
 	}
 
-	remaining := text
-	line_number := 0
-	for {
-		line, ok := strings.split_lines_iterator(&remaining)
-		if !ok {
-			break
+	tables := []struct {
+		path:               []string,
+		allowed:            []string,
+		required:           bool,
+		missing_message:    string,
+		wrong_type_message: string,
+		unknown_message:    string,
+	}{
+		{nil, ROOT_KEYS[:], true, "", "configuration root must be a table", "unknown root key or table"},
+		{[]string{"peer"}, PEER_KEYS[:], true, "missing [peer]", "peer must be a table", "unknown key in [peer]"},
+		{[]string{"tools"}, TOOLS_KEYS[:], true, "missing [tools]", "tools must be a table", "unknown key in [tools]"},
+		{[]string{"debug"}, DEBUG_KEYS[:], false, "", "debug must be a table", "unknown key in [debug]"},
+	}
+	debug_table_status := config_toml.Lookup_Status.Missing
+	for table, i in tables {
+		status, problem := validate_table(
+			&document,
+			table.path,
+			table.allowed,
+			table.required,
+			table.missing_message,
+			table.wrong_type_message,
+			table.unknown_message,
+		)
+		if i == 3 {
+			debug_table_status = status
 		}
-		line_number += 1
-		line = strings.trim_space(line)
-		if len(line) == 0 || line[0] == '#' {
-			continue
-		}
-		if line[0] == '[' {
-			problem: string
-			table, problem = parse_table(line, &seen)
-			if len(problem) != 0 {
-				return config, config_error(path, line_number, problem), false
-			}
-			continue
-		}
-		problem := parse_assignment(&config, &seen, table, line)
-		if len(problem) != 0 {
-			return config, config_error(path, line_number, problem), false
+		if len(problem) > 0 {
+			return config, config_error(path, 0, problem), false
 		}
 	}
 
-	if !seen.local_mailbox {
-		return config, config_error(path, line_number + 1, "missing local_mailbox"), false
+	problem: string
+	config.local_mailbox, problem = required_string(
+		&document,
+		[]string{"local_mailbox"},
+		"missing local_mailbox",
+		"local_mailbox must be a string",
+	)
+	if len(problem) > 0 {
+		return config, config_error(path, 0, problem), false
 	}
-	if !seen.peer_path {
-		return config, config_error(path, line_number + 1, "missing peer.path"), false
+	config.peer_path, problem = required_string(
+		&document,
+		[]string{"peer", "path"},
+		"missing peer.path",
+		"peer.path must be a string",
+	)
+	if len(problem) > 0 {
+		return config, config_error(path, 0, problem), false
 	}
-	if !seen.rsync {
-		return config, config_error(path, line_number + 1, "missing tools.rsync"), false
+	config.rsync, problem = required_string(
+		&document,
+		[]string{"tools", "rsync"},
+		"missing tools.rsync",
+		"tools.rsync must be a string",
+	)
+	if len(problem) > 0 {
+		return config, config_error(path, 0, problem), false
 	}
+
+	peer_ssh_status: config_toml.Lookup_Status
+	config.peer_ssh, peer_ssh_status, problem = optional_string(
+		&document,
+		[]string{"peer", "ssh"},
+		"peer.ssh must be a string",
+	)
+	if len(problem) > 0 {
+		return config, config_error(path, 0, problem), false
+	}
+	ssh_status: config_toml.Lookup_Status
+	config.ssh, ssh_status, problem = optional_string(
+		&document,
+		[]string{"tools", "ssh"},
+		"tools.ssh must be a string",
+	)
+	if len(problem) > 0 {
+		return config, config_error(path, 0, problem), false
+	}
+
+	rsync_debug_status := config_toml.Lookup_Status.Missing
+	ssh_debug_status := config_toml.Lookup_Status.Missing
+	if debug_table_status == .Found {
+		config.rsync_debug_flag, rsync_debug_status, problem = debug_flag(
+			&document,
+			"rsync_debug_flags",
+			"debug.rsync_debug_flags must be an array of strings",
+		)
+		if len(problem) > 0 {
+			return config, config_error(path, 0, problem), false
+		}
+		config.ssh_debug_flag, ssh_debug_status, problem = debug_flag(
+			&document,
+			"ssh_debug_flags",
+			"debug.ssh_debug_flags must be an array of strings",
+		)
+		if len(problem) > 0 {
+			return config, config_error(path, 0, problem), false
+		}
+	}
+
 	if len(config.local_mailbox) == 0 || len(config.peer_path) == 0 || len(config.rsync) == 0 {
-		return config, config_error(path, line_number + 1, "required paths must not be empty"), false
+		return config, config_error(path, 0, "required paths must not be empty"), false
 	}
-	if (config.has_peer_ssh && len(config.peer_ssh) == 0) || (config.has_ssh && len(config.ssh) == 0) {
-		return config, config_error(path, line_number + 1, "SSH values must not be empty"), false
+	if peer_ssh_status == .Found && len(config.peer_ssh) == 0 ||
+	   ssh_status == .Found && len(config.ssh) == 0 {
+		return config, config_error(path, 0, "SSH values must not be empty"), false
 	}
-	if !filepath.is_abs(config.rsync) || config.has_ssh && !filepath.is_abs(config.ssh) {
-		return config, config_error(path, line_number + 1, "tool paths must be absolute"), false
+	if !filepath.is_abs(config.rsync) || len(config.ssh) > 0 && !filepath.is_abs(config.ssh) {
+		return config, config_error(path, 0, "tool paths must be absolute"), false
 	}
-	if config.has_peer_ssh != config.has_ssh {
-		return config, config_error(path, line_number + 1, "SSH peer requires tools.ssh; local peer must omit it"), false
+	if (len(config.peer_ssh) > 0) != (len(config.ssh) > 0) {
+		return config, config_error(path, 0, "SSH peer requires tools.ssh; local peer must omit it"), false
 	}
-	if !config.has_peer_ssh && config.has_ssh_debug_flag {
-		return config, config_error(path, line_number + 1, "local peer must omit ssh_debug_flags"), false
+	if len(config.peer_ssh) == 0 && ssh_debug_status == .Found {
+		return config, config_error(path, 0, "local peer must omit ssh_debug_flags"), false
 	}
-	if !seen.rsync_debug_flag {
+	if rsync_debug_status == .Missing {
 		config.rsync_debug_flag = strings.clone("-v")
 	}
-	if config.has_peer_ssh && !seen.ssh_debug_flag {
+	if len(config.peer_ssh) > 0 && ssh_debug_status == .Missing {
 		config.ssh_debug_flag = strings.clone("-v")
-		config.has_ssh_debug_flag = true
 	}
 
 	resolved_mailbox := resolve_local_path(directory, config.local_mailbox)
 	delete(config.local_mailbox)
 	config.local_mailbox = resolved_mailbox
-	if !config.has_peer_ssh {
+	if len(config.peer_ssh) == 0 {
 		resolved_peer := resolve_local_path(directory, config.peer_path)
 		delete(config.peer_path)
 		config.peer_path = resolved_peer
@@ -433,18 +647,7 @@ destroy_config :: proc(config: ^Config) {
 	}
 	config^ = {}
 }
-#+end_src
 
-** File loading
-
-Pseudocode:
-
-1. Convert selected config path to a clean absolute path without filesystem
-   canonicalization.
-2. Read that exact file and derive its lexical directory.
-3. Parse and resolve from that directory; perform no other filesystem access.
-
-#+begin_src odin :tangle seal/config.odin :name config-file-loading
 load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
 	absolute_path, path_error := os.get_absolute_path(selected_path, context.allocator)
 	if path_error != nil {
@@ -663,7 +866,7 @@ run_cfg :: proc(cli: Cli) -> int {
 		} else {
 			debug("rsync debug flags", config.rsync_debug_flag)
 		}
-		if config.has_peer_ssh {
+		if len(config.peer_ssh) > 0 {
 			debug("peer ssh", config.peer_ssh)
 			debug("ssh", config.ssh)
 			if len(config.ssh_debug_flag) == 0 {
@@ -683,7 +886,7 @@ run_cfg :: proc(cli: Cli) -> int {
 	fmt.printfln("configuration path: %s", config.path)
 	fmt.printfln("configuration directory: %s", config.directory)
 	fmt.printfln("local mailbox: %s", config.local_mailbox)
-	if config.has_peer_ssh {
+	if len(config.peer_ssh) > 0 {
 		fmt.println("peer kind: ssh")
 		fmt.printfln("peer ssh: %s", config.peer_ssh)
 	} else {
@@ -691,13 +894,13 @@ run_cfg :: proc(cli: Cli) -> int {
 	}
 	fmt.printfln("peer path: %s", config.peer_path)
 	fmt.printfln("rsync: %s", config.rsync)
-	if config.has_ssh {
+	if len(config.ssh) > 0 {
 		fmt.printfln("ssh: %s", config.ssh)
 	} else {
 		fmt.println("ssh: not configured")
 	}
 	print_debug_flag("rsync debug flags", config.rsync_debug_flag)
-	if config.has_peer_ssh {
+	if len(config.peer_ssh) > 0 {
 		print_debug_flag("ssh debug flags", config.ssh_debug_flag)
 	} else {
 		fmt.println("ssh debug flags: not applicable")
@@ -707,7 +910,7 @@ run_cfg :: proc(cli: Cli) -> int {
 	for flag in TRANSFER_FLAGS {
 		fmt.printfln("  %s", flag)
 	}
-	if config.has_peer_ssh {
+	if len(config.peer_ssh) > 0 {
 		fmt.printfln("  %s", SSH_TRANSFER_FLAG)
 	}
 	return 0
@@ -812,65 +1015,49 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 }
 #+end_src
 
-** Configuration test package
+** Configuration behavior
 
-#+begin_src odin :tangle seal/config_test.odin :name config-test-package
+Tests keep parser mechanics in the facade package and exercise only Seal schema:
+local and SSH coordinates, debug arrays and defaults, unknown names, wrong types,
+and invalid TOML propagation.
+
+#+begin_src odin :tangle seal/config_test.odin :name config-behavior-tests
 package main
 
+import "core:strings"
 import "core:testing"
-#+end_src
 
-** Representative local configuration
-
-Pseudocode:
-
-1. Parse a local peer with comments, an empty rsync debug array, and relative
-   mailbox coordinates.
-2. Require lexical resolution from the supplied configuration directory.
-3. Require the local-only SSH omissions and no unrelated behavior.
-
-#+begin_src odin :tangle seal/config_test.odin :name local-config-test
 @(test)
 test_local_config_resolves_from_config_directory :: proc(t: ^testing.T) {
 	text := `# local workspace
 local_mailbox = "../mailbox"
 
-[peer] # local coordinates
+[peer]
 path = "peer/mailbox"
 
 [tools]
 rsync = "/run/current-system/sw/bin/rsync"
 
 [debug]
-rsync_debug_flags = [] # quiet when --debug is present
+rsync_debug_flags = []
 `
 	config, problem, ok := parse_config(text, "/work/seal/config/seal.toml", "/work/seal/config")
 	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
 	testing.expect(t, ok, problem.message)
 	testing.expect_value(t, config.local_mailbox, "/work/seal/mailbox")
 	testing.expect_value(t, config.peer_path, "/work/seal/config/peer/mailbox")
-	testing.expect(t, !config.has_peer_ssh)
-	testing.expect(t, !config.has_ssh)
+	testing.expect_value(t, config.peer_ssh, "")
+	testing.expect_value(t, config.ssh, "")
 	testing.expect_value(t, config.rsync_debug_flag, "")
 }
-#+end_src
 
-** Representative SSH configuration
-
-Pseudocode:
-
-1. Parse all SSH coordinates, trailing comments, a supported string escape,
-   and one accepted verbosity value.
-2. Leave remote peer path untouched while resolving only local mailbox state.
-3. Require the missing rsync debug value to default to =-v=.
-
-#+begin_src odin :tangle seal/config_test.odin :name ssh-config-test
 @(test)
-test_ssh_config_keeps_remote_path :: proc(t: ^testing.T) {
+test_ssh_config_keeps_remote_path_and_applies_defaults :: proc(t: ^testing.T) {
 	text := `local_mailbox = "mailbox"
 
 [peer]
-path = "/home/agent/mailbox" # peer-side path
+path = "/home/agent/mailbox"
 ssh = "experiment.\"agent"
 
 [tools]
@@ -882,6 +1069,7 @@ ssh_debug_flags = ["-vvv"]
 `
 	config, problem, ok := parse_config(text, "/work/seal.toml", "/work")
 	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
 	testing.expect(t, ok, problem.message)
 	testing.expect_value(t, config.local_mailbox, "/work/mailbox")
 	testing.expect_value(t, config.peer_path, "/home/agent/mailbox")
@@ -889,28 +1077,90 @@ ssh_debug_flags = ["-vvv"]
 	testing.expect_value(t, config.rsync_debug_flag, "-v")
 	testing.expect_value(t, config.ssh_debug_flag, "-vvv")
 }
-#+end_src
 
-** First invalid line
-
-Pseudocode:
-
-1. Present an unknown peer key before later missing fields could be considered.
-2. Require one failure naming the supplied path and physical line.
-
-#+begin_src odin :tangle seal/config_test.odin :name invalid-config-test
 @(test)
-test_invalid_config_reports_first_path_and_line :: proc(t: ^testing.T) {
-	text := `local_mailbox = "mailbox"
+test_schema_rejects_unknown_names :: proc(t: ^testing.T) {
+	unknown_root := `local_mailbox = "mailbox"
+surprise = "value"
 [peer]
-destination = "agent"
+path = "peer"
+[tools]
+rsync = "/bin/rsync"
 `
-	config, problem, ok := parse_config(text, "/work/bad.toml", "/work")
+	config, problem, ok := parse_config(unknown_root, "/work/root.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.message, "unknown root key or table")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+
+	unknown_table := `local_mailbox = "mailbox"
+[peer]
+path = "peer"
+[tools]
+rsync = "/bin/rsync"
+[extra]
+value = "unknown"
+`
+	config, problem, ok = parse_config(unknown_table, "/work/table.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.message, "unknown root key or table")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+}
+
+@(test)
+test_schema_rejects_wrong_type :: proc(t: ^testing.T) {
+	text := `local_mailbox = 42
+[peer]
+path = "peer"
+[tools]
+rsync = "/bin/rsync"
+`
+	config, problem, ok := parse_config(text, "/work/type.toml", "/work")
 	defer destroy_config(&config)
 	defer destroy_config_error(&problem)
 	testing.expect(t, !ok)
-	testing.expect_value(t, problem.path, "/work/bad.toml")
-	testing.expect_value(t, problem.line, 3)
-	testing.expect_value(t, problem.message, "unknown key in current table")
+	testing.expect_value(t, problem.message, "local_mailbox must be a string")
+}
+
+@(test)
+test_schema_rejects_empty_ssh_and_unlisted_debug_flag :: proc(t: ^testing.T) {
+	empty_ssh := `local_mailbox = "mailbox"
+[peer]
+path = "/srv/mailbox"
+ssh = ""
+[tools]
+rsync = "/bin/rsync"
+ssh = "/bin/ssh"
+`
+	config, problem, ok := parse_config(empty_ssh, "/work/empty-ssh.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.message, "SSH values must not be empty")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+
+	bad_debug := `local_mailbox = "mailbox"
+[peer]
+path = "peer"
+[tools]
+rsync = "/bin/rsync"
+[debug]
+rsync_debug_flags = ["--verbose"]
+`
+	config, problem, ok = parse_config(bad_debug, "/work/debug.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.message, "debug flag must be -v, -vv, or -vvv")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+}
+
+@(test)
+test_invalid_toml_reports_parser_error :: proc(t: ^testing.T) {
+	config, problem, ok := parse_config("local_mailbox = [\n", "/work/bad.toml", "/work")
+	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
+	testing.expect(t, !ok)
+	testing.expect(t, problem.line > 0)
+	testing.expect(t, !strings.contains(problem.message, "/work/bad.toml"))
 }
 #+end_src
