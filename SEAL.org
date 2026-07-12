@@ -107,76 +107,95 @@ valid_config_key :: proc(input: string) -> bool {
 }
 #+end_src
 
-** Complete-line parser
+** Table production
 
-The parser trims horizontal whitespace and returns borrowed key/value slices.
-It recognizes only blank, table, assignment, or invalid complete lines. Schema
-names and configuration ownership remain outside this file.
+Precondition: =line= is nonempty and starts with =[=; =parse_table_line=
+validates the closing bracket and ASCII key and returns the borrowed table key.
+
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-table-production
+parse_table_line :: proc(line: string) -> Config_Syntax_Line {
+	if len(line) < 3 || line[len(line) - 1] != ']' {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	key := line[1:len(line) - 1]
+	if !valid_config_key(key) {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	return Config_Syntax_Line{kind = .Table, key = key}
+}
+#+end_src
+
+** Assignment production
+
+Precondition: =line= is nonempty and starts with an ASCII letter.
 
 Pseudocode:
 
-1. Trim leading and trailing spaces and tabs; accept an empty result.
-2. Recognize =[key]= only when the inner key has no whitespace and follows the
-   ASCII key grammar.
-3. Otherwise recognize one key, optional horizontal whitespace, ===, optional
-   horizontal whitespace, and one complete double-quoted printable-ASCII value.
-4. Reject comments, escapes, Unicode, control bytes, lists, and trailing bytes.
+1. Scan the key through its final ASCII letter, digit, or underscore.
+2. Consume optional horizontal whitespace, ===, optional horizontal whitespace,
+   and an opening double quote.
+3. Scan printable ASCII value bytes while rejecting backslashes.
+4. Accept only a closing double quote at the end of the line.
 
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-complete-line-parser
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-assignment-production
+parse_assignment_line :: proc(line: string) -> Config_Syntax_Line {
+	i := 0
+	for i < len(line) && is_key_byte(line[i]) {
+		i += 1
+	}
+	key := line[:i]
+	for i < len(line) && is_horizontal_space(line[i]) {
+		i += 1
+	}
+	if i >= len(line) || line[i] != '=' {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	i += 1
+	for i < len(line) && is_horizontal_space(line[i]) {
+		i += 1
+	}
+	if i >= len(line) || line[i] != '"' {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	i += 1
+	value_start := i
+	for i < len(line) {
+		byte_value := line[i]
+		if byte_value == '"' {
+			if i + 1 != len(line) {
+				return Config_Syntax_Line{kind = .Invalid}
+			}
+			return Config_Syntax_Line{
+				kind = .Assignment,
+				key = key,
+				value = line[value_start:i],
+			}
+		}
+		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '\\' {
+			return Config_Syntax_Line{kind = .Invalid}
+		}
+		i += 1
+	}
+	return Config_Syntax_Line{kind = .Invalid}
+}
+#+end_src
+
+** Complete-line dispatcher
+
+The dispatcher trims horizontal whitespace, accepts blank lines, selects table
+or assignment production by the first byte, and rejects every other line.
+
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-complete-line-dispatcher
 parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 	line := trim_horizontal_space(input)
 	if len(line) == 0 {
 		return Config_Syntax_Line{kind = .Blank}
 	}
 	if line[0] == '[' {
-		if len(line) < 3 || line[len(line) - 1] != ']' {
-			return Config_Syntax_Line{kind = .Invalid}
-		}
-		key := line[1:len(line) - 1]
-		if !valid_config_key(key) {
-			return Config_Syntax_Line{kind = .Invalid}
-		}
-		return Config_Syntax_Line{kind = .Table, key = key}
+		return parse_table_line(line)
 	}
-
 	if is_ascii_alpha(line[0]) {
-		i := 0
-		for i < len(line) && is_key_byte(line[i]) {
-			i += 1
-		}
-		key := line[:i]
-		for i < len(line) && is_horizontal_space(line[i]) {
-			i += 1
-		}
-		if i >= len(line) || line[i] != '=' {
-			return Config_Syntax_Line{kind = .Invalid}
-		}
-		i += 1
-		for i < len(line) && is_horizontal_space(line[i]) {
-			i += 1
-		}
-		if i >= len(line) || line[i] != '"' {
-			return Config_Syntax_Line{kind = .Invalid}
-		}
-		i += 1
-		value_start := i
-		for i < len(line) {
-			byte_value := line[i]
-			if byte_value == '"' {
-				if i + 1 != len(line) {
-					return Config_Syntax_Line{kind = .Invalid}
-				}
-				return Config_Syntax_Line{
-					kind = .Assignment,
-					key = key,
-					value = line[value_start:i],
-				}
-			}
-			if byte_value < 0x20 || byte_value > 0x7e || byte_value == '\\' {
-				return Config_Syntax_Line{kind = .Invalid}
-			}
-			i += 1
-		}
+		return parse_assignment_line(line)
 	}
 	return Config_Syntax_Line{kind = .Invalid}
 }
