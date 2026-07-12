@@ -59,6 +59,7 @@ debug :: proc(label, value: string) {
 // END org:block diagnostics
 // BEGIN org:block cli-state
 Cli_Action :: enum {
+	Usage,
 	Run,
 	Cfg,
 	Init,
@@ -81,12 +82,15 @@ Cli :: struct {
 // END org:block cli-state
 // BEGIN org:block parse-args
 parse_args :: proc(args: []string) -> Cli {
-	cli := Cli{config = DEFAULT_CONFIG_PATH}
+	cli := Cli{action = .Usage, config = DEFAULT_CONFIG_PATH}
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
 		switch arg {
 		case "--debug":
 			cli.debug = true
+			if cli.action == .Usage {
+				cli.action = .Run
+			}
 		case "--config":
 			if cli.explicit_config || i + 1 >= len(args) {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = "--config"}
@@ -95,12 +99,12 @@ parse_args :: proc(args: []string) -> Cli {
 			cli.config = args[i]
 			cli.explicit_config = true
 		case "cfg":
-			if cli.action != .Run {
+			if cli.action != .Usage && cli.action != .Run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.action = .Cfg
 		case "init":
-			if cli.action != .Run {
+			if cli.action != .Usage && cli.action != .Run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			if i + 1 >= len(args) {
@@ -234,7 +238,7 @@ run_cfg :: proc(cli: Cli) -> int {
 run :: proc(args: []string) -> int {
 	cli := parse_args(args)
 	switch cli.action {
-	case .Help:
+	case .Usage, .Help:
 		fmt.print(HELP_TEXT)
 		return 0
 	case .Version:

@@ -56,7 +56,7 @@ test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
 	testing.expect(t, os.make_directory(workspace) == nil)
 	selected := test_path(workspace, "seal.toml")
 	defer delete(selected)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		selected,
 		"../peer/mailbox",
 		"",
@@ -64,6 +64,12 @@ test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
 	)
 	defer delete(config_path)
 	defer delete(mailbox_path)
+	defer delete(rsync_path)
+	defer {
+		if len(ssh_path) > 0 {
+			delete(ssh_path)
+		}
+	}
 	testing.expect(t, ok, problem)
 	testing.expect(t, os.exists(config_path))
 	mailbox_info, mailbox_error := os.stat(mailbox_path, context.allocator)
@@ -83,6 +89,7 @@ test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
 	testing.expect_value(t, config.peer_path, expected_peer)
 	expected_rsync := test_path(tools, "rsync")
 	defer delete(expected_rsync)
+	testing.expect_value(t, rsync_path, expected_rsync)
 	testing.expect_value(t, config.rsync, expected_rsync)
 	testing.expect_value(t, config.peer_ssh, "")
 }
@@ -101,7 +108,7 @@ test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
 
 	selected := test_path(root, "seal.toml")
 	defer delete(selected)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		selected,
 		"/home/agent/mailbox",
 		"experiment.agent",
@@ -109,6 +116,8 @@ test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
 	)
 	defer delete(config_path)
 	defer delete(mailbox_path)
+	defer delete(rsync_path)
+	defer delete(ssh_path)
 	testing.expect(t, ok, problem)
 
 	config, config_problem, loaded := seal_config.load_config(config_path)
@@ -121,6 +130,8 @@ test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
 	defer delete(expected_rsync)
 	expected_ssh := test_path(tools, "ssh")
 	defer delete(expected_ssh)
+	testing.expect_value(t, rsync_path, expected_rsync)
+	testing.expect_value(t, ssh_path, expected_ssh)
 	testing.expect_value(t, config.rsync, expected_rsync)
 	testing.expect_value(t, config.ssh, expected_ssh)
 }
@@ -142,7 +153,7 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	testing.expect(t, os.make_directory(config_conflict) == nil)
 	selected := test_path(config_conflict, "seal.toml")
 	testing.expect(t, os.write_entire_file_from_string(selected, "keep config\n") == nil)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		selected,
 		"peer",
 		"",
@@ -150,6 +161,12 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	)
 	delete(config_path)
 	delete(mailbox_path)
+	if len(rsync_path) > 0 {
+		delete(rsync_path)
+	}
+	if len(ssh_path) > 0 {
+		delete(ssh_path)
+	}
 	testing.expect(t, !ok)
 	testing.expect_value(t, problem, "configuration path already exists")
 	mailbox := test_path(config_conflict, "mailbox")
@@ -171,7 +188,7 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	marker := test_path(mailbox, "keep")
 	testing.expect(t, os.write_entire_file_from_string(marker, "keep\n") == nil)
 	selected = test_path(mailbox_conflict, "seal.toml")
-	config_path, mailbox_path, problem, ok = initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok = initialize_workspace(
 		selected,
 		"peer",
 		"",
@@ -179,6 +196,12 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	)
 	delete(config_path)
 	delete(mailbox_path)
+	if len(rsync_path) > 0 {
+		delete(rsync_path)
+	}
+	if len(ssh_path) > 0 {
+		delete(ssh_path)
+	}
 	testing.expect(t, !ok)
 	testing.expect_value(t, problem, "mailbox path already exists")
 	testing.expect(t, !os.exists(selected))

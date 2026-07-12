@@ -1,5 +1,4 @@
 #+title: Seal
-
 * Purpose and ownership
 
 This document is Seal's canonical handwritten implementation source. Edit it
@@ -681,13 +680,13 @@ run_init
        -> APPLY: mkdir mailbox
                  exclusive config write
                  bounded rollback
-  -> INFORM: report paths
+  -> INFORM: report created paths and pinned tools
 #+end_example
 
-CLI and =PATH= inputs are borrowed. Initialization returns owned config/mailbox
-paths and owns resolved tool paths plus rendered text while working. After
-mutation begins, rollback removes the new mailbox only when config creation
-fails; it does not alter pre-existing paths or unrelated state.
+CLI and =PATH= inputs are borrowed. Initialization returns owned config,
+mailbox, and resolved tool paths; rendered text is owned only while applying.
+After mutation begins, rollback removes the new mailbox only when config
+creation fails; it does not alter pre-existing paths or unrelated state.
 
 ** Package and imports
 
@@ -698,6 +697,7 @@ facilities.
 package main
 
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -706,21 +706,19 @@ import "core:sys/posix"
 
 ** Output path resolution
 
-=absolute_init_path= returns an owned clean absolute selected configuration path.
+=absolute_init_path= returns an owned clean absolute requested configuration
+path or its concrete OS/allocator error.
 
 #+begin_src odin :tangle seal/init.odin :name init-output-path-resolution
-absolute_init_path :: proc(path: string) -> (string, bool) {
+absolute_init_path :: proc(path: string) -> (result: string, problem: os.Error) {
 	if filepath.is_abs(path) {
-		cleaned, clean_error := filepath.clean(path)
-		return cleaned, clean_error == nil
+		cleaned := filepath.clean(path) or_return
+		return cleaned, nil
 	}
-	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-	if cwd_error != nil {
-		return "", false
-	}
+	cwd := os.get_absolute_path(".", context.allocator) or_return
 	defer delete(cwd)
-	absolute, join_error := filepath.join([]string{cwd, path})
-	return absolute, join_error == nil
+	absolute := filepath.join([]string{cwd, path}) or_return
+	return absolute, nil
 }
 #+end_src
 
@@ -738,16 +736,19 @@ Example: for =PATH=/usr/bin/:/usr/local/bin:/home/agent/.local/bin= and tool
    first candidate satisfying all three checks wins.
 
 Dangling symlinks and nonregular targets are rejected. An empty =PATH= entry
-means the current directory.
+means the current directory. Expected missing, inaccessible, and non-directory
+entries continue the search; allocator and unexpected OS failures stop it for
+explicit orchestration translation.
 
 #+begin_src odin :tangle seal/init.odin :name init-tool-discovery
-resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
+resolve_path_tool :: proc(name, path_value: string) -> (
+	tool_path: string,
+	found: bool,
+	problem: os.Error,
+) {
 	// Phase: Prepare owned PATH search entries.
 
-	directories, split_error := os.split_path_list(path_value, context.allocator)
-	if split_error != nil {
-		return "", false
-	}
+	directories := os.split_path_list(path_value, context.allocator) or_return
 	defer {
 		for directory in directories {
 			delete(directory)
@@ -763,22 +764,33 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 		if len(path_directory) == 0 {
 			directory = "."
 		}
-		candidate, join_error := filepath.join([]string{directory, name})
-		if join_error != nil {
-			continue
-		}
+		candidate := filepath.join([]string{directory, name}) or_return
 		// Require a regular file executable by the current process.
 		info, stat_error := os.stat(candidate, context.allocator)
 		if stat_error != nil {
 			delete(candidate)
-			continue
+			expected_miss := stat_error == .Not_Exist || stat_error == .Invalid_Dir
+			if platform_error, platform_specific := os.is_platform_error(stat_error); platform_specific {
+				#partial switch posix.Errno(platform_error) {
+				case .ENOENT, .ENOTDIR, .EACCES, .ELOOP:
+					expected_miss = true
+				}
+			}
+			if expected_miss {
+				continue
+			}
+			return "", false, stat_error
 		}
 		candidate_cstring, cstring_error := strings.clone_to_cstring(
 			candidate,
 			context.temp_allocator,
 		)
+		if cstring_error != nil {
+			os.file_info_delete(info, context.allocator)
+			delete(candidate)
+			return "", false, cstring_error
+		}
 		executable := info.type == .Regular &&
-			cstring_error == nil &&
 			posix.access(candidate_cstring, {.X_OK}) == .OK
 		os.file_info_delete(info, context.allocator)
 		if !executable {
@@ -789,11 +801,12 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 		// Resolve the candidate's absolute identity.
 		absolute, absolute_error := os.get_absolute_path(candidate, context.allocator)
 		delete(candidate)
-		if absolute_error == nil {
-			return absolute, true
+		if absolute_error != nil {
+			return "", false, absolute_error
 		}
+		return absolute, true, nil
 	}
-	return "", false
+	return "", false, nil
 }
 #+end_src
 
@@ -809,6 +822,7 @@ Pseudocode:
 
 #+begin_src odin :tangle seal/init.odin :name init-config-projection
 init_scalar_representable :: proc(value: string) -> bool {
+	// Printable ASCII including space, except double quote and backslash.
 	for byte_value in transmute([]byte)value {
 		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '"' || byte_value == '\\' {
 			return false
@@ -870,16 +884,16 @@ render_init_config :: proc(
 inspection failure without mutation.
 
 #+begin_src odin :tangle seal/init.odin :name init-filesystem-preflight
-path_conflicts :: proc(path: string) -> (conflicts, inspect_failed: bool) {
+path_conflicts :: proc(path: string) -> (conflicts: bool, problem: os.Error) {
 	info, stat_error := os.lstat(path, context.allocator)
 	if stat_error == nil {
 		os.file_info_delete(info, context.allocator)
-		return true, false
+		return true, nil
 	}
 	if stat_error == .Not_Exist {
-		return false, false
+		return false, nil
 	}
-	return false, true
+	return false, stat_error
 }
 #+end_src
 
@@ -892,22 +906,27 @@ Pseudocode:
 3. Remove a partial file when write, close, or byte-count validation fails.
 
 #+begin_src odin :tangle seal/init.odin :name init-exclusive-config-creation
-write_new_config :: proc(path, text: string) -> bool {
-	file, open_error := os.open(
+write_new_config :: proc(path, text: string) -> os.Error {
+	file := os.open(
 		path,
 		{.Write, .Create, .Excl},
 		os.Permissions_Read_All + {.Write_User},
-	)
-	if open_error != nil {
-		return false
-	}
+	) or_return
 	written, write_error := os.write(file, transmute([]byte)text)
 	close_error := os.close(file)
-	if write_error != nil || close_error != nil || written != len(text) {
+	if write_error != nil {
 		_ = os.remove(path)
-		return false
+		return write_error
 	}
-	return true
+	if close_error != nil {
+		_ = os.remove(path)
+		return close_error
+	}
+	if written != len(text) {
+		_ = os.remove(path)
+		return os.Error(io.Error.Short_Write)
+	}
+	return nil
 }
 #+end_src
 
@@ -920,100 +939,105 @@ Pseudocode:
 3. Resolve =rsync= and conditional =ssh= from supplied =PATH= and render config.
 4. Create the mailbox, then exclusively create and write config.
 5. If config creation fails, remove only the mailbox created by this call.
-6. Return both owned paths without inspecting or contacting the peer.
+6. Return owned output and tool paths without inspecting or contacting the peer.
 
 #+begin_src odin :tangle seal/init.odin :name init-workspace-orchestration
 initialize_workspace :: proc(
-	selected_path, peer_path, peer_ssh: string,
+	requested_config_path, peer_path, peer_ssh: string,
 	path_value: string,
-) -> (config_path, mailbox_path, problem: string, ok: bool) {
+) -> (
+	config_path, mailbox_path: string,
+	rsync_path, ssh_path: string,
+	problem: string,
+	ok: bool,
+) {
 	// Phase: Preflight paths, peer input, tools, and rendered config.
 
 	// Resolve output paths.
-	resolved: bool
-	config_path, resolved = absolute_init_path(selected_path)
-	if !resolved {
-		return "", "", "cannot resolve configuration path", false
+	path_problem: os.Error
+	config_path, path_problem = absolute_init_path(requested_config_path)
+	if path_problem != nil {
+		return "", "", "", "", "cannot resolve configuration path", false
 	}
 	directory := filepath.dir(config_path)
-	path_error: os.Error
-	mailbox_path, path_error = filepath.join([]string{directory, "mailbox"})
-	if path_error != nil {
-		return config_path, "", "cannot resolve mailbox path", false
+	mailbox_path, path_problem = filepath.join([]string{directory, "mailbox"})
+	if path_problem != nil {
+		return config_path, "", "", "", "cannot resolve mailbox path", false
 	}
 
 	// Reject target conflicts.
-	config_exists, inspect_failed := path_conflicts(config_path)
-	if inspect_failed {
-		return config_path, mailbox_path, "cannot inspect configuration path", false
+	config_exists, inspect_problem := path_conflicts(config_path)
+	if inspect_problem != nil {
+		return config_path, mailbox_path, "", "", "cannot inspect configuration path", false
 	}
 	if config_exists {
-		return config_path, mailbox_path, "configuration path already exists", false
+		return config_path, mailbox_path, "", "", "configuration path already exists", false
 	}
 	mailbox_exists: bool
-	mailbox_exists, inspect_failed = path_conflicts(mailbox_path)
-	if inspect_failed {
-		return config_path, mailbox_path, "cannot inspect mailbox path", false
+	mailbox_exists, inspect_problem = path_conflicts(mailbox_path)
+	if inspect_problem != nil {
+		return config_path, mailbox_path, "", "", "cannot inspect mailbox path", false
 	}
 	if mailbox_exists {
-		return config_path, mailbox_path, "mailbox path already exists", false
+		return config_path, mailbox_path, "", "", "mailbox path already exists", false
 	}
 	// Validate peer coordinates.
 	if len(peer_path) == 0 {
-		return config_path, mailbox_path, "peer values must not be empty", false
+		return config_path, mailbox_path, "", "", "peer values must not be empty", false
 	}
 
 	// Resolve pinned rsync and conditional SSH.
-	rsync, found_rsync := resolve_path_tool("rsync", path_value)
-	if !found_rsync {
-		return config_path, mailbox_path, "cannot find executable rsync in PATH", false
+	found_rsync: bool
+	tool_problem: os.Error
+	rsync_path, found_rsync, tool_problem = resolve_path_tool("rsync", path_value)
+	if tool_problem != nil {
+		return config_path, mailbox_path, rsync_path, "", "cannot inspect executable rsync in PATH", false
 	}
-	defer delete(rsync)
-	ssh := ""
+	if !found_rsync {
+		return config_path, mailbox_path, "", "", "cannot find executable rsync in PATH", false
+	}
 	if len(peer_ssh) > 0 {
 		found_ssh: bool
-		ssh, found_ssh = resolve_path_tool("ssh", path_value)
-		if !found_ssh {
-			return config_path, mailbox_path, "cannot find executable ssh in PATH", false
+		ssh_path, found_ssh, tool_problem = resolve_path_tool("ssh", path_value)
+		if tool_problem != nil {
+			return config_path, mailbox_path, rsync_path, ssh_path, "cannot inspect executable ssh in PATH", false
 		}
-	}
-	defer {
-		if len(ssh) > 0 {
-			delete(ssh)
+		if !found_ssh {
+			return config_path, mailbox_path, rsync_path, "", "cannot find executable ssh in PATH", false
 		}
 	}
 
 	// Project complete config text.
-	text, rendered := render_init_config(peer_path, peer_ssh, rsync, ssh)
+	text, rendered := render_init_config(peer_path, peer_ssh, rsync_path, ssh_path)
 	if !rendered {
-		return config_path, mailbox_path, "peer or tool path cannot be represented", false
+		return config_path, mailbox_path, rsync_path, ssh_path, "peer or tool path cannot be represented", false
 	}
 	defer delete(text)
 	// Phase: Apply filesystem changes with bounded rollback.
 
 	// Create mailbox.
 	if directory_error := os.make_directory(mailbox_path); directory_error != nil {
-		return config_path, mailbox_path, "cannot create mailbox directory", false
+		return config_path, mailbox_path, rsync_path, ssh_path, "cannot create mailbox directory", false
 	}
 	// Exclusively create config; roll back mailbox on failure.
-	if !write_new_config(config_path, text) {
+	if config_problem := write_new_config(config_path, text); config_problem != nil {
 		_ = os.remove(mailbox_path)
-		return config_path, mailbox_path, "cannot create configuration", false
+		return config_path, mailbox_path, rsync_path, ssh_path, "cannot create configuration", false
 	}
-	return config_path, mailbox_path, "", true
+	return config_path, mailbox_path, rsync_path, ssh_path, "", true
 }
 #+end_src
 
 ** Command adapter
 
-=run_init= borrows process inputs, supplies =PATH=, reports owned result paths,
-and releases them after reporting.
+=run_init= borrows process inputs, supplies =PATH=, reports created paths and
+pinned tools, and releases every owned result path after reporting.
 
 #+begin_src odin :tangle seal/init.odin :name init-command-adapter
 run_init :: proc(cli: Cli) -> int {
 	path_value := os.get_env("PATH", context.allocator)
 	defer delete(path_value)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		cli.config,
 		cli.peer_path,
 		cli.peer_ssh,
@@ -1026,13 +1050,23 @@ run_init :: proc(cli: Cli) -> int {
 		if len(mailbox_path) > 0 {
 			delete(mailbox_path)
 		}
+		if len(rsync_path) > 0 {
+			delete(rsync_path)
+		}
+		if len(ssh_path) > 0 {
+			delete(ssh_path)
+		}
 	}
 	if !ok {
 		error("init", problem)
 		return 1
 	}
-	info("configuration", config_path)
-	info("mailbox", mailbox_path)
+	info("created configuration", config_path)
+	info("created mailbox", mailbox_path)
+	info("pinned rsync", rsync_path)
+	if len(ssh_path) > 0 {
+		info("pinned ssh", ssh_path)
+	}
 	return 0
 }
 #+end_src
@@ -1120,6 +1154,7 @@ Only current seed actions exist. Later verbs are not represented.
 
 #+begin_src odin :tangle seal/main.odin :name cli-state
 Cli_Action :: enum {
+	Usage,
 	Run,
 	Cfg,
 	Init,
@@ -1151,16 +1186,19 @@ Pseudocode:
 4. Accept =--ssh SSH_DESTINATION= only once and only after =init=.
 5. Classify a missing init peer as init usage; reject other missing values,
    repeated actions, and unknown arguments with the first offending spelling.
-6. Otherwise retain the seed's empty successful run.
+6. Default bare invocation to usage; retain explicit debug-only seed run.
 
 #+begin_src odin :tangle seal/main.odin :name parse-args
 parse_args :: proc(args: []string) -> Cli {
-	cli := Cli{config = DEFAULT_CONFIG_PATH}
+	cli := Cli{action = .Usage, config = DEFAULT_CONFIG_PATH}
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
 		switch arg {
 		case "--debug":
 			cli.debug = true
+			if cli.action == .Usage {
+				cli.action = .Run
+			}
 		case "--config":
 			if cli.explicit_config || i + 1 >= len(args) {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = "--config"}
@@ -1169,12 +1207,12 @@ parse_args :: proc(args: []string) -> Cli {
 			cli.config = args[i]
 			cli.explicit_config = true
 		case "cfg":
-			if cli.action != .Run {
+			if cli.action != .Usage && cli.action != .Run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.action = .Cfg
 		case "init":
-			if cli.action != .Run {
+			if cli.action != .Usage && cli.action != .Run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			if i + 1 >= len(args) {
@@ -1319,7 +1357,8 @@ run_cfg :: proc(cli: Cli) -> int {
 
 Pseudocode:
 
-1. Parse arguments and service help or version without filesystem access.
+1. Parse arguments and service bare usage, help, or version without filesystem
+   access.
 2. Report malformed init shape as usage; reject unknown arguments with a plain
    error and nonzero status.
 3. Dispatch =cfg= to read-only configuration display and =init= to local
@@ -1333,7 +1372,7 @@ Pseudocode:
 run :: proc(args: []string) -> int {
 	cli := parse_args(args)
 	switch cli.action {
-	case .Help:
+	case .Usage, .Help:
 		fmt.print(HELP_TEXT)
 		return 0
 	case .Version:
@@ -1396,6 +1435,9 @@ Pseudocode:
 #+begin_src odin :tangle seal/main_test.odin :name visible-seed-test
 @(test)
 test_visible_seed_behavior :: proc(t: ^testing.T) {
+	usage := parse_args([]string{})
+	testing.expect_value(t, usage.action, Cli_Action.Usage)
+
 	help := parse_args([]string{"--help"})
 	testing.expect_value(t, help.action, Cli_Action.Help)
 
@@ -1672,7 +1714,7 @@ test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
 	testing.expect(t, os.make_directory(workspace) == nil)
 	selected := test_path(workspace, "seal.toml")
 	defer delete(selected)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		selected,
 		"../peer/mailbox",
 		"",
@@ -1680,6 +1722,12 @@ test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
 	)
 	defer delete(config_path)
 	defer delete(mailbox_path)
+	defer delete(rsync_path)
+	defer {
+		if len(ssh_path) > 0 {
+			delete(ssh_path)
+		}
+	}
 	testing.expect(t, ok, problem)
 	testing.expect(t, os.exists(config_path))
 	mailbox_info, mailbox_error := os.stat(mailbox_path, context.allocator)
@@ -1699,6 +1747,7 @@ test_local_init_round_trips_through_config :: proc(t: ^testing.T) {
 	testing.expect_value(t, config.peer_path, expected_peer)
 	expected_rsync := test_path(tools, "rsync")
 	defer delete(expected_rsync)
+	testing.expect_value(t, rsync_path, expected_rsync)
 	testing.expect_value(t, config.rsync, expected_rsync)
 	testing.expect_value(t, config.peer_ssh, "")
 }
@@ -1726,7 +1775,7 @@ test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
 
 	selected := test_path(root, "seal.toml")
 	defer delete(selected)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		selected,
 		"/home/agent/mailbox",
 		"experiment.agent",
@@ -1734,6 +1783,8 @@ test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
 	)
 	defer delete(config_path)
 	defer delete(mailbox_path)
+	defer delete(rsync_path)
+	defer delete(ssh_path)
 	testing.expect(t, ok, problem)
 
 	config, config_problem, loaded := seal_config.load_config(config_path)
@@ -1746,6 +1797,8 @@ test_ssh_init_records_remote_coordinates_and_tools :: proc(t: ^testing.T) {
 	defer delete(expected_rsync)
 	expected_ssh := test_path(tools, "ssh")
 	defer delete(expected_ssh)
+	testing.expect_value(t, rsync_path, expected_rsync)
+	testing.expect_value(t, ssh_path, expected_ssh)
 	testing.expect_value(t, config.rsync, expected_rsync)
 	testing.expect_value(t, config.ssh, expected_ssh)
 }
@@ -1778,7 +1831,7 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	testing.expect(t, os.make_directory(config_conflict) == nil)
 	selected := test_path(config_conflict, "seal.toml")
 	testing.expect(t, os.write_entire_file_from_string(selected, "keep config\n") == nil)
-	config_path, mailbox_path, problem, ok := initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok := initialize_workspace(
 		selected,
 		"peer",
 		"",
@@ -1786,6 +1839,12 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	)
 	delete(config_path)
 	delete(mailbox_path)
+	if len(rsync_path) > 0 {
+		delete(rsync_path)
+	}
+	if len(ssh_path) > 0 {
+		delete(ssh_path)
+	}
 	testing.expect(t, !ok)
 	testing.expect_value(t, problem, "configuration path already exists")
 	mailbox := test_path(config_conflict, "mailbox")
@@ -1807,7 +1866,7 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	marker := test_path(mailbox, "keep")
 	testing.expect(t, os.write_entire_file_from_string(marker, "keep\n") == nil)
 	selected = test_path(mailbox_conflict, "seal.toml")
-	config_path, mailbox_path, problem, ok = initialize_workspace(
+	config_path, mailbox_path, rsync_path, ssh_path, problem, ok = initialize_workspace(
 		selected,
 		"peer",
 		"",
@@ -1815,6 +1874,12 @@ test_init_conflicts_do_not_mutate_workspace :: proc(t: ^testing.T) {
 	)
 	delete(config_path)
 	delete(mailbox_path)
+	if len(rsync_path) > 0 {
+		delete(rsync_path)
+	}
+	if len(ssh_path) > 0 {
+		delete(ssh_path)
+	}
 	testing.expect(t, !ok)
 	testing.expect_value(t, problem, "mailbox path already exists")
 	testing.expect(t, !os.exists(selected))

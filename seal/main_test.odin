@@ -7,6 +7,9 @@ import "core:testing"
 // BEGIN org:block visible-seed-test
 @(test)
 test_visible_seed_behavior :: proc(t: ^testing.T) {
+	usage := parse_args([]string{})
+	testing.expect_value(t, usage.action, Cli_Action.Usage)
+
 	help := parse_args([]string{"--help"})
 	testing.expect_value(t, help.action, Cli_Action.Help)
 
