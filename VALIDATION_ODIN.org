@@ -471,11 +471,11 @@ initial state: =agent-experiment-01= running and =agent-arch-01= shut off.
 
 * TOML facade propagation revalidation
 
-The Odin tail was most recently rebased onto allocator-stable car 002 source
-=0e69a25=. Final implementation source before this evidence update was
-=dda4c6d4cad8f3ae0da8b510a29df98f76cff285= on
+The Odin tail was most recently rebased onto arena-contained car 002 source
+=a642fdd=. Final implementation source before this evidence update was
+=0efe5cd= on
 =review/odin-v0/006-live-ssh-smoke=, based on amended car 005
-=2224d923b500250046365dcfacad8e1a5b3ecae8=. No Rust ref or worktree
+=325702c20cdc8a9a7647b4a09f195489c2cb6ed7=. No Rust ref or worktree
 participated.
 
 ** Backend and package boundary
@@ -489,15 +489,21 @@ enumeration, and owned string and string-array queries. An external package
 attempting =document.state= failed compilation with =Document has no field
 'state'=. Explicit transmutation is outside the ownership contract.
 
-=Document= and =Parse_Error= are single-owner, non-copy handles. Parse state
-stores its parser allocator; destruction uses that allocator regardless of the
-later ambient context and zeros the original handle. Query allocation is
-explicit, and results must be destroyed with the same allocator. A focused test
-allocated parser state, queries, and parse errors through tracking allocator A,
-switched ambient context to independent allocator B, and destroyed them with
-zero bad frees and zero allocator-A leaks. Repeated destruction of the same
-zeroed original handle was safe. Copied owning handles are deliberately not
-claimed safe.
+=Document= and =Parse_Error= are single-owner, non-copy handles. Private
+=Backend_State= owns a =mem.Dynamic_Arena= whose block and bookkeeping
+allocators are the caller's parse allocator. Every upstream tokenizer,
+validator, parser, and formatted-error allocation uses that arena. Success
+retains it behind =Document=; failure clones only normalized error state into
+the parent allocator, then destroys the entire arena regardless of which
+upstream pointers remain reachable. Document destruction destroys the arena,
+frees private state with the parent allocator, and zeros the original handle.
+
+Query allocation remains explicit and results must be destroyed with the same
+allocator. The focused allocator A/B test covers successful parse/query,
+validator-stage failure, and duplicate-key parser-stage failure
+=a = 1; a = 2=. After error and handle teardown, allocator A reported zero bad
+frees and zero allocations. Repeated destruction of the same zeroed original
+handle remained safe. Copied owning handles are deliberately not claimed safe.
 
 =config_toml= owns TOML syntax only. =seal/config.odin= owns explicit table and
 key names, required values, type and unknown-name rejection, SSH pairing,
@@ -531,8 +537,14 @@ facade tests and fourteen Seal tests passed with scoped vet policy and memory
 tracking clean. Seal check and build passed. The fixed live binary was:
 
 #+begin_example
-04ed18090c9e0991918e5dfc78f05f163fb82dccc2f0959181a803d385b4483f  seal.bin
+414a865a91e5991b234a0d3632656d6bbfecb64b0be52394fc595fcaa0da7d15  seal.bin
 #+end_example
+
+The arena repair did not change runtime configuration semantics. A bounded
+local replay at =/tmp/seal-odin-arena-repair-20260712T1340Z= initialized a
+workspace, parsed it through =cfg=, reported a local peer and pinned rsync, and
+returned 0. The root was removed and absence-checked. No SSH contact occurred;
+the last verified VM state remained unchanged.
 
 ** Allocator-stable handle replay
 
