@@ -1,4 +1,4 @@
-// BEGIN org:block config-syntax
+// BEGIN org:block config-syntax-result-types
 package main
 
 Config_Syntax_Kind :: enum {
@@ -13,7 +13,8 @@ Config_Syntax_Line :: struct {
 	key:   string,
 	value: string,
 }
-
+// END org:block config-syntax-result-types
+// BEGIN org:block config-syntax-predicate-helpers
 is_horizontal_space :: proc(byte_value: byte) -> bool {
 	return byte_value == ' ' || byte_value == '\t'
 }
@@ -52,7 +53,8 @@ valid_config_key :: proc(input: string) -> bool {
 	}
 	return true
 }
-
+// END org:block config-syntax-predicate-helpers
+// BEGIN org:block config-syntax-complete-line-parser
 parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 	line := trim_horizontal_space(input)
 	if len(line) == 0 {
@@ -111,4 +113,4 @@ parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 	}
 	return Config_Syntax_Line{}
 }
-// END org:block config-syntax
+// END org:block config-syntax-complete-line-parser

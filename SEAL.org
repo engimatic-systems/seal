@@ -34,22 +34,13 @@ Build output and local tangle machinery are not source artifacts.
 
 * Configuration syntax
 
-** Borrowed line recognition
+** Result types
 
-The recognizer trims horizontal whitespace and returns borrowed key/value slices.
-It recognizes only blank, table, assignment, or invalid complete lines. Schema
-names and configuration ownership remain outside this file.
+=Config_Syntax_Kind= classifies a complete line as invalid, blank, table, or
+assignment. =Config_Syntax_Line= carries that classification plus borrowed key
+and value slices when applicable.
 
-Pseudocode:
-
-1. Trim leading and trailing spaces and tabs; accept an empty result.
-2. Recognize =[key]= only when the inner key has no whitespace and follows the
-   ASCII key grammar.
-3. Otherwise recognize one key, optional horizontal whitespace, ===, optional
-   horizontal whitespace, and one complete double-quoted printable-ASCII value.
-4. Reject comments, escapes, Unicode, control bytes, lists, and trailing bytes.
-
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-result-types
 package main
 
 Config_Syntax_Kind :: enum {
@@ -64,7 +55,18 @@ Config_Syntax_Line :: struct {
 	key:   string,
 	value: string,
 }
+#+end_src
 
+** Predicate helpers
+
+- =is_horizontal_space=: accepts an ASCII space or tab.
+- =trim_horizontal_space=: removes leading and trailing ASCII spaces and tabs.
+- =is_ascii_alpha=: accepts an uppercase or lowercase ASCII letter.
+- =is_key_byte=: accepts an ASCII letter, digit, or underscore.
+- =valid_config_key=: accepts a nonempty key that starts with an ASCII letter
+  and continues with key bytes.
+
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-predicate-helpers
 is_horizontal_space :: proc(byte_value: byte) -> bool {
 	return byte_value == ' ' || byte_value == '\t'
 }
@@ -103,7 +105,24 @@ valid_config_key :: proc(input: string) -> bool {
 	}
 	return true
 }
+#+end_src
 
+** Complete-line parser
+
+The parser trims horizontal whitespace and returns borrowed key/value slices.
+It recognizes only blank, table, assignment, or invalid complete lines. Schema
+names and configuration ownership remain outside this file.
+
+Pseudocode:
+
+1. Trim leading and trailing spaces and tabs; accept an empty result.
+2. Recognize =[key]= only when the inner key has no whitespace and follows the
+   ASCII key grammar.
+3. Otherwise recognize one key, optional horizontal whitespace, ===, optional
+   horizontal whitespace, and one complete double-quoted printable-ASCII value.
+4. Reject comments, escapes, Unicode, control bytes, lists, and trailing bytes.
+
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-complete-line-parser
 parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 	line := trim_horizontal_space(input)
 	if len(line) == 0 {
