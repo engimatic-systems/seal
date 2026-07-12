@@ -6,8 +6,8 @@ This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary Rust files used by Cargo and reviewers.
 
 The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=,
-=tests/cli.rs=, and the three files under =tests/fixtures/=. =Cargo.lock= is
-Cargo-generated and is not literate source.
+=src/config.rs=, =tests/cli.rs=, and the three files under =tests/fixtures/=.
+=Cargo.lock= is Cargo-generated and is not literate source.
 
 Tangle, format, test, and build from the repository root:
 
@@ -63,16 +63,13 @@ Pseudocode:
 
 #+begin_src rust :tangle src/main.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
-use std::{
-    env,
-    fmt::Display,
-    fs,
-    path::{Path, PathBuf},
-    process::ExitCode,
-};
+mod config;
+
+use std::{env, fmt::Display, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+
+use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -116,7 +113,7 @@ fn main() -> ExitCode {
     }
 
     let result = match cli.command {
-        Some(Command::Cfg) => print_config(&cwd, cli.config.as_deref()),
+        Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref()).and_then(print_config),
         None => Ok(()),
     };
 
@@ -149,36 +146,44 @@ Pseudocode:
    one supported verbosity flag.
 4. Stop at the first useful validation error.
 
-#+begin_src rust :tangle src/main.rs
+#+begin_src rust :tangle src/config.rs :mkdirp yes
+// Generated from SEAL.org; edit the literate source instead.
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use serde::Deserialize;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
-    local_mailbox: PathBuf,
-    peer: Peer,
-    tools: Tools,
+pub(crate) struct Config {
+    pub(crate) local_mailbox: PathBuf,
+    pub(crate) peer: Peer,
+    pub(crate) tools: Tools,
     #[serde(default)]
-    debug: DebugConfig,
+    pub(crate) debug: DebugConfig,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Peer {
-    path: PathBuf,
-    ssh: Option<String>,
+pub(crate) struct Peer {
+    pub(crate) path: PathBuf,
+    pub(crate) ssh: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Tools {
-    rsync: PathBuf,
-    ssh: Option<PathBuf>,
+pub(crate) struct Tools {
+    pub(crate) rsync: PathBuf,
+    pub(crate) ssh: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DebugConfig {
-    rsync_debug_flags: Option<Vec<String>>,
-    ssh_debug_flags: Option<Vec<String>>,
+pub(crate) struct DebugConfig {
+    pub(crate) rsync_debug_flags: Option<Vec<String>>,
+    pub(crate) ssh_debug_flags: Option<Vec<String>>,
 }
 
 impl Config {
@@ -230,62 +235,91 @@ fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), Str
 }
 #+end_src
 
-** Effective configuration display
+** Configuration loading and display
 
-Configuration selection is explicit and local. Canonicalizing the selected
-file supplies its resolved path and the directory against which local mailbox
-coordinates are resolved; peer-side SSH paths remain unchanged.
+Configuration selection is explicit and local. Seal makes the selected path
+absolute from the process working directory without resolving filesystem
+links. Its parent is the directory against which local mailbox coordinates are
+resolved; peer-side SSH paths remain unchanged.
 
 Pseudocode:
 
-1. Choose the supplied path and reason, or exactly =./seal.toml= and its default
-   reason.
-2. Resolve and read that one file, deserialize it, and validate the resulting
-   typed values.
-3. Resolve the local mailbox and a local peer path from the configuration
-   directory. Leave an SSH peer path untouched.
-4. Print selection, effective coordinates, pinned tools, applicable debug
-   flags, binary version, and fixed transfer profile. Perform no other I/O.
+1. Loading chooses the supplied absolute path, the supplied path joined to the
+   working directory, or =seal.toml= in the working directory. It reads,
+   deserializes, and validates that one file, then returns its typed values,
+   selected path, and selection reason.
+2. Display receives that loaded configuration. It resolves the local mailbox
+   and a local peer path from the configuration directory, leaves an SSH peer
+   path untouched, and prints the effective values. It performs no other I/O.
+
+#+begin_src rust :tangle src/config.rs
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    pub(crate) path: PathBuf,
+    pub(crate) selection: &'static str,
+}
+
+pub(crate) fn load_config(
+    cwd: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<LoadedConfig, String> {
+    let (config_path, selection) = match explicit_path {
+        Some(path) if path.is_absolute() => (path.to_path_buf(), "explicit --config PATH"),
+        Some(path) => (cwd.join(path), "explicit --config PATH"),
+        None => (cwd.join("seal.toml"), "default ./seal.toml"),
+    };
+    let source = fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "cannot read configuration {}: {error}",
+            config_path.display()
+        )
+    })?;
+    let config: Config = toml::from_str(&source)
+        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
+    config
+        .validate()
+        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
+
+    Ok(LoadedConfig {
+        config,
+        path: config_path,
+        selection,
+    })
+}
+
+pub(crate) fn resolve_local(config_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    }
+}
+
+pub(crate) fn effective_debug_flags(flags: Option<&[String]>) -> String {
+    match flags {
+        Some(flags) => format!("{flags:?}"),
+        None => "[\"-v\"]".into(),
+    }
+}
+#+end_src
 
 #+begin_src rust :tangle src/main.rs
 const FIXED_TRANSFER_PROFILE: &[&str] =
     &["--recursive", "--links", "--perms", "--times", "--checksum"];
 
-fn print_config(cwd: &Path, explicit_path: Option<&Path>) -> Result<(), String> {
-    let (selected, selection) = match explicit_path {
-        Some(path) => (path.to_path_buf(), "explicit --config PATH"),
-        None => (PathBuf::from("./seal.toml"), "default ./seal.toml"),
-    };
-    let candidate = if selected.is_absolute() {
-        selected.clone()
-    } else {
-        cwd.join(&selected)
-    };
-    let resolved = candidate.canonicalize().map_err(|error| {
-        format!(
-            "cannot resolve configuration {}: {error}",
-            selected.display()
-        )
-    })?;
-    let source = fs::read_to_string(&resolved)
-        .map_err(|error| format!("cannot read configuration {}: {error}", resolved.display()))?;
-    let config: Config = toml::from_str(&source)
-        .map_err(|error| format!("invalid configuration {}: {error}", resolved.display()))?;
-    config
-        .validate()
-        .map_err(|error| format!("invalid configuration {}: {error}", resolved.display()))?;
-
-    let config_dir = resolved.parent().ok_or_else(|| {
-        format!(
-            "configuration has no parent directory: {}",
-            resolved.display()
-        )
-    })?;
+fn print_config(loaded: LoadedConfig) -> Result<(), String> {
+    let LoadedConfig {
+        config,
+        path,
+        selection,
+    } = loaded;
+    let config_dir = path
+        .parent()
+        .ok_or_else(|| format!("configuration has no parent directory: {}", path.display()))?;
     let local_mailbox = resolve_local(config_dir, &config.local_mailbox);
 
     println!("config selection: {selection}");
-    println!("selected config: {}", selected.display());
-    println!("resolved config: {}", resolved.display());
+    println!("config path: {}", path.display());
     println!("local mailbox: {}", local_mailbox.display());
     match &config.peer.ssh {
         Some(destination) => {
@@ -317,21 +351,6 @@ fn print_config(cwd: &Path, explicit_path: Option<&Path>) -> Result<(), String> 
     println!("fixed transfer profile: {FIXED_TRANSFER_PROFILE:?}");
 
     Ok(())
-}
-
-fn resolve_local(config_dir: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        config_dir.join(path)
-    }
-}
-
-fn effective_debug_flags(flags: Option<&[String]>) -> String {
-    match flags {
-        Some(flags) => format!("{flags:?}"),
-        None => "[\"-v\"]".into(),
-    }
 }
 #+end_src
 
