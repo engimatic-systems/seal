@@ -76,4 +76,27 @@ destination = "agent"
 	destroy_config(&config)
 	destroy_config_error(&problem)
 }
+
+@(test)
+test_config_document_rejects_duplicate_tables_and_fields :: proc(t: ^testing.T) {
+	duplicate_table := `[peer]
+[peer]
+`
+	config, problem, ok := parse_config(duplicate_table, "/work/table.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 2)
+	testing.expect_value(t, problem.message, "duplicate table [peer]")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+
+	duplicate_field := `local_mailbox = "first"
+local_mailbox = "second"
+`
+	config, problem, ok = parse_config(duplicate_field, "/work/field.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 2)
+	testing.expect_value(t, problem.message, "duplicate field")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+}
 // END org:block config-schema-tests

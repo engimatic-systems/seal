@@ -201,27 +201,14 @@ parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 }
 #+end_src
 
-* Configuration schema
+* Configuration model
 
-** Fields, policy, and resolution
+** Result and error types
 
-Configuration stores semantic values only. =Config_State= exists only while
-parsing to enforce duplicate and presence policy; SSH mode follows from a
-nonempty validated =peer_ssh= value.
+=Config= owns selected paths and semantic values; =Config_Error= owns its
+diagnostic path and borrows its static message.
 
-Pseudocode:
-
-1. Recognize each physical line through the syntax file and reject invalid lines.
-2. Accept exactly root =local_mailbox= plus peer/tools/debug tables and their
-   known keys; reject duplicates and unknown names at the first line.
-3. Require local mailbox, peer path, and absolute rsync; pair optional nonempty
-   peer SSH with absolute tools SSH.
-4. Accept debug scalars =""=, ="-v"=, ="-vv"=, or ="-vvv"= and default absent
-   applicable fields to ="-v"=.
-5. Resolve local paths from the selected configuration directory and retain an
-   SSH peer path verbatim.
-
-#+begin_src odin :tangle seal/config.odin :name config-schema
+#+begin_src odin :tangle seal/config.odin :name config-model-result-error-types
 package main
 
 import "core:os"
@@ -245,7 +232,34 @@ Config_Error :: struct {
 	line:    int,
 	message: string,
 }
+#+end_src
 
+** Error lifetime
+
+=config_error= clones the diagnostic path, and =destroy_config_error= releases
+that clone and clears the result.
+
+#+begin_src odin :tangle seal/config.odin :name config-model-error-lifetime
+config_error :: proc(path: string, line: int, message: string) -> Config_Error {
+	return Config_Error{path = strings.clone(path), line = line, message = message}
+}
+
+destroy_config_error :: proc(problem: ^Config_Error) {
+	if len(problem.path) > 0 {
+		delete(problem.path)
+	}
+	problem^ = {}
+}
+#+end_src
+
+* Configuration document
+
+** Parse state
+
+=Config_Table= records the current assignment scope; =Config_State= records
+tables and fields already seen while parsing one document.
+
+#+begin_src odin :tangle seal/config.odin :name config-document-parse-state
 Config_Table :: enum {
 	Root,
 	Peer,
@@ -265,18 +279,14 @@ Config_State :: struct {
 	rsync_debug_flag: bool,
 	ssh_debug_flag:   bool,
 }
+#+end_src
 
-config_error :: proc(path: string, line: int, message: string) -> Config_Error {
-	return Config_Error{path = strings.clone(path), line = line, message = message}
-}
+** Table structure
 
-destroy_config_error :: proc(problem: ^Config_Error) {
-	if len(problem.path) > 0 {
-		delete(problem.path)
-	}
-	problem^ = {}
-}
+=select_config_table= returns each known table once and reports duplicate or
+unknown table names.
 
+#+begin_src odin :tangle seal/config.odin :name config-document-table-structure
 select_config_table :: proc(name: string, state: ^Config_State) -> (Config_Table, string) {
 	switch name {
 	case "peer":
@@ -301,7 +311,14 @@ select_config_table :: proc(name: string, state: ^Config_State) -> (Config_Table
 		return .Root, "unknown table"
 	}
 }
+#+end_src
 
+** Field structure
+
+=assign_config_value= clones a field's first value; =assign_config_field=
+maps known keys in the active table and rejects duplicates or unknown keys.
+
+#+begin_src odin :tangle seal/config.odin :name config-document-field-structure
 assign_config_value :: proc(destination: ^string, present: ^bool, value: string) -> string {
 	if present^ {
 		return "duplicate field"
@@ -354,28 +371,46 @@ assign_config_field :: proc(
 	}
 	return "unknown key in current table"
 }
+#+end_src
 
-valid_debug_flag :: proc(value: string) -> bool {
-	return len(value) == 0 || value == "-v" || value == "-vv" || value == "-vvv"
-}
+** Required fields
 
-resolve_local_path :: proc(directory, path: string) -> string {
-	if filepath.is_abs(path) {
-		return strings.clone(path)
+=validate_required_fields= reports the first absent structurally required
+field after the complete document has been consumed.
+
+#+begin_src odin :tangle seal/config.odin :name config-document-required-fields
+validate_required_fields :: proc(state: ^Config_State) -> string {
+	if !state.local_mailbox {
+		return "missing local_mailbox"
 	}
-	joined, _ := filepath.join([]string{directory, path})
-	return joined
-}
-
-parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
-	config := Config{
-		path = strings.clone(path),
-		directory = strings.clone(directory),
+	if !state.peer_path {
+		return "missing peer.path"
 	}
-	state := Config_State{}
+	if !state.rsync {
+		return "missing tools.rsync"
+	}
+	return ""
+}
+#+end_src
+
+** Document parser
+
+Pseudocode:
+
+1. Read physical lines in order and retain the current table plus line number.
+2. Ignore blank lines; select tables; assign fields; reject invalid syntax.
+3. Stop at the first syntax, table, or field problem and return its line.
+4. Otherwise return the final physical line number and an empty problem.
+
+#+begin_src odin :tangle seal/config.odin :name config-document-parser
+parse_config_document :: proc(
+	text: string,
+	config: ^Config,
+	state: ^Config_State,
+) -> (line_number: int, problem: string) {
 	table := Config_Table.Root
 	remaining := text
-	line_number := 0
+	line_number = 0
 	for {
 		line, ok := strings.split_lines_iterator(&remaining)
 		if !ok {
@@ -387,67 +422,158 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		case .Blank:
 			continue
 		case .Table:
-			problem: string
-			table, problem = select_config_table(parsed.key, &state)
+			table, problem = select_config_table(parsed.key, state)
 			if len(problem) > 0 {
-				return config, config_error(path, line_number, problem), false
+				return line_number, problem
 			}
 		case .Assignment:
-			problem := assign_config_field(&config, &state, table, parsed.key, parsed.value)
+			problem = assign_config_field(config, state, table, parsed.key, parsed.value)
 			if len(problem) > 0 {
-				return config, config_error(path, line_number, problem), false
+				return line_number, problem
 			}
 		case .Invalid:
-			return config, config_error(path, line_number, "invalid configuration syntax"), false
+			return line_number, "invalid configuration syntax"
 		}
 	}
+	return line_number, ""
+}
+#+end_src
 
-	if !state.local_mailbox {
-		return config, config_error(path, line_number + 1, "missing local_mailbox"), false
-	}
-	if !state.peer_path {
-		return config, config_error(path, line_number + 1, "missing peer.path"), false
-	}
-	if !state.rsync {
-		return config, config_error(path, line_number + 1, "missing tools.rsync"), false
-	}
+* Configuration semantics
+
+** Semantic helpers
+
+=valid_debug_flag= accepts the empty flag or one through three verbose flags.
+
+#+begin_src odin :tangle seal/config.odin :name config-semantics-helpers
+valid_debug_flag :: proc(value: string) -> bool {
+	return len(value) == 0 || value == "-v" || value == "-vv" || value == "-vvv"
+}
+#+end_src
+
+** Static validation
+
+Pseudocode:
+
+1. Reject empty required paths and empty explicitly supplied SSH values.
+2. Require absolute local tool paths.
+3. Require peer SSH and tools SSH together, and reject SSH debug flags locally.
+4. Accept only the debug flag values named by =valid_debug_flag=.
+
+#+begin_src odin :tangle seal/config.odin :name config-semantics-static-validation
+validate_config_semantics :: proc(config: ^Config, state: ^Config_State) -> string {
 	if len(config.local_mailbox) == 0 || len(config.peer_path) == 0 || len(config.rsync) == 0 {
-		return config, config_error(path, line_number + 1, "required paths must not be empty"), false
+		return "required paths must not be empty"
 	}
 	if state.peer_ssh && len(config.peer_ssh) == 0 || state.ssh && len(config.ssh) == 0 {
-		return config, config_error(path, line_number + 1, "SSH values must not be empty"), false
+		return "SSH values must not be empty"
 	}
 	if !filepath.is_abs(config.rsync) || state.ssh && !filepath.is_abs(config.ssh) {
-		return config, config_error(path, line_number + 1, "tool paths must be absolute"), false
+		return "tool paths must be absolute"
 	}
 	if state.peer_ssh != state.ssh {
-		return config, config_error(path, line_number + 1, "SSH peer requires tools.ssh; local peer must omit it"), false
+		return "SSH peer requires tools.ssh; local peer must omit it"
 	}
 	if !state.peer_ssh && state.ssh_debug_flag {
-		return config, config_error(path, line_number + 1, "local peer must omit ssh_debug_flags"), false
+		return "local peer must omit ssh_debug_flags"
 	}
 	if state.rsync_debug_flag && !valid_debug_flag(config.rsync_debug_flag) ||
 	   state.ssh_debug_flag && !valid_debug_flag(config.ssh_debug_flag) {
-		return config, config_error(path, line_number + 1, "debug flag must be empty, -v, -vv, or -vvv"), false
+		return "debug flag must be empty, -v, -vv, or -vvv"
 	}
+	return ""
+}
+#+end_src
+
+** Defaults
+
+=apply_config_defaults= supplies =-v= only for absent applicable debug fields.
+
+#+begin_src odin :tangle seal/config.odin :name config-semantics-defaults
+apply_config_defaults :: proc(config: ^Config, state: ^Config_State) {
 	if !state.rsync_debug_flag {
 		config.rsync_debug_flag = strings.clone("-v")
 	}
 	if state.peer_ssh && !state.ssh_debug_flag {
 		config.ssh_debug_flag = strings.clone("-v")
 	}
+}
+#+end_src
 
-	resolved_mailbox := resolve_local_path(directory, config.local_mailbox)
+** Path interpretation
+
+=resolve_local_path= clones absolute paths or joins relative paths to the
+configuration directory; =resolve_config_paths= retains SSH peer paths verbatim.
+
+#+begin_src odin :tangle seal/config.odin :name config-semantics-path-interpretation
+resolve_local_path :: proc(directory, path: string) -> string {
+	if filepath.is_abs(path) {
+		return strings.clone(path)
+	}
+	joined, _ := filepath.join([]string{directory, path})
+	return joined
+}
+
+resolve_config_paths :: proc(config: ^Config) {
+	resolved_mailbox := resolve_local_path(config.directory, config.local_mailbox)
 	delete(config.local_mailbox)
 	config.local_mailbox = resolved_mailbox
 	if len(config.peer_ssh) == 0 {
-		resolved_peer := resolve_local_path(directory, config.peer_path)
+		resolved_peer := resolve_local_path(config.directory, config.peer_path)
 		delete(config.peer_path)
 		config.peer_path = resolved_peer
 	}
+}
+#+end_src
+
+* Configuration assembly
+
+** Parse and interpret
+
+=parse_config= returns an owned partial =Config= on failure for the caller to
+destroy and wraps static phase problems in an owned =Config_Error=.
+
+Pseudocode:
+
+1. Initialize the owned result and document parse state.
+2. Parse the document and wrap any failure at its physical line.
+3. Validate required structure, then semantics, at the line after the document.
+4. Apply defaults, resolve local paths, and return the complete owned result.
+
+#+begin_src odin :tangle seal/config.odin :name config-assembly-parse-interpret
+parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
+	config := Config{
+		path = strings.clone(path),
+		directory = strings.clone(directory),
+	}
+	state := Config_State{}
+	line_number, problem := parse_config_document(text, &config, &state)
+	if len(problem) > 0 {
+		return config, config_error(path, line_number, problem), false
+	}
+
+	problem = validate_required_fields(&state)
+	if len(problem) > 0 {
+		return config, config_error(path, line_number + 1, problem), false
+	}
+	problem = validate_config_semantics(&config, &state)
+	if len(problem) > 0 {
+		return config, config_error(path, line_number + 1, problem), false
+	}
+	apply_config_defaults(&config, &state)
+	resolve_config_paths(&config)
 	return config, Config_Error{}, true
 }
+#+end_src
 
+* Configuration lifetime
+
+** Destruction
+
+=destroy_config= releases every owned string in a complete or partial result
+and clears the value.
+
+#+begin_src odin :tangle seal/config.odin :name config-lifetime-destruction
 destroy_config :: proc(config: ^Config) {
 	values := []string{
 		config.path,
@@ -467,7 +593,14 @@ destroy_config :: proc(config: ^Config) {
 	}
 	config^ = {}
 }
+#+end_src
 
+** File loading
+
+=load_config= owns temporary absolute-path and file-content buffers while
+constructing configuration from the selected file.
+
+#+begin_src odin :tangle seal/config.odin :name config-lifetime-file-loading
 load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
 	absolute_path, path_error := os.get_absolute_path(selected_path, context.allocator)
 	if path_error != nil {
@@ -957,6 +1090,29 @@ destination = "agent"
 	testing.expect(t, !ok)
 	testing.expect_value(t, problem.line, 2)
 	testing.expect_value(t, problem.message, "invalid configuration syntax")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+}
+
+@(test)
+test_config_document_rejects_duplicate_tables_and_fields :: proc(t: ^testing.T) {
+	duplicate_table := `[peer]
+[peer]
+`
+	config, problem, ok := parse_config(duplicate_table, "/work/table.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 2)
+	testing.expect_value(t, problem.message, "duplicate table [peer]")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+
+	duplicate_field := `local_mailbox = "first"
+local_mailbox = "second"
+`
+	config, problem, ok = parse_config(duplicate_field, "/work/field.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 2)
+	testing.expect_value(t, problem.message, "duplicate field")
 	destroy_config(&config)
 	destroy_config_error(&problem)
 }
