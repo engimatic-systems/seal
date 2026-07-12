@@ -71,45 +71,44 @@ parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 		return Config_Syntax_Line{kind = .Table, key = key}
 	}
 
-	i := 0
-	if !is_ascii_alpha(line[i]) {
-		return Config_Syntax_Line{kind = .Invalid}
-	}
-	for i < len(line) && is_key_byte(line[i]) {
-		i += 1
-	}
-	key := line[:i]
-	for i < len(line) && is_horizontal_space(line[i]) {
-		i += 1
-	}
-	if i >= len(line) || line[i] != '=' {
-		return Config_Syntax_Line{kind = .Invalid}
-	}
-	i += 1
-	for i < len(line) && is_horizontal_space(line[i]) {
-		i += 1
-	}
-	if i >= len(line) || line[i] != '"' {
-		return Config_Syntax_Line{kind = .Invalid}
-	}
-	i += 1
-	value_start := i
-	for i < len(line) {
-		byte_value := line[i]
-		if byte_value == '"' {
-			if i + 1 != len(line) {
-				return Config_Syntax_Line{kind = .Invalid}
-			}
-			return Config_Syntax_Line{
-				kind = .Assignment,
-				key = key,
-				value = line[value_start:i],
-			}
+	if is_ascii_alpha(line[0]) {
+		i := 0
+		for i < len(line) && is_key_byte(line[i]) {
+			i += 1
 		}
-		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '\\' {
+		key := line[:i]
+		for i < len(line) && is_horizontal_space(line[i]) {
+			i += 1
+		}
+		if i >= len(line) || line[i] != '=' {
 			return Config_Syntax_Line{kind = .Invalid}
 		}
 		i += 1
+		for i < len(line) && is_horizontal_space(line[i]) {
+			i += 1
+		}
+		if i >= len(line) || line[i] != '"' {
+			return Config_Syntax_Line{kind = .Invalid}
+		}
+		i += 1
+		value_start := i
+		for i < len(line) {
+			byte_value := line[i]
+			if byte_value == '"' {
+				if i + 1 != len(line) {
+					return Config_Syntax_Line{kind = .Invalid}
+				}
+				return Config_Syntax_Line{
+					kind = .Assignment,
+					key = key,
+					value = line[value_start:i],
+				}
+			}
+			if byte_value < 0x20 || byte_value > 0x7e || byte_value == '\\' {
+				return Config_Syntax_Line{kind = .Invalid}
+			}
+			i += 1
+		}
 	}
 	return Config_Syntax_Line{kind = .Invalid}
 }
