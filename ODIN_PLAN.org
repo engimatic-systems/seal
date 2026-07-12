@@ -28,26 +28,21 @@ Expected generated files may include:
 Files appear only when current behavior needs them. No package manager or
 third-party library is required. Use the pinned Nix =odin= package for checks.
 
-* TOML subset
+* Configuration syntax
 
-Car 002 owns a parser for only the syntax Seal consumes. It is not a reusable
-TOML package and must not claim general TOML conformance.
+Car 002 owns a borrowed-slice recognizer for Seal's tiny line syntax, not TOML.
+Lines trim spaces and tabs; blank lines are accepted and comments are not.
+Tables are =[key]= without internal whitespace. Assignments are =key = "value"=.
+Keys use ASCII alpha followed by ASCII alphanumeric or underscore. Strings use
+printable ASCII excluding quote and backslash, with no escapes. Complete trimmed
+lines must be consumed. Lists, Unicode, control bytes, trailing syntax, and
+other value forms are rejected.
 
-Accepted syntax:
-
-- UTF-8 text split into ordinary single lines;
-- blank lines and comments whose first non-whitespace byte is =#=;
-- table headers =[peer]=, =[tools]=, and =[debug]=;
-- known bare keys separated from values by === with surrounding whitespace;
-- basic quoted string values with =\\=, =\"=, =\n=, =\r=, and =\t= escapes;
-- debug arrays =[]= or one quoted verbosity string such as =["-v"]=; and
-- an optional trailing comment after a string, array, or table header.
-
-Reject unknown tables, unknown keys, duplicate fields, missing required fields,
-malformed escapes, multiline values, dotted keys, inline tables, arrays with
-more than one value, and other TOML syntax with one useful path-and-line error.
-Do not build tokens, a generic value tree, serializer framework, or error
-aggregation system. =init= writes the same plain subset.
+=seal/config_syntax.odin= recognizes syntax only. =seal/config.odin= owns exact
+tables and keys, duplicate and required-field policy, SSH pairing, absolute tool
+paths, scalar debug whitelist/defaults, and local path resolution. There is no
+document model, map, AST, callback framework, serializer framework, backend
+selection, or error aggregation.
 
 * Train
 

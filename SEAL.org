@@ -6,9 +6,9 @@ This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary files used by Odin and reviewers.
 
 The complete generated-file boundary is =.gitignore=, =seal/main.odin=,
-=seal/config.odin=, =seal/main_test.odin=, and =seal/config_test.odin=.
-Generated files identify their source blocks so compiler diagnostics can be
-mapped back here.
+=seal/config.odin=, =seal/config_syntax.odin=, =seal/main_test.odin=,
+=seal/config_test.odin=, and =seal/config_syntax_test.odin=. Generated files
+identify their source blocks so compiler diagnostics can be mapped back here.
 
 Tangle twice, then check, test, and build from the repository root:
 
@@ -32,34 +32,175 @@ Build output and local tangle machinery are not source artifacts.
 /seal.bin
 #+end_src
 
-* Configuration
+* Configuration syntax
 
-** Package, imports, and types
+** Borrowed line recognition
 
-Configuration owns only Seal's fields. Empty debug strings represent an empty
-debug array; booleans distinguish absent optional SSH coordinates.
+The recognizer trims horizontal whitespace and returns borrowed key/value slices.
+It recognizes only blank, table, assignment, or invalid complete lines. Schema
+names and configuration ownership remain outside this file.
 
-#+begin_src odin :tangle seal/config.odin :name config-package-types
+Pseudocode:
+
+1. Trim leading and trailing spaces and tabs; accept an empty result.
+2. Recognize =[key]= only when the inner key has no whitespace and follows the
+   ASCII key grammar.
+3. Otherwise recognize one key, optional horizontal whitespace, ===, optional
+   horizontal whitespace, and one complete double-quoted printable-ASCII value.
+4. Reject comments, escapes, Unicode, control bytes, lists, and trailing bytes.
+
+#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax
+package main
+
+Config_Syntax_Kind :: enum {
+	Invalid,
+	Blank,
+	Table,
+	Assignment,
+}
+
+Config_Syntax_Line :: struct {
+	kind:  Config_Syntax_Kind,
+	key:   string,
+	value: string,
+}
+
+is_horizontal_space :: proc(byte_value: byte) -> bool {
+	return byte_value == ' ' || byte_value == '\t'
+}
+
+trim_horizontal_space :: proc(input: string) -> string {
+	start := 0
+	for start < len(input) && is_horizontal_space(input[start]) {
+		start += 1
+	}
+	end := len(input)
+	for end > start && is_horizontal_space(input[end - 1]) {
+		end -= 1
+	}
+	return input[start:end]
+}
+
+is_ascii_alpha :: proc(byte_value: byte) -> bool {
+	return byte_value >= 'A' && byte_value <= 'Z' ||
+		byte_value >= 'a' && byte_value <= 'z'
+}
+
+is_key_byte :: proc(byte_value: byte) -> bool {
+	return is_ascii_alpha(byte_value) ||
+		byte_value >= '0' && byte_value <= '9' ||
+		byte_value == '_'
+}
+
+valid_config_key :: proc(input: string) -> bool {
+	if len(input) == 0 || !is_ascii_alpha(input[0]) {
+		return false
+	}
+	for byte_value in transmute([]byte)input[1:] {
+		if !is_key_byte(byte_value) {
+			return false
+		}
+	}
+	return true
+}
+
+parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
+	line := trim_horizontal_space(input)
+	if len(line) == 0 {
+		return Config_Syntax_Line{kind = .Blank}
+	}
+	if line[0] == '[' {
+		if len(line) < 3 || line[len(line) - 1] != ']' {
+			return Config_Syntax_Line{}
+		}
+		key := line[1:len(line) - 1]
+		if !valid_config_key(key) {
+			return Config_Syntax_Line{}
+		}
+		return Config_Syntax_Line{kind = .Table, key = key}
+	}
+
+	i := 0
+	if !is_ascii_alpha(line[i]) {
+		return Config_Syntax_Line{}
+	}
+	for i < len(line) && is_key_byte(line[i]) {
+		i += 1
+	}
+	key := line[:i]
+	for i < len(line) && is_horizontal_space(line[i]) {
+		i += 1
+	}
+	if i >= len(line) || line[i] != '=' {
+		return Config_Syntax_Line{}
+	}
+	i += 1
+	for i < len(line) && is_horizontal_space(line[i]) {
+		i += 1
+	}
+	if i >= len(line) || line[i] != '"' {
+		return Config_Syntax_Line{}
+	}
+	i += 1
+	value_start := i
+	for i < len(line) {
+		byte_value := line[i]
+		if byte_value == '"' {
+			if i + 1 != len(line) {
+				return Config_Syntax_Line{}
+			}
+			return Config_Syntax_Line{
+				kind = .Assignment,
+				key = key,
+				value = line[value_start:i],
+			}
+		}
+		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '\\' {
+			return Config_Syntax_Line{}
+		}
+		i += 1
+	}
+	return Config_Syntax_Line{}
+}
+#+end_src
+
+* Configuration schema
+
+** Fields, policy, and resolution
+
+Configuration stores semantic values only. =Config_State= exists only while
+parsing to enforce duplicate and presence policy; SSH mode follows from a
+nonempty validated =peer_ssh= value.
+
+Pseudocode:
+
+1. Recognize each physical line through the syntax file and reject invalid lines.
+2. Accept exactly root =local_mailbox= plus peer/tools/debug tables and their
+   known keys; reject duplicates and unknown names at the first line.
+3. Require local mailbox, peer path, and absolute rsync; pair optional nonempty
+   peer SSH with absolute tools SSH.
+4. Accept debug scalars =""=, ="-v"=, ="-vv"=, or ="-vvv"= and default absent
+   applicable fields to ="-v"=.
+5. Resolve local paths from the selected configuration directory and retain an
+   SSH peer path verbatim.
+
+#+begin_src odin :tangle seal/config.odin :name config-schema
 package main
 
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:unicode/utf8"
 
 Config :: struct {
-	path:               string,
-	directory:          string,
-	local_mailbox:      string,
-	peer_path:          string,
-	peer_ssh:           string,
-	has_peer_ssh:       bool,
-	rsync:              string,
-	ssh:                string,
-	has_ssh:            bool,
-	rsync_debug_flag:   string,
-	ssh_debug_flag:     string,
-	has_ssh_debug_flag: bool,
+	path:             string,
+	directory:        string,
+	local_mailbox:    string,
+	peer_path:        string,
+	peer_ssh:         string,
+	rsync:            string,
+	ssh:              string,
+	rsync_debug_flag: string,
+	ssh_debug_flag:   string,
 }
 
 Config_Error :: struct {
@@ -75,7 +216,7 @@ Config_Table :: enum {
 	Debug,
 }
 
-Config_Seen :: struct {
+Config_State :: struct {
 	peer_table:       bool,
 	tools_table:      bool,
 	debug_table:      bool,
@@ -87,130 +228,7 @@ Config_Seen :: struct {
 	rsync_debug_flag: bool,
 	ssh_debug_flag:   bool,
 }
-#+end_src
 
-** Basic values
-
-Pseudocode:
-
-1. Require an opening quote and scan one physical line byte by byte.
-2. Copy ordinary UTF-8 bytes and decode only the five accepted escapes.
-3. Reject control bytes, malformed escapes, and an absent closing quote.
-4. Return an owned decoded string plus the unconsumed suffix.
-
-#+begin_src odin :tangle seal/config.odin :name config-basic-values
-parse_basic_string :: proc(input: string) -> (value, rest, problem: string) {
-	if len(input) == 0 || input[0] != '"' {
-		return "", "", "expected quoted string"
-	}
-
-	builder := strings.builder_make()
-	defer strings.builder_destroy(&builder)
-	for i := 1; i < len(input); i += 1 {
-		byte_value := input[i]
-		if byte_value == '"' {
-			return strings.clone(strings.to_string(builder)), input[i + 1:], ""
-		}
-		if byte_value < 0x20 {
-			return "", "", "control byte in quoted string"
-		}
-		if byte_value != '\\' {
-			strings.write_byte(&builder, byte_value)
-			continue
-		}
-
-		i += 1
-		if i >= len(input) {
-			return "", "", "unterminated escape"
-		}
-		switch input[i] {
-		case '\\':
-			strings.write_byte(&builder, '\\')
-		case '"':
-			strings.write_byte(&builder, '"')
-		case 'n':
-			strings.write_byte(&builder, '\n')
-		case 'r':
-			strings.write_byte(&builder, '\r')
-		case 't':
-			strings.write_byte(&builder, '\t')
-		case:
-			return "", "", "unsupported string escape"
-		}
-	}
-	return "", "", "unterminated quoted string"
-}
-
-trailing_comment_or_empty :: proc(input: string) -> bool {
-	rest := strings.trim_space(input)
-	return len(rest) == 0 || rest[0] == '#'
-}
-
-parse_string_value :: proc(input: string) -> (value, problem: string) {
-	rest: string
-	value, rest, problem = parse_basic_string(input)
-	if len(problem) != 0 {
-		return "", problem
-	}
-	if !trailing_comment_or_empty(rest) {
-		delete(value)
-		return "", "unexpected syntax after string"
-	}
-	return value, ""
-}
-
-valid_debug_flag :: proc(value: string) -> bool {
-	return value == "-v" || value == "-vv" || value == "-vvv"
-}
-
-parse_debug_value :: proc(input: string) -> (value, problem: string) {
-	if len(input) == 0 || input[0] != '[' {
-		return "", "expected debug flag array"
-	}
-	rest := strings.trim_left_space(input[1:])
-	if len(rest) > 0 && rest[0] == ']' {
-		if !trailing_comment_or_empty(rest[1:]) {
-			return "", "unexpected syntax after debug flag array"
-		}
-		return "", ""
-	}
-
-	suffix: string
-	value, suffix, problem = parse_basic_string(rest)
-	if len(problem) != 0 {
-		return "", problem
-	}
-	suffix = strings.trim_left_space(suffix)
-	if len(suffix) == 0 || suffix[0] != ']' {
-		delete(value)
-		return "", "debug flag array must contain one value"
-	}
-	if !trailing_comment_or_empty(suffix[1:]) {
-		delete(value)
-		return "", "unexpected syntax after debug flag array"
-	}
-	if !valid_debug_flag(value) {
-		delete(value)
-		return "", "debug flag must be -v, -vv, or -vvv"
-	}
-	return value, ""
-}
-#+end_src
-
-** Strict line parser
-
-Pseudocode:
-
-1. Start in the root table with debug defaults of =-v=.
-2. Skip blank and comment lines; accept each known table header once.
-3. Split assignments at the first equals byte and dispatch only exact bare keys
-   allowed in the current table.
-4. Reject the first unknown or duplicate field with its source line.
-5. Require the three unconditional fields and the SSH/local field combinations.
-6. Resolve local peer and mailbox paths lexically from the config directory;
-   leave an SSH peer path untouched.
-
-#+begin_src odin :tangle seal/config.odin :name config-line-parser
 config_error :: proc(path: string, line: int, message: string) -> Config_Error {
 	return Config_Error{path = strings.clone(path), line = line, message = message}
 }
@@ -222,108 +240,86 @@ destroy_config_error :: proc(problem: ^Config_Error) {
 	problem^ = {}
 }
 
-parse_table :: proc(line: string, seen: ^Config_Seen) -> (Config_Table, string) {
-	closing := strings.index_byte(line, ']')
-	if closing < 0 || !trailing_comment_or_empty(line[closing + 1:]) {
-		return .Root, "malformed table header"
-	}
-	name := line[1:closing]
+select_config_table :: proc(name: string, state: ^Config_State) -> (Config_Table, string) {
 	switch name {
 	case "peer":
-		if seen.peer_table {
+		if state.peer_table {
 			return .Root, "duplicate table [peer]"
 		}
-		seen.peer_table = true
+		state.peer_table = true
 		return .Peer, ""
 	case "tools":
-		if seen.tools_table {
+		if state.tools_table {
 			return .Root, "duplicate table [tools]"
 		}
-		seen.tools_table = true
+		state.tools_table = true
 		return .Tools, ""
 	case "debug":
-		if seen.debug_table {
+		if state.debug_table {
 			return .Root, "duplicate table [debug]"
 		}
-		seen.debug_table = true
+		state.debug_table = true
 		return .Debug, ""
 	case:
 		return .Root, "unknown table"
 	}
 }
 
-assign_string :: proc(destination: ^string, present: ^bool, input: string) -> string {
+assign_config_value :: proc(destination: ^string, present: ^bool, value: string) -> string {
 	if present^ {
 		return "duplicate field"
 	}
-	value, problem := parse_string_value(input)
-	if len(problem) != 0 {
-		return problem
-	}
-	destination^ = value
+	destination^ = strings.clone(value)
 	present^ = true
 	return ""
 }
 
-assign_debug :: proc(destination: ^string, present: ^bool, input: string) -> string {
-	if present^ {
-		return "duplicate field"
-	}
-	value, problem := parse_debug_value(input)
-	if len(problem) != 0 {
-		return problem
-	}
-	destination^ = value
-	present^ = true
-	return ""
-}
-
-parse_assignment :: proc(
+assign_config_field :: proc(
 	config: ^Config,
-	seen: ^Config_Seen,
+	state: ^Config_State,
 	table: Config_Table,
-	line: string,
+	key, value: string,
 ) -> string {
-	equals := strings.index_byte(line, '=')
-	if equals < 0 {
-		return "expected key = value"
-	}
-	key := strings.trim_space(line[:equals])
-	value := strings.trim_left_space(line[equals + 1:])
 	switch table {
 	case .Root:
 		if key == "local_mailbox" {
-			return assign_string(&config.local_mailbox, &seen.local_mailbox, value)
+			return assign_config_value(&config.local_mailbox, &state.local_mailbox, value)
 		}
 	case .Peer:
 		switch key {
 		case "path":
-			return assign_string(&config.peer_path, &seen.peer_path, value)
+			return assign_config_value(&config.peer_path, &state.peer_path, value)
 		case "ssh":
-			problem := assign_string(&config.peer_ssh, &seen.peer_ssh, value)
-			config.has_peer_ssh = len(problem) == 0
-			return problem
+			return assign_config_value(&config.peer_ssh, &state.peer_ssh, value)
 		}
 	case .Tools:
 		switch key {
 		case "rsync":
-			return assign_string(&config.rsync, &seen.rsync, value)
+			return assign_config_value(&config.rsync, &state.rsync, value)
 		case "ssh":
-			problem := assign_string(&config.ssh, &seen.ssh, value)
-			config.has_ssh = len(problem) == 0
-			return problem
+			return assign_config_value(&config.ssh, &state.ssh, value)
 		}
 	case .Debug:
 		switch key {
 		case "rsync_debug_flags":
-			return assign_debug(&config.rsync_debug_flag, &seen.rsync_debug_flag, value)
+			return assign_config_value(
+				&config.rsync_debug_flag,
+				&state.rsync_debug_flag,
+				value,
+			)
 		case "ssh_debug_flags":
-			problem := assign_debug(&config.ssh_debug_flag, &seen.ssh_debug_flag, value)
-			config.has_ssh_debug_flag = len(problem) == 0
-			return problem
+			return assign_config_value(
+				&config.ssh_debug_flag,
+				&state.ssh_debug_flag,
+				value,
+			)
 		}
 	}
 	return "unknown key in current table"
+}
+
+valid_debug_flag :: proc(value: string) -> bool {
+	return len(value) == 0 || value == "-v" || value == "-vv" || value == "-vvv"
 }
 
 resolve_local_path :: proc(directory, path: string) -> string {
@@ -339,12 +335,8 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		path = strings.clone(path),
 		directory = strings.clone(directory),
 	}
-	seen := Config_Seen{}
+	state := Config_State{}
 	table := Config_Table.Root
-	if !utf8.valid_string(text) {
-		return config, config_error(path, 1, "configuration is not valid UTF-8"), false
-	}
-
 	remaining := text
 	line_number := 0
 	for {
@@ -353,60 +345,65 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			break
 		}
 		line_number += 1
-		line = strings.trim_space(line)
-		if len(line) == 0 || line[0] == '#' {
+		parsed := parse_config_syntax_line(line)
+		switch parsed.kind {
+		case .Blank:
 			continue
-		}
-		if line[0] == '[' {
+		case .Table:
 			problem: string
-			table, problem = parse_table(line, &seen)
-			if len(problem) != 0 {
+			table, problem = select_config_table(parsed.key, &state)
+			if len(problem) > 0 {
 				return config, config_error(path, line_number, problem), false
 			}
-			continue
-		}
-		problem := parse_assignment(&config, &seen, table, line)
-		if len(problem) != 0 {
-			return config, config_error(path, line_number, problem), false
+		case .Assignment:
+			problem := assign_config_field(&config, &state, table, parsed.key, parsed.value)
+			if len(problem) > 0 {
+				return config, config_error(path, line_number, problem), false
+			}
+		case .Invalid:
+			return config, config_error(path, line_number, "invalid configuration syntax"), false
 		}
 	}
 
-	if !seen.local_mailbox {
+	if !state.local_mailbox {
 		return config, config_error(path, line_number + 1, "missing local_mailbox"), false
 	}
-	if !seen.peer_path {
+	if !state.peer_path {
 		return config, config_error(path, line_number + 1, "missing peer.path"), false
 	}
-	if !seen.rsync {
+	if !state.rsync {
 		return config, config_error(path, line_number + 1, "missing tools.rsync"), false
 	}
 	if len(config.local_mailbox) == 0 || len(config.peer_path) == 0 || len(config.rsync) == 0 {
 		return config, config_error(path, line_number + 1, "required paths must not be empty"), false
 	}
-	if (config.has_peer_ssh && len(config.peer_ssh) == 0) || (config.has_ssh && len(config.ssh) == 0) {
+	if state.peer_ssh && len(config.peer_ssh) == 0 || state.ssh && len(config.ssh) == 0 {
 		return config, config_error(path, line_number + 1, "SSH values must not be empty"), false
 	}
-	if !filepath.is_abs(config.rsync) || config.has_ssh && !filepath.is_abs(config.ssh) {
+	if !filepath.is_abs(config.rsync) || state.ssh && !filepath.is_abs(config.ssh) {
 		return config, config_error(path, line_number + 1, "tool paths must be absolute"), false
 	}
-	if config.has_peer_ssh != config.has_ssh {
+	if state.peer_ssh != state.ssh {
 		return config, config_error(path, line_number + 1, "SSH peer requires tools.ssh; local peer must omit it"), false
 	}
-	if !config.has_peer_ssh && config.has_ssh_debug_flag {
+	if !state.peer_ssh && state.ssh_debug_flag {
 		return config, config_error(path, line_number + 1, "local peer must omit ssh_debug_flags"), false
 	}
-	if !seen.rsync_debug_flag {
+	if state.rsync_debug_flag && !valid_debug_flag(config.rsync_debug_flag) ||
+	   state.ssh_debug_flag && !valid_debug_flag(config.ssh_debug_flag) {
+		return config, config_error(path, line_number + 1, "debug flag must be empty, -v, -vv, or -vvv"), false
+	}
+	if !state.rsync_debug_flag {
 		config.rsync_debug_flag = strings.clone("-v")
 	}
-	if config.has_peer_ssh && !seen.ssh_debug_flag {
+	if state.peer_ssh && !state.ssh_debug_flag {
 		config.ssh_debug_flag = strings.clone("-v")
-		config.has_ssh_debug_flag = true
 	}
 
 	resolved_mailbox := resolve_local_path(directory, config.local_mailbox)
 	delete(config.local_mailbox)
 	config.local_mailbox = resolved_mailbox
-	if !config.has_peer_ssh {
+	if len(config.peer_ssh) == 0 {
 		resolved_peer := resolve_local_path(directory, config.peer_path)
 		delete(config.peer_path)
 		config.peer_path = resolved_peer
@@ -433,18 +430,7 @@ destroy_config :: proc(config: ^Config) {
 	}
 	config^ = {}
 }
-#+end_src
 
-** File loading
-
-Pseudocode:
-
-1. Convert selected config path to a clean absolute path without filesystem
-   canonicalization.
-2. Read that exact file and derive its lexical directory.
-3. Parse and resolve from that directory; perform no other filesystem access.
-
-#+begin_src odin :tangle seal/config.odin :name config-file-loading
 load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
 	absolute_path, path_error := os.get_absolute_path(selected_path, context.allocator)
 	if path_error != nil {
@@ -611,11 +597,7 @@ Pseudocode:
 
 #+begin_src odin :tangle seal/main.odin :name cfg-display
 print_debug_flag :: proc(label, value: string) {
-	if len(value) == 0 {
-		fmt.printfln("%s: []", label)
-		return
-	}
-	fmt.printfln("%s: [\"%s\"]", label, value)
+	fmt.printfln("%s: \"%s\"", label, value)
 }
 
 run_cfg :: proc(cli: Cli) -> int {
@@ -659,15 +641,15 @@ run_cfg :: proc(cli: Cli) -> int {
 		debug("peer path", config.peer_path)
 		debug("rsync", config.rsync)
 		if len(config.rsync_debug_flag) == 0 {
-			debug("rsync debug flags", "[]")
+			debug("rsync debug flags", `""`)
 		} else {
 			debug("rsync debug flags", config.rsync_debug_flag)
 		}
-		if config.has_peer_ssh {
+		if len(config.peer_ssh) > 0 {
 			debug("peer ssh", config.peer_ssh)
 			debug("ssh", config.ssh)
 			if len(config.ssh_debug_flag) == 0 {
-				debug("ssh debug flags", "[]")
+				debug("ssh debug flags", `""`)
 			} else {
 				debug("ssh debug flags", config.ssh_debug_flag)
 			}
@@ -683,7 +665,7 @@ run_cfg :: proc(cli: Cli) -> int {
 	fmt.printfln("configuration path: %s", config.path)
 	fmt.printfln("configuration directory: %s", config.directory)
 	fmt.printfln("local mailbox: %s", config.local_mailbox)
-	if config.has_peer_ssh {
+	if len(config.peer_ssh) > 0 {
 		fmt.println("peer kind: ssh")
 		fmt.printfln("peer ssh: %s", config.peer_ssh)
 	} else {
@@ -691,13 +673,13 @@ run_cfg :: proc(cli: Cli) -> int {
 	}
 	fmt.printfln("peer path: %s", config.peer_path)
 	fmt.printfln("rsync: %s", config.rsync)
-	if config.has_ssh {
+	if len(config.ssh) > 0 {
 		fmt.printfln("ssh: %s", config.ssh)
 	} else {
 		fmt.println("ssh: not configured")
 	}
 	print_debug_flag("rsync debug flags", config.rsync_debug_flag)
-	if config.has_peer_ssh {
+	if len(config.peer_ssh) > 0 {
 		print_debug_flag("ssh debug flags", config.ssh_debug_flag)
 	} else {
 		fmt.println("ssh debug flags: not applicable")
@@ -707,7 +689,7 @@ run_cfg :: proc(cli: Cli) -> int {
 	for flag in TRANSFER_FLAGS {
 		fmt.printfln("  %s", flag)
 	}
-	if config.has_peer_ssh {
+	if len(config.peer_ssh) > 0 {
 		fmt.printfln("  %s", SSH_TRANSFER_FLAG)
 	}
 	return 0
@@ -812,105 +794,133 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 }
 #+end_src
 
-** Configuration test package
+** Configuration syntax behavior
 
-#+begin_src odin :tangle seal/config_test.odin :name config-test-package
+Focused syntax tests pin borrowed valid lines and representative rejected forms.
+
+#+begin_src odin :tangle seal/config_syntax_test.odin :name config-syntax-tests
 package main
 
 import "core:testing"
+
+@(test)
+test_config_syntax_recognizes_complete_lines :: proc(t: ^testing.T) {
+	blank := parse_config_syntax_line(" \t ")
+	testing.expect_value(t, blank.kind, Config_Syntax_Kind.Blank)
+
+	table := parse_config_syntax_line("  [peer]\t")
+	testing.expect_value(t, table.kind, Config_Syntax_Kind.Table)
+	testing.expect_value(t, table.key, "peer")
+
+	assignment := parse_config_syntax_line("local_mailbox \t=  \"mail # box\"")
+	testing.expect_value(t, assignment.kind, Config_Syntax_Kind.Assignment)
+	testing.expect_value(t, assignment.key, "local_mailbox")
+	testing.expect_value(t, assignment.value, "mail # box")
+}
+
+@(test)
+test_config_syntax_rejects_non_contract_forms :: proc(t: ^testing.T) {
+	invalid := []string{
+		"# comment",
+		"[ peer]",
+		"[peer ]",
+		"1key = \"value\"",
+		"key-name = \"value\"",
+		"key = value",
+		"key = \"escaped\\nvalue\"",
+		"key = \"unicode: \xc3\xa9\"",
+		"key = \"value\" trailing",
+		"key = []",
+		"key = [\"-v\"]",
+	}
+	for line in invalid {
+		parsed := parse_config_syntax_line(line)
+		testing.expect_value(t, parsed.kind, Config_Syntax_Kind.Invalid)
+	}
+}
 #+end_src
 
-** Representative local configuration
+** Configuration schema behavior
 
-Pseudocode:
+Schema tests cover local and SSH values, scalar debug quiet/default behavior,
+unknown fields, and syntax errors with source lines.
 
-1. Parse a local peer with comments, an empty rsync debug array, and relative
-   mailbox coordinates.
-2. Require lexical resolution from the supplied configuration directory.
-3. Require the local-only SSH omissions and no unrelated behavior.
+#+begin_src odin :tangle seal/config_test.odin :name config-schema-tests
+package main
 
-#+begin_src odin :tangle seal/config_test.odin :name local-config-test
+import "core:testing"
+
 @(test)
 test_local_config_resolves_from_config_directory :: proc(t: ^testing.T) {
-	text := `# local workspace
-local_mailbox = "../mailbox"
+	text := `local_mailbox = "../mailbox"
 
-[peer] # local coordinates
+[peer]
 path = "peer/mailbox"
 
 [tools]
 rsync = "/run/current-system/sw/bin/rsync"
 
 [debug]
-rsync_debug_flags = [] # quiet when --debug is present
+rsync_debug_flags = ""
 `
 	config, problem, ok := parse_config(text, "/work/seal/config/seal.toml", "/work/seal/config")
 	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
 	testing.expect(t, ok, problem.message)
 	testing.expect_value(t, config.local_mailbox, "/work/seal/mailbox")
 	testing.expect_value(t, config.peer_path, "/work/seal/config/peer/mailbox")
-	testing.expect(t, !config.has_peer_ssh)
-	testing.expect(t, !config.has_ssh)
+	testing.expect_value(t, config.peer_ssh, "")
+	testing.expect_value(t, config.ssh, "")
 	testing.expect_value(t, config.rsync_debug_flag, "")
 }
-#+end_src
 
-** Representative SSH configuration
-
-Pseudocode:
-
-1. Parse all SSH coordinates, trailing comments, a supported string escape,
-   and one accepted verbosity value.
-2. Leave remote peer path untouched while resolving only local mailbox state.
-3. Require the missing rsync debug value to default to =-v=.
-
-#+begin_src odin :tangle seal/config_test.odin :name ssh-config-test
 @(test)
-test_ssh_config_keeps_remote_path :: proc(t: ^testing.T) {
+test_ssh_config_keeps_remote_path_and_defaults :: proc(t: ^testing.T) {
 	text := `local_mailbox = "mailbox"
 
 [peer]
-path = "/home/agent/mailbox" # peer-side path
-ssh = "experiment.\"agent"
+path = "/home/agent/mailbox"
+ssh = "experiment.agent"
 
 [tools]
 rsync = "/bin/rsync"
 ssh = "/bin/ssh"
 
 [debug]
-ssh_debug_flags = ["-vvv"]
+ssh_debug_flags = "-vvv"
 `
 	config, problem, ok := parse_config(text, "/work/seal.toml", "/work")
 	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
 	testing.expect(t, ok, problem.message)
 	testing.expect_value(t, config.local_mailbox, "/work/mailbox")
 	testing.expect_value(t, config.peer_path, "/home/agent/mailbox")
-	testing.expect_value(t, config.peer_ssh, "experiment.\"agent")
+	testing.expect_value(t, config.peer_ssh, "experiment.agent")
 	testing.expect_value(t, config.rsync_debug_flag, "-v")
 	testing.expect_value(t, config.ssh_debug_flag, "-vvv")
 }
-#+end_src
 
-** First invalid line
-
-Pseudocode:
-
-1. Present an unknown peer key before later missing fields could be considered.
-2. Require one failure naming the supplied path and physical line.
-
-#+begin_src odin :tangle seal/config_test.odin :name invalid-config-test
 @(test)
-test_invalid_config_reports_first_path_and_line :: proc(t: ^testing.T) {
-	text := `local_mailbox = "mailbox"
+test_config_policy_rejects_unknown_and_invalid_lines :: proc(t: ^testing.T) {
+	unknown := `local_mailbox = "mailbox"
 [peer]
 destination = "agent"
 `
-	config, problem, ok := parse_config(text, "/work/bad.toml", "/work")
-	defer destroy_config(&config)
-	defer destroy_config_error(&problem)
+	config, problem, ok := parse_config(unknown, "/work/unknown.toml", "/work")
 	testing.expect(t, !ok)
-	testing.expect_value(t, problem.path, "/work/bad.toml")
 	testing.expect_value(t, problem.line, 3)
 	testing.expect_value(t, problem.message, "unknown key in current table")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+
+	invalid := `local_mailbox = "mailbox"
+[ peer]
+`
+	config, problem, ok = parse_config(invalid, "/work/invalid.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 2)
+	testing.expect_value(t, problem.message, "invalid configuration syntax")
+	destroy_config(&config)
+	destroy_config_error(&problem)
 }
 #+end_src
