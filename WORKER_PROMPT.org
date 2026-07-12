@@ -58,8 +58,15 @@ When uncertain, omit the behavior and record the question.
 
 * Train topology
 
-Each branch starts from the operator-approved =integration/v0= tip and targets
-=integration/v0=. Cars remain serial; do not prebuild tail branches.
+The coordinator constructs the full stack before operator review, one cold
+worker at a time. Car 001 starts from =integration/v0= and targets it. Each
+later branch starts from the preceding worker commit and its PR targets the
+preceding review branch. Do not flatten the stack or target a later car directly
+at =integration/v0= during construction.
+
+The assigned ticket's predecessor may remain open because ticket closure tracks
+the later serial review and integration pass. A committed predecessor handoff
+with passing required checks is sufficient for construction dispatch.
 
 | Car | Ticket | Branch | Goal |
 |-
@@ -70,7 +77,13 @@ Each branch starts from the operator-approved =integration/v0= tip and targets
 | 005 | sys-rx3t | review/005-push | Local-to-peer reversal |
 | 006 | sys-4e48 | review/006-live-ssh-smoke | Tactile SSH round trip |
 
-Do not merge PRs. Do not advance or retarget the train unless the operator asks.
+Workers do not merge PRs, dispatch later cars, advance bases, or retarget PRs.
+The operator has authorized the coordinator to construct the full stack, not to
+merge it.
+
+The worker builds only its assigned car. The coordinator, not the worker,
+dispatches the next car after a bounded topology, scope, build, behavior, and
+size check. No independent reviewer agent runs during construction.
 
 =sys-nvdk= defines a possible later =doctor= command. It is not a v0 car.
 

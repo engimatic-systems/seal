@@ -185,14 +185,26 @@ The train is serial:
 seed -> config/cfg -> init -> pull -> push -> live SSH smoke
 #+end_example
 
-Dispatch one cold worker for one ready car. Give it the accepted specification,
-assigned ticket, current base, and minimality rule rather than full conversation
-history. Do not prebuild the train tail.
+Build the complete train before operator review. Dispatch one cold worker at a
+time, one worker per car. Give each worker the accepted specification, assigned
+ticket, exact predecessor commit and branch, and minimality rule rather than
+full conversation history.
 
-The operator reviews each tactile artifact before the next car advances. No
-independent reviewer agent is required during construction. The coordinator
-checks topology, scope, build, representative behavior, and unexplained code
-growth; it does not demand broader tests as a default review response.
+Car 001 starts from =integration/v0= and targets it. Each later car starts from
+the preceding worker commit and targets the preceding review branch, so every
+PR shows one incremental car. Construction readiness means the predecessor has
+a committed handoff and passing required checks; tickets remain unclosed and no
+implementation PR merges during construction.
+
+The coordinator checks topology, scope, build, representative behavior, and
+unexplained code growth before dispatching the next worker. It does not perform
+an independent reviewer-agent pass or demand broader tests as a default review
+response. Report construction state after car 002 and car 004; these are
+operator observation points rather than mandatory stop gates.
+
+After all six cars exist, the operator reviews them serially from car 001. Only
+then may an approved car merge into =integration/v0= and the next PR retarget to
+=integration/v0= for its incremental review.
 
 After live smoke, a separate reduction review may identify deletable code,
 tests, dependencies, and fields. That review must not add behavior or broaden
