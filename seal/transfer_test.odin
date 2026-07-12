@@ -45,7 +45,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		peer_path = "/home/agent/mailbox",
 		peer_ssh = "agent alias",
 		rsync = "/tools/rsync",
-		ssh = "/tools/ssh",
+		ssh = `/tools/ssh dir/ssh"quote\name`,
 		rsync_debug_flag = "-vv",
 		ssh_debug_flag = "-vvv",
 	}
@@ -61,7 +61,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		"-vv",
 		"--secluded-args",
 		"--rsh",
-		"/tools/ssh -vvv",
+		`"/tools/ssh dir/ssh""quote\name" -vvv`,
 		"--",
 		"agent alias:/home/agent/mailbox/",
 		"/work/mailbox/",
@@ -88,36 +88,6 @@ test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
 		"--",
 		"/work/local mailbox/",
 		"/work/peer mailbox/",
-	})
-}
-
-@(test)
-test_ssh_debug_dry_run_push_reverses_operands :: proc(t: ^testing.T) {
-	config := Config{
-		local_mailbox = "/work/mailbox",
-		peer_path = "/home/agent/mailbox",
-		peer_ssh = "agent alias",
-		rsync = "/tools/rsync",
-		ssh = "/tools/ssh",
-		rsync_debug_flag = "-vv",
-		ssh_debug_flag = "-vvv",
-	}
-	plan := plan_transfer(config, .Push, true, true)
-	defer destroy_process_plan(&plan)
-	expect_arguments(t, plan.argv[:], []string{
-		"--recursive",
-		"--links",
-		"--perms",
-		"--times",
-		"--checksum",
-		"--dry-run",
-		"-vv",
-		"--secluded-args",
-		"--rsh",
-		"/tools/ssh -vvv",
-		"--",
-		"/work/mailbox/",
-		"agent alias:/home/agent/mailbox/",
 	})
 }
 // END org:block push-plan-tests

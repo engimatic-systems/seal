@@ -34,10 +34,6 @@ info :: proc(label, value: string) {
 	diagnostic("info", label, value)
 }
 
-warn :: proc(label, value: string) {
-	diagnostic("warn", label, value)
-}
-
 error :: proc(label, value: string) {
 	diagnostic("error", label, value)
 }
@@ -142,6 +138,42 @@ print_debug_flag :: proc(label, value: string) {
 	fmt.printfln("%s: [\"%s\"]", label, value)
 }
 
+debug_config :: proc(cli: Cli, config: Config) -> bool {
+	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+	if cwd_error != nil {
+		error("cannot determine current directory", fmt.tprint(cwd_error))
+		return false
+	}
+	defer delete(cwd)
+	debug("cwd", cwd)
+	if cli.explicit_config {
+		debug("configuration selection", "--config")
+	} else {
+		debug("configuration selection", "default ./seal.toml")
+	}
+	debug("configuration path", config.path)
+	debug("configuration directory", config.directory)
+	debug("local mailbox", config.local_mailbox)
+	debug("peer path", config.peer_path)
+	debug("rsync", config.rsync)
+	if len(config.rsync_debug_flag) == 0 {
+		debug("rsync debug flags", "[]")
+	} else {
+		debug("rsync debug flags", config.rsync_debug_flag)
+	}
+	if len(config.peer_ssh) > 0 {
+		debug("peer ssh", config.peer_ssh)
+		debug("ssh", config.ssh)
+		if len(config.ssh_debug_flag) == 0 {
+			debug("ssh debug flags", "[]")
+		} else {
+			debug("ssh debug flags", config.ssh_debug_flag)
+		}
+	}
+	debug("version", VERSION)
+	return true
+}
+
 run_cfg :: proc(cli: Cli) -> int {
 	config, config_problem, ok := load_config(cli.config)
 	if !ok {
@@ -164,39 +196,8 @@ run_cfg :: proc(cli: Cli) -> int {
 		return 1
 	}
 	defer destroy_config(&config)
-	if cli.debug {
-		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-		if cwd_error != nil {
-			error("cannot determine current directory", fmt.tprint(cwd_error))
-			return 1
-		}
-		defer delete(cwd)
-		debug("cwd", cwd)
-		if cli.explicit_config {
-			debug("configuration selection", "--config")
-		} else {
-			debug("configuration selection", "default ./seal.toml")
-		}
-		debug("configuration path", config.path)
-		debug("configuration directory", config.directory)
-		debug("local mailbox", config.local_mailbox)
-		debug("peer path", config.peer_path)
-		debug("rsync", config.rsync)
-		if len(config.rsync_debug_flag) == 0 {
-			debug("rsync debug flags", "[]")
-		} else {
-			debug("rsync debug flags", config.rsync_debug_flag)
-		}
-		if len(config.peer_ssh) > 0 {
-			debug("peer ssh", config.peer_ssh)
-			debug("ssh", config.ssh)
-			if len(config.ssh_debug_flag) == 0 {
-				debug("ssh debug flags", "[]")
-			} else {
-				debug("ssh debug flags", config.ssh_debug_flag)
-			}
-		}
-		debug("version", VERSION)
+	if cli.debug && !debug_config(cli, config) {
+		return 1
 	}
 
 	if cli.explicit_config {

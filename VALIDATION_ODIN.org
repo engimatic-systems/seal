@@ -258,7 +258,92 @@ rsync error: unexplained error (code 255) at io.c(232) [Receiver=3.4.1]
 status=255
 #+end_example
 
-* Contract repair and friction
+* Cold review repair
+
+Cold review reproduced two blockers in the committed car: rsync split a pinned
+SSH path at whitespace because =--rsh= received the raw path, and =init
+--debug= reported only ordinary initialization information. The repair quotes
+the executable as one token in rsync's documented command grammar, doubles an
+embedded double quote, and leaves the optional verbosity flag as a following
+token. One shared =debug_config= procedure now serves =cfg=, =init=, and
+transfer.
+
+The required checks were repeated after the repair:
+
+#+begin_src sh
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+git diff --check
+nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
+#+end_src
+
+Every command returned 0; the second tangle was clean and all 11 reduced tests
+passed. The exact SSH pull test covers whitespace, double quote, and backslash
+encoding. The redundant exhaustive SSH push vector was removed while the exact
+local push reversal remains.
+
+The targeted live replay used =/tmp/seal-odin-repair-20260712T0504Z= on both
+machines and a local PATH directory named =tools with spaces=. Regular rsync
+and SSH executables were copied there so =init= would discover and pin that
+exact path:
+
+#+begin_src sh
+LOCAL=/tmp/seal-odin-repair-20260712T0504Z
+REMOTE=/tmp/seal-odin-repair-20260712T0504Z
+TOOLS="$LOCAL/tools with spaces"
+PATH="$TOOLS" ./seal.bin --debug --config "$LOCAL/seal.toml" \
+  init "$REMOTE/mailbox" --ssh experiment.agent
+./seal.bin --config "$LOCAL/seal.toml" cfg
+./seal.bin --debug --config "$LOCAL/seal.toml" pull --dry-run
+./seal.bin --config "$LOCAL/seal.toml" pull
+./seal.bin --config "$LOCAL/seal.toml" push --dry-run
+./seal.bin --config "$LOCAL/seal.toml" push
+#+end_src
+
+All six commands returned 0. Init debug included cwd, explicit selection,
+resolved configuration path and directory, local mailbox, peer path and SSH
+destination, both pinned tools, both effective default debug flags, and version.
+Transfer debug added the previously absent directory and version. Its decisive
+plan and status were:
+
+#+begin_example
+[debug] :: configuration directory: /tmp/seal-odin-repair-20260712T0504Z
+[debug] :: version: 0.1.0
+[debug] :: process argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "--dry-run", "-v", "--secluded-args", "--rsh", "\"/tmp/seal-odin-repair-20260712T0504Z/tools with spaces/ssh\" -v", "--", "experiment.agent:/tmp/seal-odin-repair-20260712T0504Z/mailbox/", "/tmp/seal-odin-repair-20260712T0504Z/mailbox/"]
+[debug] :: child status: 0
+#+end_example
+
+The ordinary replay retained destination-only files on pull and push, preserved
+=../root.txt= as a symbolic link, preserved mode 755, transferred but did not
+execute the fixture script, and applied both directions. This re-establishes
+ordinary init/cfg/pull/push behavior after the reductions.
+
+A separate direct rsync dry-run pressure-tested the exact encoder form against
+an executable path containing whitespace, double quote, and backslash. Rsync
+reported =proof.txt= and returned 0 with:
+
+#+begin_example
+rsh="/tmp/seal-rsh-pressure-20260712T0507Z/tools space""quote\slash/ssh"
+#+end_example
+
+Both targeted local and peer roots were removed and absence-checked. A first
+attempt to use the quote-bearing directory through =init= stopped before
+workspace creation because Odin's PATH-list parser rejected that entry; this
+was test-fixture friction, not remaining rsync encoding failure.
+
+Reviewer reductions also removed =Config.has_ssh=,
+=Config.has_ssh_debug_flag=, the unused =warn= diagnostic, and duplicated debug
+presentation. =Config_Seen= now owns parse-time presence, with
+=has_peer_ssh= set only after validation. No command, option, transfer flag,
+logging framework, or mailbox interpretation was added.
+
+The earlier raw =--rsh= transcripts above remain historical evidence from the
+pre-review binary. The quoted repair transcript supersedes them for final
+behavior.
+
+* Construction repair and friction
 
 The first live =init= attempt exposed a contract-blocking lifetime defect:
 successful initialization printed corrupted prefixes for both returned paths.

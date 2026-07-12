@@ -252,6 +252,18 @@ run_init :: proc(cli: Cli) -> int {
 		error("init", problem)
 		return 1
 	}
+	if cli.debug {
+		config, config_problem, loaded := load_config(config_path)
+		defer destroy_config(&config)
+		defer destroy_config_error(&config_problem)
+		if !loaded {
+			error("configuration", config_problem.message)
+			return 1
+		}
+		if !debug_config(cli, config) {
+			return 1
+		}
+	}
 	info("configuration", config_path)
 	info("mailbox", mailbox_path)
 	return 0

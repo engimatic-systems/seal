@@ -46,6 +46,24 @@ with_trailing_slash :: proc(path: string) -> string {
 	return fmt.aprintf("%s/", path)
 }
 
+rsync_remote_shell :: proc(executable, debug_flag: string) -> string {
+	builder := strings.builder_make()
+	defer strings.builder_destroy(&builder)
+	strings.write_byte(&builder, '"')
+	for byte_value in transmute([]byte)executable {
+		strings.write_byte(&builder, byte_value)
+		if byte_value == '"' {
+			strings.write_byte(&builder, byte_value)
+		}
+	}
+	strings.write_byte(&builder, '"')
+	if len(debug_flag) > 0 {
+		strings.write_byte(&builder, ' ')
+		strings.write_string(&builder, debug_flag)
+	}
+	return strings.clone(strings.to_string(builder))
+}
+
 plan_transfer :: proc(
 	config: Config,
 	direction: Transfer_Direction,
@@ -65,11 +83,11 @@ plan_transfer :: proc(
 	if len(config.peer_ssh) > 0 {
 		append_plan_argument(&plan, SSH_TRANSFER_FLAG)
 		append_plan_argument(&plan, "--rsh")
-		remote_shell := strings.clone(config.ssh)
-		if debug_enabled && len(config.ssh_debug_flag) > 0 {
-			delete(remote_shell)
-			remote_shell = fmt.aprintf("%s %s", config.ssh, config.ssh_debug_flag)
+		ssh_debug_flag := ""
+		if debug_enabled {
+			ssh_debug_flag = config.ssh_debug_flag
 		}
+		remote_shell := rsync_remote_shell(config.ssh, ssh_debug_flag)
 		append_plan_argument(&plan, remote_shell)
 		delete(remote_shell)
 	}
@@ -166,37 +184,8 @@ run_transfer :: proc(cli: Cli, direction: Transfer_Direction) -> int {
 		return 1
 	}
 	defer destroy_config(&config)
-	if cli.debug {
-		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-		if cwd_error != nil {
-			error("cannot determine current directory", fmt.tprint(cwd_error))
-			return 1
-		}
-		defer delete(cwd)
-		debug("cwd", cwd)
-		if cli.explicit_config {
-			debug("configuration selection", "--config")
-		} else {
-			debug("configuration selection", "default ./seal.toml")
-		}
-		debug("configuration path", config.path)
-		debug("local mailbox", config.local_mailbox)
-		debug("peer path", config.peer_path)
-		debug("rsync", config.rsync)
-		if len(config.rsync_debug_flag) == 0 {
-			debug("rsync debug flags", "[]")
-		} else {
-			debug("rsync debug flags", config.rsync_debug_flag)
-		}
-		if len(config.peer_ssh) > 0 {
-			debug("peer ssh", config.peer_ssh)
-			debug("ssh", config.ssh)
-			if len(config.ssh_debug_flag) == 0 {
-				debug("ssh debug flags", "[]")
-			} else {
-				debug("ssh debug flags", config.ssh_debug_flag)
-			}
-		}
+	if cli.debug && !debug_config(cli, config) {
+		return 1
 	}
 	plan := plan_transfer(config, direction, cli.debug, cli.dry_run)
 	defer destroy_process_plan(&plan)

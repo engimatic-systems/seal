@@ -1100,7 +1100,9 @@ initialize_workspace :: proc(
 
 ** Init command
 
-The command supplies the process environment and reports only local paths.
+The command supplies the process environment. An ordinary run reports created
+paths; a debug run also reloads the written configuration and reports its
+effective values through the shared debug presentation.
 
 #+begin_src odin :tangle seal/init.odin :name init-command
 run_init :: proc(cli: Cli) -> int {
@@ -1123,6 +1125,18 @@ run_init :: proc(cli: Cli) -> int {
 	if !ok {
 		error("init", problem)
 		return 1
+	}
+	if cli.debug {
+		config, config_problem, loaded := load_config(config_path)
+		defer destroy_config(&config)
+		defer destroy_config_error(&config_problem)
+		if !loaded {
+			error("configuration", config_problem.message)
+			return 1
+		}
+		if !debug_config(cli, config) {
+			return 1
+		}
 	}
 	info("configuration", config_path)
 	info("mailbox", mailbox_path)
@@ -1187,8 +1201,9 @@ Pseudocode:
 
 1. Start with the pinned rsync executable and exact ordinary profile.
 2. Add dry-run and configured rsync verbosity only when requested.
-3. For SSH, add secluded arguments and a remote-shell command containing the
-   pinned SSH executable plus configured SSH verbosity only in debug mode.
+3. For SSH, quote the pinned SSH path as one token in rsync's remote-shell
+   command grammar, then add configured SSH verbosity as a separate token only
+   in debug mode.
 4. Give both mailbox roots a trailing slash; keep remote paths peer-side and
    local paths already resolved by configuration loading.
 5. Add =--=, then order peer and local operands for pull or reverse the same
@@ -1200,6 +1215,24 @@ with_trailing_slash :: proc(path: string) -> string {
 		return strings.clone(path)
 	}
 	return fmt.aprintf("%s/", path)
+}
+
+rsync_remote_shell :: proc(executable, debug_flag: string) -> string {
+	builder := strings.builder_make()
+	defer strings.builder_destroy(&builder)
+	strings.write_byte(&builder, '"')
+	for byte_value in transmute([]byte)executable {
+		strings.write_byte(&builder, byte_value)
+		if byte_value == '"' {
+			strings.write_byte(&builder, byte_value)
+		}
+	}
+	strings.write_byte(&builder, '"')
+	if len(debug_flag) > 0 {
+		strings.write_byte(&builder, ' ')
+		strings.write_string(&builder, debug_flag)
+	}
+	return strings.clone(strings.to_string(builder))
 }
 
 plan_transfer :: proc(
@@ -1221,11 +1254,11 @@ plan_transfer :: proc(
 	if len(config.peer_ssh) > 0 {
 		append_plan_argument(&plan, SSH_TRANSFER_FLAG)
 		append_plan_argument(&plan, "--rsh")
-		remote_shell := strings.clone(config.ssh)
-		if debug_enabled && len(config.ssh_debug_flag) > 0 {
-			delete(remote_shell)
-			remote_shell = fmt.aprintf("%s %s", config.ssh, config.ssh_debug_flag)
+		ssh_debug_flag := ""
+		if debug_enabled {
+			ssh_debug_flag = config.ssh_debug_flag
 		}
+		remote_shell := rsync_remote_shell(config.ssh, ssh_debug_flag)
 		append_plan_argument(&plan, remote_shell)
 		delete(remote_shell)
 	}
@@ -1318,8 +1351,7 @@ invoke_process_plan :: proc(plan: Process_Plan, debug_enabled: bool) -> int {
 Pseudocode:
 
 1. Load the selected configuration before constructing or invoking a plan.
-2. On debug runs, report working directory, resolved transfer coordinates,
-   and configuration selection.
+2. On debug runs, report the shared effective configuration presentation.
 3. Build one directional plan and invoke it once; dry-run changes only rsync
    argv.
 
@@ -1346,37 +1378,8 @@ run_transfer :: proc(cli: Cli, direction: Transfer_Direction) -> int {
 		return 1
 	}
 	defer destroy_config(&config)
-	if cli.debug {
-		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-		if cwd_error != nil {
-			error("cannot determine current directory", fmt.tprint(cwd_error))
-			return 1
-		}
-		defer delete(cwd)
-		debug("cwd", cwd)
-		if cli.explicit_config {
-			debug("configuration selection", "--config")
-		} else {
-			debug("configuration selection", "default ./seal.toml")
-		}
-		debug("configuration path", config.path)
-		debug("local mailbox", config.local_mailbox)
-		debug("peer path", config.peer_path)
-		debug("rsync", config.rsync)
-		if len(config.rsync_debug_flag) == 0 {
-			debug("rsync debug flags", "[]")
-		} else {
-			debug("rsync debug flags", config.rsync_debug_flag)
-		}
-		if len(config.peer_ssh) > 0 {
-			debug("peer ssh", config.peer_ssh)
-			debug("ssh", config.ssh)
-			if len(config.ssh_debug_flag) == 0 {
-				debug("ssh debug flags", "[]")
-			} else {
-				debug("ssh debug flags", config.ssh_debug_flag)
-			}
-		}
+	if cli.debug && !debug_config(cli, config) {
+		return 1
 	}
 	plan := plan_transfer(config, direction, cli.debug, cli.dry_run)
 	defer destroy_process_plan(&plan)
@@ -1435,10 +1438,6 @@ diagnostic :: proc(level, label, value: string) {
 
 info :: proc(label, value: string) {
 	diagnostic("info", label, value)
-}
-
-warn :: proc(label, value: string) {
-	diagnostic("warn", label, value)
 }
 
 error :: proc(label, value: string) {
@@ -1575,6 +1574,42 @@ print_debug_flag :: proc(label, value: string) {
 	fmt.printfln("%s: [\"%s\"]", label, value)
 }
 
+debug_config :: proc(cli: Cli, config: Config) -> bool {
+	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+	if cwd_error != nil {
+		error("cannot determine current directory", fmt.tprint(cwd_error))
+		return false
+	}
+	defer delete(cwd)
+	debug("cwd", cwd)
+	if cli.explicit_config {
+		debug("configuration selection", "--config")
+	} else {
+		debug("configuration selection", "default ./seal.toml")
+	}
+	debug("configuration path", config.path)
+	debug("configuration directory", config.directory)
+	debug("local mailbox", config.local_mailbox)
+	debug("peer path", config.peer_path)
+	debug("rsync", config.rsync)
+	if len(config.rsync_debug_flag) == 0 {
+		debug("rsync debug flags", "[]")
+	} else {
+		debug("rsync debug flags", config.rsync_debug_flag)
+	}
+	if len(config.peer_ssh) > 0 {
+		debug("peer ssh", config.peer_ssh)
+		debug("ssh", config.ssh)
+		if len(config.ssh_debug_flag) == 0 {
+			debug("ssh debug flags", "[]")
+		} else {
+			debug("ssh debug flags", config.ssh_debug_flag)
+		}
+	}
+	debug("version", VERSION)
+	return true
+}
+
 run_cfg :: proc(cli: Cli) -> int {
 	config, config_problem, ok := load_config(cli.config)
 	if !ok {
@@ -1597,39 +1632,8 @@ run_cfg :: proc(cli: Cli) -> int {
 		return 1
 	}
 	defer destroy_config(&config)
-	if cli.debug {
-		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
-		if cwd_error != nil {
-			error("cannot determine current directory", fmt.tprint(cwd_error))
-			return 1
-		}
-		defer delete(cwd)
-		debug("cwd", cwd)
-		if cli.explicit_config {
-			debug("configuration selection", "--config")
-		} else {
-			debug("configuration selection", "default ./seal.toml")
-		}
-		debug("configuration path", config.path)
-		debug("configuration directory", config.directory)
-		debug("local mailbox", config.local_mailbox)
-		debug("peer path", config.peer_path)
-		debug("rsync", config.rsync)
-		if len(config.rsync_debug_flag) == 0 {
-			debug("rsync debug flags", "[]")
-		} else {
-			debug("rsync debug flags", config.rsync_debug_flag)
-		}
-		if len(config.peer_ssh) > 0 {
-			debug("peer ssh", config.peer_ssh)
-			debug("ssh", config.ssh)
-			if len(config.ssh_debug_flag) == 0 {
-				debug("ssh debug flags", "[]")
-			} else {
-				debug("ssh debug flags", config.ssh_debug_flag)
-			}
-		}
-		debug("version", VERSION)
+	if cli.debug && !debug_config(cli, config) {
+		return 1
 	}
 
 	if cli.explicit_config {
@@ -1857,7 +1861,8 @@ Pseudocode:
 
 1. Plan an SSH pull with both global debug and command dry-run enabled.
 2. Require ordinary fixed flags, dry-run, configured rsync verbosity, secluded
-   arguments, pinned SSH remote shell with its configured verbosity, and =--=.
+   arguments, and one remote-shell executable token containing whitespace,
+   quote, and backslash characters before its configured verbosity token.
 3. Require one opaque SSH source operand and the local destination, both rooted
    at trailing-slash mailbox paths.
 
@@ -1869,7 +1874,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		peer_path = "/home/agent/mailbox",
 		peer_ssh = "agent alias",
 		rsync = "/tools/rsync",
-		ssh = "/tools/ssh",
+		ssh = `/tools/ssh dir/ssh"quote\name`,
 		rsync_debug_flag = "-vv",
 		ssh_debug_flag = "-vvv",
 	}
@@ -1885,7 +1890,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		"-vv",
 		"--secluded-args",
 		"--rsh",
-		"/tools/ssh -vvv",
+		`"/tools/ssh dir/ssh""quote\name" -vvv`,
 		"--",
 		"agent alias:/home/agent/mailbox/",
 		"/work/mailbox/",
@@ -1893,14 +1898,12 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 }
 #+end_src
 
-** Exact reversed push plans
+** Exact reversed local push plan
 
 Pseudocode:
 
-1. Plan local and SSH pushes through the same planner used by pull.
-2. Require the same fixed, dry-run, and debug arguments as the corresponding
-   pull plans.
-3. Require only the final mailbox operands to reverse: local source, peer
+1. Plan a local push through the same planner used by pull.
+2. Require only the final mailbox operands to reverse: local source, peer
    destination.
 
 #+begin_src odin :tangle seal/transfer_test.odin :name push-plan-tests
@@ -1923,36 +1926,6 @@ test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
 		"--",
 		"/work/local mailbox/",
 		"/work/peer mailbox/",
-	})
-}
-
-@(test)
-test_ssh_debug_dry_run_push_reverses_operands :: proc(t: ^testing.T) {
-	config := Config{
-		local_mailbox = "/work/mailbox",
-		peer_path = "/home/agent/mailbox",
-		peer_ssh = "agent alias",
-		rsync = "/tools/rsync",
-		ssh = "/tools/ssh",
-		rsync_debug_flag = "-vv",
-		ssh_debug_flag = "-vvv",
-	}
-	plan := plan_transfer(config, .Push, true, true)
-	defer destroy_process_plan(&plan)
-	expect_arguments(t, plan.argv[:], []string{
-		"--recursive",
-		"--links",
-		"--perms",
-		"--times",
-		"--checksum",
-		"--dry-run",
-		"-vv",
-		"--secluded-args",
-		"--rsh",
-		"/tools/ssh -vvv",
-		"--",
-		"/work/mailbox/",
-		"agent alias:/home/agent/mailbox/",
 	})
 }
 #+end_src
