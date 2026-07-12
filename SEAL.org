@@ -1,0 +1,229 @@
+#+title: Seal
+
+* Purpose and ownership
+
+This document is Seal's canonical handwritten implementation source. Edit it
+first, then tangle the ordinary files used by Odin and reviewers.
+
+The complete generated-file boundary is =.gitignore=, =seal/main.odin=, and
+=seal/main_test.odin=. Generated files identify their source blocks so compiler
+diagnostics can be mapped back here.
+
+Tangle twice, then check, test, and build from the repository root:
+
+#+begin_src sh
+.ephemera/tangle-org.sh SEAL.org
+.ephemera/tangle-org.sh SEAL.org
+nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
+#+end_src
+
+The second tangle must leave no generated-file diff.
+
+* Repository files
+
+Build output and local tangle machinery are not source artifacts.
+
+#+begin_src gitignore :tangle .gitignore :name gitignore
+# Generated from SEAL.org. Edit the Org source.
+/.ephemera/
+/seal.bin
+#+end_src
+
+* Executable
+
+** Package and imports
+
+The executable uses only Odin core packages.
+
+#+begin_src odin :tangle seal/main.odin :name main-package-imports
+package main
+
+import "core:fmt"
+import "core:os"
+#+end_src
+
+** Visible constants
+
+Version and help text are explicit operator-visible contract values.
+
+#+begin_src odin :tangle seal/main.odin :name visible-constants
+VERSION :: "0.1.0"
+
+HELP_TEXT :: `Seal
+Operator-initiated opaque mailbox transport
+
+Usage: seal [OPTIONS]
+
+Options:
+  --debug       Report process facts on standard error
+  -h, --help    Print help
+  -V, --version Print version
+`
+#+end_src
+
+** Plain diagnostics
+
+Diagnostics use Seal's fixed label shape and write directly to standard error.
+There is no logging configuration or dependency.
+
+#+begin_src odin :tangle seal/main.odin :name diagnostics
+diagnostic :: proc(level, label, value: string) {
+	fmt.eprintfln("[%s] :: %s: %s", level, label, value)
+}
+
+info :: proc(label, value: string) {
+	diagnostic("info", label, value)
+}
+
+warn :: proc(label, value: string) {
+	diagnostic("warn", label, value)
+}
+
+error :: proc(label, value: string) {
+	diagnostic("error", label, value)
+}
+
+debug :: proc(label, value: string) {
+	diagnostic("debug", label, value)
+}
+#+end_src
+
+** Command-line state
+
+Only current seed actions exist. Later verbs are not represented.
+
+#+begin_src odin :tangle seal/main.odin :name cli-state
+Cli_Action :: enum {
+	Run,
+	Help,
+	Version,
+	Invalid,
+}
+
+Cli :: struct {
+	action:   Cli_Action,
+	debug:    bool,
+	invalid:  string,
+}
+#+end_src
+
+** Argument parsing
+
+Pseudocode:
+
+1. Read each supplied option once.
+2. Record global =--debug= without changing the selected visible action.
+3. Select help or version for their conventional spellings.
+4. Preserve the first unknown argument for one useful error.
+5. Otherwise select the empty successful run.
+
+#+begin_src odin :tangle seal/main.odin :name parse-args
+parse_args :: proc(args: []string) -> Cli {
+	cli := Cli{}
+	for arg in args {
+		switch arg {
+		case "--debug":
+			cli.debug = true
+		case "-h", "--help":
+			cli.action = .Help
+		case "-V", "--version":
+			cli.action = .Version
+		case:
+			return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+		}
+	}
+	return cli
+}
+#+end_src
+
+** Dispatch
+
+Pseudocode:
+
+1. Parse arguments and service help or version without filesystem access.
+2. Reject an unknown argument with a plain error and nonzero status.
+3. For an ordinary run without debug, return success without output.
+4. For a debug run, resolve the process working directory.
+5. Report cwd and version to standard error, or report cwd failure and return
+   nonzero.
+
+#+begin_src odin :tangle seal/main.odin :name run
+run :: proc(args: []string) -> int {
+	cli := parse_args(args)
+	switch cli.action {
+	case .Help:
+		fmt.print(HELP_TEXT)
+		return 0
+	case .Version:
+		fmt.printfln("seal %s", VERSION)
+		return 0
+	case .Invalid:
+		error("unexpected argument", cli.invalid)
+		return 2
+	case .Run:
+	}
+
+	if !cli.debug {
+		return 0
+	}
+
+	cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+	if cwd_error != nil {
+		error("cannot determine current directory", fmt.tprint(cwd_error))
+		return 1
+	}
+	defer delete(cwd)
+
+	debug("cwd", cwd)
+	debug("version", VERSION)
+	return 0
+}
+
+main :: proc() {
+	os.exit(run(os.args[1:]))
+}
+#+end_src
+
+* Tests
+
+** Test package and imports
+
+#+begin_src odin :tangle seal/main_test.odin :name test-package-imports
+package main
+
+import "core:strings"
+import "core:testing"
+#+end_src
+
+** Visible seed behavior
+
+Pseudocode:
+
+1. Parse help, version, and global debug forms.
+2. Require the exact version and recognizable help surface.
+3. Preserve one unknown argument for the executable's error path.
+4. Do not reproduce a general option-parser test matrix.
+
+#+begin_src odin :tangle seal/main_test.odin :name visible-seed-test
+@(test)
+test_visible_seed_behavior :: proc(t: ^testing.T) {
+	help := parse_args([]string{"--help"})
+	testing.expect_value(t, help.action, Cli_Action.Help)
+
+	version := parse_args([]string{"-V"})
+	testing.expect_value(t, version.action, Cli_Action.Version)
+
+	debug_run := parse_args([]string{"--debug"})
+	testing.expect_value(t, debug_run.action, Cli_Action.Run)
+	testing.expect(t, debug_run.debug)
+
+	invalid := parse_args([]string{"pull"})
+	testing.expect_value(t, invalid.action, Cli_Action.Invalid)
+	testing.expect_value(t, invalid.invalid, "pull")
+
+	testing.expect_value(t, VERSION, "0.1.0")
+	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS]"))
+}
+#+end_src
