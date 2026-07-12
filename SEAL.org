@@ -915,6 +915,7 @@ initialize_workspace :: proc(
 	path_value: string,
 ) -> (config_path, mailbox_path, problem: string, ok: bool) {
 	// Preflight paths, peer input, tools, and rendered config before mutation.
+	// Resolve output paths.
 	resolved: bool
 	config_path, resolved = absolute_init_path(selected_path)
 	if !resolved {
@@ -927,6 +928,7 @@ initialize_workspace :: proc(
 		return config_path, "", "cannot resolve mailbox path", false
 	}
 
+	// Reject target conflicts.
 	config_exists, inspect_failed := path_conflicts(config_path)
 	if inspect_failed {
 		return config_path, mailbox_path, "cannot inspect configuration path", false
@@ -942,10 +944,12 @@ initialize_workspace :: proc(
 	if mailbox_exists {
 		return config_path, mailbox_path, "mailbox path already exists", false
 	}
+	// Validate peer coordinates.
 	if len(peer_path) == 0 {
 		return config_path, mailbox_path, "peer values must not be empty", false
 	}
 
+	// Resolve pinned rsync and conditional SSH.
 	rsync, found_rsync := resolve_path_tool("rsync", path_value)
 	if !found_rsync {
 		return config_path, mailbox_path, "cannot find executable rsync in PATH", false
@@ -965,15 +969,18 @@ initialize_workspace :: proc(
 		}
 	}
 
+	// Project complete config text.
 	text, rendered := render_init_config(peer_path, peer_ssh, rsync, ssh)
 	if !rendered {
 		return config_path, mailbox_path, "peer or tool path cannot be represented", false
 	}
 	defer delete(text)
 	// Apply filesystem changes with exclusive write and bounded rollback.
+	// Create mailbox.
 	if directory_error := os.make_directory(mailbox_path); directory_error != nil {
 		return config_path, mailbox_path, "cannot create mailbox directory", false
 	}
+	// Exclusively create config; roll back mailbox on failure.
 	if !write_new_config(config_path, text) {
 		_ = os.remove(mailbox_path)
 		return config_path, mailbox_path, "cannot create configuration", false
