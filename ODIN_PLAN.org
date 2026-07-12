@@ -39,8 +39,9 @@ lines must be consumed. Lists, Unicode, control bytes, trailing syntax, and
 other value forms are rejected.
 
 =seal/config_syntax.odin= recognizes syntax only. =seal/config.odin= owns exact
-tables and keys, duplicate and required-field policy, SSH pairing, absolute tool
-paths, scalar debug whitelist/defaults, and local path resolution. There is no
+tables and keys, table reselection, last-seen field and required-field policy,
+SSH pairing, absolute tool paths, scalar debug whitelist/defaults, and local
+path resolution. There is no
 document model, map, AST, callback framework, serializer framework, backend
 selection, or error aggregation.
 

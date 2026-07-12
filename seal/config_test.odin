@@ -78,25 +78,32 @@ destination = "agent"
 }
 
 @(test)
-test_config_document_rejects_duplicate_tables_and_fields :: proc(t: ^testing.T) {
-	duplicate_table := `[peer]
-[peer]
-`
-	config, problem, ok := parse_config(duplicate_table, "/work/table.toml", "/work")
-	testing.expect(t, !ok)
-	testing.expect_value(t, problem.line, 2)
-	testing.expect_value(t, problem.message, "duplicate table [peer]")
-	destroy_config(&config)
-	destroy_config_error(&problem)
+test_config_document_uses_last_seen_tables_and_fields :: proc(t: ^testing.T) {
+	text := `local_mailbox = "first"
+local_mailbox = ""
+local_mailbox = "mailbox"
 
-	duplicate_field := `local_mailbox = "first"
-local_mailbox = "second"
+[peer]
+path = "first-peer"
+
+[tools]
+rsync = "/bin/false"
+
+[peer]
+path = ""
+
+[peer]
+path = "final-peer"
+
+[tools]
+rsync = "/bin/rsync"
 `
-	config, problem, ok = parse_config(duplicate_field, "/work/field.toml", "/work")
-	testing.expect(t, !ok)
-	testing.expect_value(t, problem.line, 2)
-	testing.expect_value(t, problem.message, "duplicate field")
-	destroy_config(&config)
-	destroy_config_error(&problem)
+	config, problem, ok := parse_config(text, "/work/repeated.toml", "/work")
+	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
+	testing.expect(t, ok, problem.message)
+	testing.expect_value(t, config.local_mailbox, "/work/mailbox")
+	testing.expect_value(t, config.peer_path, "/work/final-peer")
+	testing.expect_value(t, config.rsync, "/bin/rsync")
 }
 // END org:block config-schema-tests

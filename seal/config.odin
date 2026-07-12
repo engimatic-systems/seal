@@ -44,9 +44,6 @@ Config_Table :: enum {
 }
 
 Config_State :: struct {
-	peer_table:       bool,
-	tools_table:      bool,
-	debug_table:      bool,
 	local_mailbox:    bool,
 	peer_path:        bool,
 	peer_ssh:         bool,
@@ -57,25 +54,13 @@ Config_State :: struct {
 }
 // END org:block config-document-parse-state
 // BEGIN org:block config-document-table-structure
-select_config_table :: proc(name: string, state: ^Config_State) -> (Config_Table, string) {
+select_config_table :: proc(name: string) -> (Config_Table, string) {
 	switch name {
 	case "peer":
-		if state.peer_table {
-			return .Root, "duplicate table [peer]"
-		}
-		state.peer_table = true
 		return .Peer, ""
 	case "tools":
-		if state.tools_table {
-			return .Root, "duplicate table [tools]"
-		}
-		state.tools_table = true
 		return .Tools, ""
 	case "debug":
-		if state.debug_table {
-			return .Root, "duplicate table [debug]"
-		}
-		state.debug_table = true
 		return .Debug, ""
 	case:
 		return .Root, "unknown table"
@@ -84,10 +69,11 @@ select_config_table :: proc(name: string, state: ^Config_State) -> (Config_Table
 // END org:block config-document-table-structure
 // BEGIN org:block config-document-field-structure
 assign_config_value :: proc(destination: ^string, present: ^bool, value: string) -> string {
-	if present^ {
-		return "duplicate field"
+	replacement := strings.clone(value)
+	if len(destination^) > 0 {
+		delete(destination^)
 	}
-	destination^ = strings.clone(value)
+	destination^ = replacement
 	present^ = true
 	return ""
 }
@@ -170,7 +156,7 @@ parse_config_document :: proc(
 		case .Blank:
 			continue
 		case .Table:
-			table, problem = select_config_table(parsed.key, state)
+			table, problem = select_config_table(parsed.key)
 			if len(problem) > 0 {
 				return line_number, problem
 			}

@@ -119,6 +119,9 @@ rsync_debug_flags = "-v"
 ssh_debug_flags = "-v"
 #+end_src
 
+Repeated known table headers reselect that table. Repeated known fields replace
+their prior value, so the last value in the document wins.
+
 Omitting =peer.ssh= makes =peer.path= local. A local peer omits =tools.ssh= and
 =debug.ssh_debug_flags=. An SSH peer requires both =peer.ssh= and =tools.ssh=.
 
