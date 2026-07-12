@@ -20,6 +20,11 @@ Process_Plan :: struct {
 	argv:       [dynamic]string,
 }
 
+Transfer_Direction :: enum {
+	Pull,
+	Push,
+}
+
 destroy_process_plan :: proc(plan: ^Process_Plan) {
 	delete(plan.executable)
 	for argument in plan.argv {
@@ -33,7 +38,7 @@ append_plan_argument :: proc(plan: ^Process_Plan, argument: string) {
 	append(&plan.argv, strings.clone(argument))
 }
 // END org:block transfer-package-plan
-// BEGIN org:block pull-plan
+// BEGIN org:block transfer-plan
 with_trailing_slash :: proc(path: string) -> string {
 	if strings.has_suffix(path, "/") {
 		return strings.clone(path)
@@ -41,7 +46,11 @@ with_trailing_slash :: proc(path: string) -> string {
 	return fmt.aprintf("%s/", path)
 }
 
-plan_pull :: proc(config: Config, debug_enabled, dry_run: bool) -> Process_Plan {
+plan_transfer :: proc(
+	config: Config,
+	direction: Transfer_Direction,
+	debug_enabled, dry_run: bool,
+) -> Process_Plan {
 	plan := Process_Plan{executable = strings.clone(config.rsync)}
 	for flag in TRANSFER_FLAGS {
 		append_plan_argument(&plan, flag)
@@ -65,22 +74,27 @@ plan_pull :: proc(config: Config, debug_enabled, dry_run: bool) -> Process_Plan 
 		delete(remote_shell)
 	}
 
-	append_plan_argument(&plan, "--")
 	peer_path := with_trailing_slash(config.peer_path)
 	defer delete(peer_path)
 	if len(config.peer_ssh) > 0 {
-		source := fmt.aprintf("%s:%s", config.peer_ssh, peer_path)
-		append_plan_argument(&plan, source)
-		delete(source)
+		remote_path := fmt.aprintf("%s:%s", config.peer_ssh, peer_path)
+		delete(peer_path)
+		peer_path = remote_path
+	}
+	local_path := with_trailing_slash(config.local_mailbox)
+	defer delete(local_path)
+
+	append_plan_argument(&plan, "--")
+	if direction == .Pull {
+		append_plan_argument(&plan, peer_path)
+		append_plan_argument(&plan, local_path)
 	} else {
+		append_plan_argument(&plan, local_path)
 		append_plan_argument(&plan, peer_path)
 	}
-	destination := with_trailing_slash(config.local_mailbox)
-	append_plan_argument(&plan, destination)
-	delete(destination)
 	return plan
 }
-// END org:block pull-plan
+// END org:block transfer-plan
 // BEGIN org:block transfer-invocation
 debug_process_plan :: proc(plan: Process_Plan) {
 	debug("process executable", fmt.tprintf("%q", plan.executable))
@@ -129,8 +143,8 @@ invoke_process_plan :: proc(plan: Process_Plan, debug_enabled: bool) -> int {
 	return 1
 }
 // END org:block transfer-invocation
-// BEGIN org:block pull-command
-run_pull :: proc(cli: Cli) -> int {
+// BEGIN org:block transfer-command
+run_transfer :: proc(cli: Cli, direction: Transfer_Direction) -> int {
 	config, config_problem, ok := load_config(cli.config)
 	if !ok {
 		defer destroy_config(&config)
@@ -184,8 +198,8 @@ run_pull :: proc(cli: Cli) -> int {
 			}
 		}
 	}
-	plan := plan_pull(config, cli.debug, cli.dry_run)
+	plan := plan_transfer(config, direction, cli.debug, cli.dry_run)
 	defer destroy_process_plan(&plan)
 	return invoke_process_plan(plan, cli.debug)
 }
-// END org:block pull-command
+// END org:block transfer-command

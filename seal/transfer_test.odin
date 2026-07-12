@@ -22,7 +22,7 @@ test_local_pull_plan_is_exact :: proc(t: ^testing.T) {
 		rsync = "/tools/pinned-rsync",
 		rsync_debug_flag = "-vvv",
 	}
-	plan := plan_pull(config, false, false)
+	plan := plan_transfer(config, .Pull, false, false)
 	defer destroy_process_plan(&plan)
 	testing.expect_value(t, plan.executable, "/tools/pinned-rsync")
 	expect_arguments(t, plan.argv[:], []string{
@@ -49,7 +49,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		rsync_debug_flag = "-vv",
 		ssh_debug_flag = "-vvv",
 	}
-	plan := plan_pull(config, true, true)
+	plan := plan_transfer(config, .Pull, true, true)
 	defer destroy_process_plan(&plan)
 	expect_arguments(t, plan.argv[:], []string{
 		"--recursive",
@@ -68,6 +68,59 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 	})
 }
 // END org:block ssh-pull-plan-test
+// BEGIN org:block push-plan-tests
+@(test)
+test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
+	config := Config{
+		local_mailbox = "/work/local mailbox",
+		peer_path = "/work/peer mailbox/",
+		rsync = "/tools/pinned-rsync",
+		rsync_debug_flag = "-vvv",
+	}
+	plan := plan_transfer(config, .Push, false, false)
+	defer destroy_process_plan(&plan)
+	expect_arguments(t, plan.argv[:], []string{
+		"--recursive",
+		"--links",
+		"--perms",
+		"--times",
+		"--checksum",
+		"--",
+		"/work/local mailbox/",
+		"/work/peer mailbox/",
+	})
+}
+
+@(test)
+test_ssh_debug_dry_run_push_reverses_operands :: proc(t: ^testing.T) {
+	config := Config{
+		local_mailbox = "/work/mailbox",
+		peer_path = "/home/agent/mailbox",
+		peer_ssh = "agent alias",
+		rsync = "/tools/rsync",
+		ssh = "/tools/ssh",
+		rsync_debug_flag = "-vv",
+		ssh_debug_flag = "-vvv",
+	}
+	plan := plan_transfer(config, .Push, true, true)
+	defer destroy_process_plan(&plan)
+	expect_arguments(t, plan.argv[:], []string{
+		"--recursive",
+		"--links",
+		"--perms",
+		"--times",
+		"--checksum",
+		"--dry-run",
+		"-vv",
+		"--secluded-args",
+		"--rsh",
+		"/tools/ssh -vvv",
+		"--",
+		"/work/mailbox/",
+		"agent alias:/home/agent/mailbox/",
+	})
+}
+// END org:block push-plan-tests
 // BEGIN org:block child-failure-test
 @(test)
 test_child_failure_status_is_returned :: proc(t: ^testing.T) {

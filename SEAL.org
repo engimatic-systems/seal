@@ -1128,7 +1128,7 @@ run_init :: proc(cli: Cli) -> int {
 }
 #+end_src
 
-* Peer-to-local transfer
+* Directional transfer
 
 Transfer owns the fixed rsync plan and direct child invocation. Mailbox names
 and bytes remain opaque.
@@ -1160,6 +1160,11 @@ Process_Plan :: struct {
 	argv:       [dynamic]string,
 }
 
+Transfer_Direction :: enum {
+	Pull,
+	Push,
+}
+
 destroy_process_plan :: proc(plan: ^Process_Plan) {
 	delete(plan.executable)
 	for argument in plan.argv {
@@ -1174,7 +1179,7 @@ append_plan_argument :: proc(plan: ^Process_Plan, argument: string) {
 }
 #+end_src
 
-** Pull planning
+** Transfer planning
 
 Pseudocode:
 
@@ -1182,11 +1187,12 @@ Pseudocode:
 2. Add dry-run and configured rsync verbosity only when requested.
 3. For SSH, add secluded arguments and a remote-shell command containing the
    pinned SSH executable plus configured SSH verbosity only in debug mode.
-4. Add =--=, then one peer-to-local source and destination operand.
-5. Give both mailbox roots a trailing slash; keep remote paths peer-side and
+4. Give both mailbox roots a trailing slash; keep remote paths peer-side and
    local paths already resolved by configuration loading.
+5. Add =--=, then order peer and local operands for pull or reverse the same
+   operands for push.
 
-#+begin_src odin :tangle seal/transfer.odin :name pull-plan
+#+begin_src odin :tangle seal/transfer.odin :name transfer-plan
 with_trailing_slash :: proc(path: string) -> string {
 	if strings.has_suffix(path, "/") {
 		return strings.clone(path)
@@ -1194,7 +1200,11 @@ with_trailing_slash :: proc(path: string) -> string {
 	return fmt.aprintf("%s/", path)
 }
 
-plan_pull :: proc(config: Config, debug_enabled, dry_run: bool) -> Process_Plan {
+plan_transfer :: proc(
+	config: Config,
+	direction: Transfer_Direction,
+	debug_enabled, dry_run: bool,
+) -> Process_Plan {
 	plan := Process_Plan{executable = strings.clone(config.rsync)}
 	for flag in TRANSFER_FLAGS {
 		append_plan_argument(&plan, flag)
@@ -1218,19 +1228,24 @@ plan_pull :: proc(config: Config, debug_enabled, dry_run: bool) -> Process_Plan 
 		delete(remote_shell)
 	}
 
-	append_plan_argument(&plan, "--")
 	peer_path := with_trailing_slash(config.peer_path)
 	defer delete(peer_path)
 	if len(config.peer_ssh) > 0 {
-		source := fmt.aprintf("%s:%s", config.peer_ssh, peer_path)
-		append_plan_argument(&plan, source)
-		delete(source)
+		remote_path := fmt.aprintf("%s:%s", config.peer_ssh, peer_path)
+		delete(peer_path)
+		peer_path = remote_path
+	}
+	local_path := with_trailing_slash(config.local_mailbox)
+	defer delete(local_path)
+
+	append_plan_argument(&plan, "--")
+	if direction == .Pull {
+		append_plan_argument(&plan, peer_path)
+		append_plan_argument(&plan, local_path)
 	} else {
+		append_plan_argument(&plan, local_path)
 		append_plan_argument(&plan, peer_path)
 	}
-	destination := with_trailing_slash(config.local_mailbox)
-	append_plan_argument(&plan, destination)
-	delete(destination)
 	return plan
 }
 #+end_src
@@ -1296,17 +1311,18 @@ invoke_process_plan :: proc(plan: Process_Plan, debug_enabled: bool) -> int {
 }
 #+end_src
 
-** Pull command
+** Transfer command
 
 Pseudocode:
 
 1. Load the selected configuration before constructing or invoking a plan.
 2. On debug runs, report working directory, resolved transfer coordinates,
    and configuration selection.
-3. Build one pull plan and invoke it once; dry-run changes only rsync argv.
+3. Build one directional plan and invoke it once; dry-run changes only rsync
+   argv.
 
-#+begin_src odin :tangle seal/transfer.odin :name pull-command
-run_pull :: proc(cli: Cli) -> int {
+#+begin_src odin :tangle seal/transfer.odin :name transfer-command
+run_transfer :: proc(cli: Cli, direction: Transfer_Direction) -> int {
 	config, config_problem, ok := load_config(cli.config)
 	if !ok {
 		defer destroy_config(&config)
@@ -1360,7 +1376,7 @@ run_pull :: proc(cli: Cli) -> int {
 			}
 		}
 	}
-	plan := plan_pull(config, cli.debug, cli.dry_run)
+	plan := plan_transfer(config, direction, cli.debug, cli.dry_run)
 	defer destroy_process_plan(&plan)
 	return invoke_process_plan(plan, cli.debug)
 }
@@ -1395,6 +1411,7 @@ Usage:
   seal [OPTIONS] cfg
   seal [OPTIONS] init PEER_PATH [--ssh SSH_DESTINATION]
   seal [OPTIONS] pull [--dry-run]
+  seal [OPTIONS] push [--dry-run]
 
 Options:
   --config PATH Select configuration instead of ./seal.toml
@@ -1433,7 +1450,7 @@ debug :: proc(label, value: string) {
 
 ** Command-line state
 
-Only implemented actions exist. Push and later verbs are not represented.
+Only implemented actions exist. Later verbs are not represented.
 
 #+begin_src odin :tangle seal/main.odin :name cli-state
 Cli_Action :: enum {
@@ -1441,6 +1458,7 @@ Cli_Action :: enum {
 	Cfg,
 	Init,
 	Pull,
+	Push,
 	Help,
 	Version,
 	Invalid,
@@ -1465,10 +1483,10 @@ Pseudocode:
 
 1. Read each supplied argument once.
 2. Record global =--debug= and the one =--config PATH= value.
-3. Select =cfg=, =init PEER_PATH=, =pull=, help, or version for their exact
-   spellings.
+3. Select =cfg=, =init PEER_PATH=, =pull=, =push=, help, or version for their
+   exact spellings.
 4. Accept =--ssh SSH_DESTINATION= only once and only after =init=; accept
-   =--dry-run= only once and only after =pull=.
+   =--dry-run= only once and only after =pull= or =push=.
 5. Reject missing values, repeated actions, and unknown arguments with the
    first offending spelling.
 6. Otherwise retain the seed's empty successful run.
@@ -1505,8 +1523,13 @@ parse_args :: proc(args: []string) -> Cli {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.action = .Pull
+		case "push":
+			if cli.action != .Run {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.action = .Push
 		case "--dry-run":
-			if cli.action != .Pull || cli.dry_run {
+			if (cli.action != .Pull && cli.action != .Push) || cli.dry_run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.dry_run = true
@@ -1653,7 +1676,7 @@ Pseudocode:
 1. Parse arguments and service help or version without filesystem access.
 2. Reject an unknown argument with a plain error and nonzero status.
 3. Dispatch =cfg= to read-only configuration display, =init= to local
-   workspace creation, and =pull= to one peer-to-local process plan.
+   workspace creation, and =pull= or =push= to one directional process plan.
 4. For an ordinary run without debug, retain seed success without output.
 5. For a debug run, resolve the process working directory.
 6. Report cwd and version to standard error, or report cwd failure and return
@@ -1677,7 +1700,9 @@ run :: proc(args: []string) -> int {
 	case .Init:
 		return run_init(cli)
 	case .Pull:
-		return run_pull(cli)
+		return run_transfer(cli, .Pull)
+	case .Push:
+		return run_transfer(cli, .Push)
 	case .Run:
 	}
 
@@ -1735,9 +1760,9 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, debug_run.action, Cli_Action.Run)
 	testing.expect(t, debug_run.debug)
 
-	invalid := parse_args([]string{"push"})
+	invalid := parse_args([]string{"doctor"})
 	testing.expect_value(t, invalid.action, Cli_Action.Invalid)
-	testing.expect_value(t, invalid.invalid, "push")
+	testing.expect_value(t, invalid.invalid, "doctor")
 
 	testing.expect_value(t, VERSION, "0.1.0")
 	testing.expect(t, strings.contains(HELP_TEXT, "seal [OPTIONS] cfg"))
@@ -1761,6 +1786,10 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, pull.action, Cli_Action.Pull)
 	testing.expect(t, pull.debug)
 	testing.expect(t, pull.dry_run)
+
+	push := parse_args([]string{"push", "--dry-run"})
+	testing.expect_value(t, push.action, Cli_Action.Push)
+	testing.expect(t, push.dry_run)
 }
 #+end_src
 
@@ -1804,7 +1833,7 @@ test_local_pull_plan_is_exact :: proc(t: ^testing.T) {
 		rsync = "/tools/pinned-rsync",
 		rsync_debug_flag = "-vvv",
 	}
-	plan := plan_pull(config, false, false)
+	plan := plan_transfer(config, .Pull, false, false)
 	defer destroy_process_plan(&plan)
 	testing.expect_value(t, plan.executable, "/tools/pinned-rsync")
 	expect_arguments(t, plan.argv[:], []string{
@@ -1842,7 +1871,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		rsync_debug_flag = "-vv",
 		ssh_debug_flag = "-vvv",
 	}
-	plan := plan_pull(config, true, true)
+	plan := plan_transfer(config, .Pull, true, true)
 	defer destroy_process_plan(&plan)
 	expect_arguments(t, plan.argv[:], []string{
 		"--recursive",
@@ -1858,6 +1887,70 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		"--",
 		"agent alias:/home/agent/mailbox/",
 		"/work/mailbox/",
+	})
+}
+#+end_src
+
+** Exact reversed push plans
+
+Pseudocode:
+
+1. Plan local and SSH pushes through the same planner used by pull.
+2. Require the same fixed, dry-run, and debug arguments as the corresponding
+   pull plans.
+3. Require only the final mailbox operands to reverse: local source, peer
+   destination.
+
+#+begin_src odin :tangle seal/transfer_test.odin :name push-plan-tests
+@(test)
+test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
+	config := Config{
+		local_mailbox = "/work/local mailbox",
+		peer_path = "/work/peer mailbox/",
+		rsync = "/tools/pinned-rsync",
+		rsync_debug_flag = "-vvv",
+	}
+	plan := plan_transfer(config, .Push, false, false)
+	defer destroy_process_plan(&plan)
+	expect_arguments(t, plan.argv[:], []string{
+		"--recursive",
+		"--links",
+		"--perms",
+		"--times",
+		"--checksum",
+		"--",
+		"/work/local mailbox/",
+		"/work/peer mailbox/",
+	})
+}
+
+@(test)
+test_ssh_debug_dry_run_push_reverses_operands :: proc(t: ^testing.T) {
+	config := Config{
+		local_mailbox = "/work/mailbox",
+		peer_path = "/home/agent/mailbox",
+		peer_ssh = "agent alias",
+		rsync = "/tools/rsync",
+		ssh = "/tools/ssh",
+		rsync_debug_flag = "-vv",
+		ssh_debug_flag = "-vvv",
+	}
+	plan := plan_transfer(config, .Push, true, true)
+	defer destroy_process_plan(&plan)
+	expect_arguments(t, plan.argv[:], []string{
+		"--recursive",
+		"--links",
+		"--perms",
+		"--times",
+		"--checksum",
+		"--dry-run",
+		"-vv",
+		"--secluded-args",
+		"--rsh",
+		"/tools/ssh -vvv",
+		"--",
+		"/work/mailbox/",
+		"agent alias:/home/agent/mailbox/",
 	})
 }
 #+end_src

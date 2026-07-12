@@ -17,9 +17,9 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, debug_run.action, Cli_Action.Run)
 	testing.expect(t, debug_run.debug)
 
-	invalid := parse_args([]string{"push"})
+	invalid := parse_args([]string{"doctor"})
 	testing.expect_value(t, invalid.action, Cli_Action.Invalid)
-	testing.expect_value(t, invalid.invalid, "push")
+	testing.expect_value(t, invalid.invalid, "doctor")
 
 	testing.expect_value(t, VERSION, "0.1.0")
 	testing.expect(t, strings.contains(HELP_TEXT, "seal [OPTIONS] cfg"))
@@ -43,5 +43,9 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, pull.action, Cli_Action.Pull)
 	testing.expect(t, pull.debug)
 	testing.expect(t, pull.dry_run)
+
+	push := parse_args([]string{"push", "--dry-run"})
+	testing.expect_value(t, push.action, Cli_Action.Push)
+	testing.expect(t, push.dry_run)
 }
 // END org:block visible-seed-test

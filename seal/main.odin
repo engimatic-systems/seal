@@ -16,6 +16,7 @@ Usage:
   seal [OPTIONS] cfg
   seal [OPTIONS] init PEER_PATH [--ssh SSH_DESTINATION]
   seal [OPTIONS] pull [--dry-run]
+  seal [OPTIONS] push [--dry-run]
 
 Options:
   --config PATH Select configuration instead of ./seal.toml
@@ -51,6 +52,7 @@ Cli_Action :: enum {
 	Cfg,
 	Init,
 	Pull,
+	Push,
 	Help,
 	Version,
 	Invalid,
@@ -100,8 +102,13 @@ parse_args :: proc(args: []string) -> Cli {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.action = .Pull
+		case "push":
+			if cli.action != .Run {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.action = .Push
 		case "--dry-run":
-			if cli.action != .Pull || cli.dry_run {
+			if (cli.action != .Pull && cli.action != .Push) || cli.dry_run {
 				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
 			}
 			cli.dry_run = true
@@ -248,7 +255,9 @@ run :: proc(args: []string) -> int {
 	case .Init:
 		return run_init(cli)
 	case .Pull:
-		return run_pull(cli)
+		return run_transfer(cli, .Pull)
+	case .Push:
+		return run_transfer(cli, .Push)
 	case .Run:
 	}
 
