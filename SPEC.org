@@ -87,6 +87,20 @@ variables.
 Relative local paths resolve from the selected configuration's directory. An
 SSH peer path remains a peer-side path.
 
+** Syntax
+
+Configuration is a deliberately small line-oriented syntax, not general TOML.
+Each line is trimmed only of leading and trailing spaces and tabs. Blank lines
+are accepted; comments are not accepted outside strings.
+
+A table line is =[=, one key, then =]= with no internal whitespace. An
+assignment is one key, optional horizontal whitespace, ===, optional horizontal
+whitespace, and one string. A key starts with an ASCII letter and continues
+with ASCII letters, digits, or underscore. A string is double-quoted printable
+ASCII excluding double quote and backslash; it has no escapes. The complete
+trimmed line must be consumed. Lists, Unicode, control bytes, trailing syntax,
+and other value forms are rejected.
+
 ** Fields
 
 #+begin_src toml
@@ -101,9 +115,12 @@ rsync = "/run/current-system/sw/bin/rsync"
 ssh = "/run/current-system/sw/bin/ssh"
 
 [debug]
-rsync_debug_flags = ["-v"]
-ssh_debug_flags = ["-v"]
+rsync_debug_flags = "-v"
+ssh_debug_flags = "-v"
 #+end_src
+
+Repeated known table headers reselect that table. Repeated known fields replace
+their prior value, so the last value in the document wins.
 
 Omitting =peer.ssh= makes =peer.path= local. A local peer omits =tools.ssh= and
 =debug.ssh_debug_flags=. An SSH peer requires both =peer.ssh= and =tools.ssh=.
@@ -121,9 +138,9 @@ V0 does not configure =--rsync-path= or perform remote executable discovery.
 The live smoke determines whether that becomes concrete friction.
 
 The optional =debug= table controls diagnostic verbosity only when global
-=--debug= is present. Each applicable array is empty or contains one of =-v=,
-=-vv=, or =-vvv=. Missing fields default to =[-v]=. No other SSH or rsync debug
-syntax and no arbitrary flag passthrough is accepted in v0.
+=--debug= is present. Each applicable scalar is =""=, ="-v"=, ="-vv"=, or
+="-vvv"=. Missing fields default to ="-v"=. No other SSH or rsync debug syntax
+and no arbitrary flag passthrough is accepted in v0.
 
 The fixed transfer flags are not configuration. The specification and obvious
 constants in =SEAL.org= own them.

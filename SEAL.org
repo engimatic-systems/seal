@@ -5,16 +5,21 @@
 This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary files used by Odin and reviewers.
 
-The complete generated-file boundary is =.gitignore=, =seal/main.odin=, and
-=seal/main_test.odin=. Generated files identify their source blocks so compiler
-diagnostics can be mapped back here.
+The complete generated-file boundary is =.gitignore=, =seal/main.odin=,
+=seal/main_test.odin=, =seal/config/config.odin=,
+=seal/config/config_document.odin=, =seal/config/config_syntax.odin=,
+=seal/config/config_test.odin=, and =seal/config/config_syntax_test.odin=.
+Generated files identify their source blocks so compiler diagnostics can be
+mapped back here.
 
 Tangle twice, then check, test, and build from the repository root:
 
 #+begin_src sh
 .ephemera/tangle-org.sh SEAL.org
 .ephemera/tangle-org.sh SEAL.org
+nix shell nixpkgs#odin -c odin check seal/config -no-entry-point -vet-style -vet-tabs
 nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin test seal/config -vet-style -vet-tabs
 nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
 nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
 #+end_src
@@ -31,6 +36,633 @@ Build output and local tangle machinery are not source artifacts.
 /seal.bin
 #+end_src
 
+* Configuration package
+
+The =seal/config= package separates tiny line grammar, document construction,
+and caller-facing configuration lifetime into =config_syntax.odin=,
+=config_document.odin=, and =config.odin= respectively.
+
+Dataflow and ownership:
+
+#+begin_example
+load_config -> parse_config -> parse_config_document -> parse_config_syntax_line
+                                      |
+                                      v
+                         Config payloads + Config_State presence
+                                      |
+                                      v
+ required structure -> static semantics -> defaults -> path interpretation
+                                      |
+                                      v
+                                 owned Config
+#+end_example
+
+Syntax and document values are borrowed slices until known fields clone them.
+Repeated known fields clone the last-seen value before releasing prior owned
+storage. Failures return a partial owned =Config= for caller cleanup; errors own
+their path. Environment probing is outside the configuration package.
+
+* Configuration syntax
+
+** Result types
+
+=Config_Syntax_Kind= classifies a complete line as invalid, blank, table, or
+assignment. =Config_Syntax_Line= carries that classification plus borrowed key
+and value slices when applicable.
+
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-result-types
+package config
+
+@(private)
+Config_Syntax_Kind :: enum {
+	Invalid,
+	Blank,
+	Table,
+	Assignment,
+}
+
+@(private)
+Config_Syntax_Line :: struct {
+	kind:  Config_Syntax_Kind,
+	key:   string,
+	value: string,
+}
+#+end_src
+
+** Predicate helpers
+
+- =is_horizontal_space=: accepts an ASCII space or tab.
+- =trim_horizontal_space=: removes leading and trailing ASCII spaces and tabs.
+- =is_ascii_alpha=: accepts an uppercase or lowercase ASCII letter.
+- =is_key_byte=: accepts an ASCII letter, digit, or underscore.
+- =valid_config_key=: accepts a nonempty key that starts with an ASCII letter
+  and continues with key bytes.
+
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-predicate-helpers
+@(private)
+is_horizontal_space :: proc(byte_value: byte) -> bool {
+	return byte_value == ' ' || byte_value == '\t'
+}
+
+@(private)
+trim_horizontal_space :: proc(input: string) -> string {
+	start := 0
+	for start < len(input) && is_horizontal_space(input[start]) {
+		start += 1
+	}
+	end := len(input)
+	for end > start && is_horizontal_space(input[end - 1]) {
+		end -= 1
+	}
+	return input[start:end]
+}
+
+@(private)
+is_ascii_alpha :: proc(byte_value: byte) -> bool {
+	return byte_value >= 'A' && byte_value <= 'Z' ||
+		byte_value >= 'a' && byte_value <= 'z'
+}
+
+@(private)
+is_key_byte :: proc(byte_value: byte) -> bool {
+	return is_ascii_alpha(byte_value) ||
+		byte_value >= '0' && byte_value <= '9' ||
+		byte_value == '_'
+}
+
+@(private)
+valid_config_key :: proc(input: string) -> bool {
+	if len(input) == 0 || !is_ascii_alpha(input[0]) {
+		return false
+	}
+	for byte_value in transmute([]byte)input[1:] {
+		if !is_key_byte(byte_value) {
+			return false
+		}
+	}
+	return true
+}
+#+end_src
+
+** Table production
+
+Precondition: =line= is nonempty and starts with =[=; =parse_table_line=
+validates the closing bracket and ASCII key and returns the borrowed table key.
+
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-table-production
+@(private)
+parse_table_line :: proc(line: string) -> Config_Syntax_Line {
+	if len(line) < 3 || line[len(line) - 1] != ']' {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	key := line[1:len(line) - 1]
+	if !valid_config_key(key) {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	return Config_Syntax_Line{kind = .Table, key = key}
+}
+#+end_src
+
+** Assignment production
+
+Precondition: =line= is nonempty and starts with an ASCII letter.
+
+Pseudocode:
+
+1. Scan the key through its final ASCII letter, digit, or underscore.
+2. Consume optional horizontal whitespace, ===, optional horizontal whitespace,
+   and an opening double quote.
+3. Scan printable ASCII value bytes while rejecting backslashes.
+4. Accept only a closing double quote at the end of the line.
+
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-assignment-production
+@(private)
+parse_assignment_line :: proc(line: string) -> Config_Syntax_Line {
+	i := 0
+	for i < len(line) && is_key_byte(line[i]) {
+		i += 1
+	}
+	key := line[:i]
+	for i < len(line) && is_horizontal_space(line[i]) {
+		i += 1
+	}
+	if i >= len(line) || line[i] != '=' {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	i += 1
+	for i < len(line) && is_horizontal_space(line[i]) {
+		i += 1
+	}
+	if i >= len(line) || line[i] != '"' {
+		return Config_Syntax_Line{kind = .Invalid}
+	}
+	i += 1
+	value_start := i
+	for i < len(line) {
+		byte_value := line[i]
+		if byte_value == '"' {
+			if i + 1 != len(line) {
+				return Config_Syntax_Line{kind = .Invalid}
+			}
+			return Config_Syntax_Line{
+				kind = .Assignment,
+				key = key,
+				value = line[value_start:i],
+			}
+		}
+		if byte_value < 0x20 || byte_value > 0x7e || byte_value == '\\' {
+			return Config_Syntax_Line{kind = .Invalid}
+		}
+		i += 1
+	}
+	return Config_Syntax_Line{kind = .Invalid}
+}
+#+end_src
+
+** Complete-line dispatcher
+
+The dispatcher trims horizontal whitespace, accepts blank lines, selects table
+or assignment production by the first byte, and rejects every other line.
+
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-complete-line-dispatcher
+@(private)
+parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
+	line := trim_horizontal_space(input)
+	if len(line) == 0 {
+		return Config_Syntax_Line{kind = .Blank}
+	}
+	if line[0] == '[' {
+		return parse_table_line(line)
+	}
+	if is_ascii_alpha(line[0]) {
+		return parse_assignment_line(line)
+	}
+	return Config_Syntax_Line{kind = .Invalid}
+}
+#+end_src
+
+* Configuration model
+
+** Result and error types
+
+=Config= owns selected paths and semantic values; =Config_Error= owns its
+diagnostic path and borrows its static message.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-model-result-error-types
+package config
+
+import "core:os"
+import "core:path/filepath"
+import "core:strings"
+
+Config :: struct {
+	path:             string,
+	directory:        string,
+	local_mailbox:    string,
+	peer_path:        string,
+	peer_ssh:         string,
+	rsync:            string,
+	ssh:              string,
+	rsync_debug_flag: string,
+	ssh_debug_flag:   string,
+}
+
+Config_Error :: struct {
+	path:    string,
+	line:    int,
+	message: string,
+}
+#+end_src
+
+** Error lifetime
+
+=config_error= clones the diagnostic path, and =destroy_config_error= releases
+that clone and clears the result.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-model-error-lifetime
+@(private)
+config_error :: proc(path: string, line: int, message: string) -> Config_Error {
+	return Config_Error{path = strings.clone(path), line = line, message = message}
+}
+
+destroy_config_error :: proc(problem: ^Config_Error) {
+	if len(problem.path) > 0 {
+		delete(problem.path)
+	}
+	problem^ = {}
+}
+#+end_src
+
+* Configuration document
+
+** Parse state
+
+=Config_Table= records the current assignment scope; =Config_State= records
+field presence while parsing one document.
+
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-parse-state
+package config
+
+import "core:strings"
+
+@(private)
+Config_Table :: enum {
+	Root,
+	Peer,
+	Tools,
+	Debug,
+}
+
+@(private)
+Config_State :: struct {
+	local_mailbox:    bool,
+	peer_path:        bool,
+	peer_ssh:         bool,
+	rsync:            bool,
+	ssh:              bool,
+	rsync_debug_flag: bool,
+	ssh_debug_flag:   bool,
+}
+#+end_src
+
+** Table structure
+
+=select_config_table= selects known table names and reports unknown names;
+repeated known headers select that table again.
+
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-table-structure
+@(private)
+select_config_table :: proc(name: string) -> (Config_Table, string) {
+	switch name {
+	case "peer":
+		return .Peer, ""
+	case "tools":
+		return .Tools, ""
+	case "debug":
+		return .Debug, ""
+	case:
+		return .Root, "unknown table"
+	}
+}
+#+end_src
+
+** Field structure
+
+=assign_config_value= replaces an owned field with a clone of its last value;
+=assign_config_field= maps known keys in the active table and rejects unknowns.
+
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-field-structure
+@(private)
+assign_config_value :: proc(destination: ^string, present: ^bool, value: string) -> string {
+	replacement := strings.clone(value)
+	if len(destination^) > 0 {
+		delete(destination^)
+	}
+	destination^ = replacement
+	present^ = true
+	return ""
+}
+
+@(private)
+assign_config_field :: proc(
+	config: ^Config,
+	state: ^Config_State,
+	table: Config_Table,
+	key, value: string,
+) -> string {
+	switch table {
+	case .Root:
+		if key == "local_mailbox" {
+			return assign_config_value(&config.local_mailbox, &state.local_mailbox, value)
+		}
+	case .Peer:
+		switch key {
+		case "path":
+			return assign_config_value(&config.peer_path, &state.peer_path, value)
+		case "ssh":
+			return assign_config_value(&config.peer_ssh, &state.peer_ssh, value)
+		}
+	case .Tools:
+		switch key {
+		case "rsync":
+			return assign_config_value(&config.rsync, &state.rsync, value)
+		case "ssh":
+			return assign_config_value(&config.ssh, &state.ssh, value)
+		}
+	case .Debug:
+		switch key {
+		case "rsync_debug_flags":
+			return assign_config_value(
+				&config.rsync_debug_flag,
+				&state.rsync_debug_flag,
+				value,
+			)
+		case "ssh_debug_flags":
+			return assign_config_value(
+				&config.ssh_debug_flag,
+				&state.ssh_debug_flag,
+				value,
+			)
+		}
+	}
+	return "unknown key in current table"
+}
+#+end_src
+
+** Required fields
+
+=validate_required_fields= reports the first absent structurally required
+field after the complete document has been consumed.
+
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-required-fields
+@(private)
+validate_required_fields :: proc(state: ^Config_State) -> string {
+	if !state.local_mailbox {
+		return "missing local_mailbox"
+	}
+	if !state.peer_path {
+		return "missing peer.path"
+	}
+	if !state.rsync {
+		return "missing tools.rsync"
+	}
+	return ""
+}
+#+end_src
+
+** Document parser
+
+Pseudocode:
+
+1. Read physical lines in order and retain the current table plus line number.
+2. Ignore blank lines; select or reselect tables; assign last-seen field values.
+3. Stop at the first syntax, table, or field problem and return its line.
+4. Otherwise return the final physical line number and an empty problem.
+
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-parser
+@(private)
+parse_config_document :: proc(
+	text: string,
+	config: ^Config,
+	state: ^Config_State,
+) -> (line_number: int, problem: string) {
+	table := Config_Table.Root
+	remaining := text
+	line_number = 0
+	for {
+		line, ok := strings.split_lines_iterator(&remaining)
+		if !ok {
+			break
+		}
+		line_number += 1
+		parsed := parse_config_syntax_line(line)
+		switch parsed.kind {
+		case .Blank:
+			continue
+		case .Table:
+			table, problem = select_config_table(parsed.key)
+			if len(problem) > 0 {
+				return line_number, problem
+			}
+		case .Assignment:
+			problem = assign_config_field(config, state, table, parsed.key, parsed.value)
+			if len(problem) > 0 {
+				return line_number, problem
+			}
+		case .Invalid:
+			return line_number, "invalid configuration syntax"
+		}
+	}
+	return line_number, ""
+}
+#+end_src
+
+* Configuration semantics
+
+** Semantic helpers
+
+=valid_debug_flag= accepts the empty flag or one through three verbose flags.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-helpers
+@(private)
+valid_debug_flag :: proc(value: string) -> bool {
+	return len(value) == 0 || value == "-v" || value == "-vv" || value == "-vvv"
+}
+#+end_src
+
+** Static validation
+
+Pseudocode:
+
+1. Reject empty required paths and empty explicitly supplied SSH values.
+2. Require absolute local tool paths.
+3. Require peer SSH and tools SSH together, and reject SSH debug flags locally.
+4. Accept only the debug flag values named by =valid_debug_flag=.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-static-validation
+@(private)
+validate_config_semantics :: proc(config: ^Config, state: ^Config_State) -> string {
+	if len(config.local_mailbox) == 0 || len(config.peer_path) == 0 || len(config.rsync) == 0 {
+		return "required paths must not be empty"
+	}
+	if state.peer_ssh && len(config.peer_ssh) == 0 || state.ssh && len(config.ssh) == 0 {
+		return "SSH values must not be empty"
+	}
+	if !filepath.is_abs(config.rsync) || state.ssh && !filepath.is_abs(config.ssh) {
+		return "tool paths must be absolute"
+	}
+	if state.peer_ssh != state.ssh {
+		return "SSH peer requires tools.ssh; local peer must omit it"
+	}
+	if !state.peer_ssh && state.ssh_debug_flag {
+		return "local peer must omit ssh_debug_flags"
+	}
+	if state.rsync_debug_flag && !valid_debug_flag(config.rsync_debug_flag) ||
+	   state.ssh_debug_flag && !valid_debug_flag(config.ssh_debug_flag) {
+		return "debug flag must be empty, -v, -vv, or -vvv"
+	}
+	return ""
+}
+#+end_src
+
+** Defaults
+
+=apply_config_defaults= supplies =-v= only for absent applicable debug fields.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-defaults
+@(private)
+apply_config_defaults :: proc(config: ^Config, state: ^Config_State) {
+	if !state.rsync_debug_flag {
+		config.rsync_debug_flag = strings.clone("-v")
+	}
+	if state.peer_ssh && !state.ssh_debug_flag {
+		config.ssh_debug_flag = strings.clone("-v")
+	}
+}
+#+end_src
+
+** Path interpretation
+
+=resolve_local_path= clones absolute paths or joins relative paths to the
+configuration directory; =resolve_config_paths= retains SSH peer paths verbatim.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-path-interpretation
+@(private)
+resolve_local_path :: proc(directory, path: string) -> string {
+	if filepath.is_abs(path) {
+		return strings.clone(path)
+	}
+	joined, _ := filepath.join([]string{directory, path})
+	return joined
+}
+
+@(private)
+resolve_config_paths :: proc(config: ^Config) {
+	resolved_mailbox := resolve_local_path(config.directory, config.local_mailbox)
+	delete(config.local_mailbox)
+	config.local_mailbox = resolved_mailbox
+	if len(config.peer_ssh) == 0 {
+		resolved_peer := resolve_local_path(config.directory, config.peer_path)
+		delete(config.peer_path)
+		config.peer_path = resolved_peer
+	}
+}
+#+end_src
+
+* Configuration assembly
+
+** Parse and interpret
+
+=parse_config= returns an owned partial =Config= on failure for the caller to
+destroy and wraps static phase problems in an owned =Config_Error=.
+
+Pseudocode:
+
+1. Initialize the owned result and document parse state.
+2. Parse the document and wrap any failure at its physical line.
+3. Validate required structure, then semantics, at the line after the document.
+4. Apply defaults, resolve local paths, and return the complete owned result.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-assembly-parse-interpret
+@(private)
+parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
+	config := Config{
+		path = strings.clone(path),
+		directory = strings.clone(directory),
+	}
+	state := Config_State{}
+	line_number, problem := parse_config_document(text, &config, &state)
+	if len(problem) > 0 {
+		return config, config_error(path, line_number, problem), false
+	}
+
+	problem = validate_required_fields(&state)
+	if len(problem) > 0 {
+		return config, config_error(path, line_number + 1, problem), false
+	}
+	problem = validate_config_semantics(&config, &state)
+	if len(problem) > 0 {
+		return config, config_error(path, line_number + 1, problem), false
+	}
+	apply_config_defaults(&config, &state)
+	resolve_config_paths(&config)
+	return config, Config_Error{}, true
+}
+#+end_src
+
+* Configuration lifetime
+
+** Destruction
+
+=destroy_config= releases every owned string in a complete or partial result
+and clears the value.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-lifetime-destruction
+destroy_config :: proc(config: ^Config) {
+	values := []string{
+		config.path,
+		config.directory,
+		config.local_mailbox,
+		config.peer_path,
+		config.peer_ssh,
+		config.rsync,
+		config.ssh,
+		config.rsync_debug_flag,
+		config.ssh_debug_flag,
+	}
+	for value in values {
+		if len(value) > 0 {
+			delete(value)
+		}
+	}
+	config^ = {}
+}
+#+end_src
+
+** File loading
+
+=load_config= owns temporary absolute-path and file-content buffers while
+constructing configuration from the selected file.
+
+#+begin_src odin :tangle seal/config/config.odin :name config-lifetime-file-loading
+load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
+	absolute_path, path_error := os.get_absolute_path(selected_path, context.allocator)
+	if path_error != nil {
+		return Config{}, config_error(selected_path, 0, "cannot resolve configuration path"), false
+	}
+	defer delete(absolute_path)
+
+	contents, read_error := os.read_entire_file(absolute_path, context.allocator)
+	if read_error != nil {
+		return Config{}, config_error(absolute_path, 0, "cannot read configuration"), false
+	}
+	defer delete(contents)
+
+	directory := filepath.dir(absolute_path)
+	return parse_config(string(contents), absolute_path, directory)
+}
+#+end_src
+
 * Executable
 
 ** Package and imports
@@ -42,6 +674,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import seal_config "config"
 #+end_src
 
 ** Visible constants
@@ -51,12 +684,25 @@ Version and help text are explicit operator-visible contract values.
 #+begin_src odin :tangle seal/main.odin :name visible-constants
 VERSION :: "0.1.0"
 
+DEFAULT_CONFIG_PATH :: "./seal.toml"
+
+TRANSFER_FLAGS := [?]string{
+	"--recursive",
+	"--links",
+	"--perms",
+	"--times",
+	"--checksum",
+}
+
+SSH_TRANSFER_FLAG :: "--secluded-args"
+
 HELP_TEXT :: `Seal
 Operator-initiated opaque mailbox transport
 
-Usage: seal [OPTIONS]
+Usage: seal [OPTIONS] cfg
 
 Options:
+  --config PATH Select configuration instead of ./seal.toml
   --debug       Report process facts on standard error
   -h, --help    Print help
   -V, --version Print version
@@ -97,6 +743,7 @@ Only current seed actions exist. Later verbs are not represented.
 #+begin_src odin :tangle seal/main.odin :name cli-state
 Cli_Action :: enum {
 	Run,
+	Cfg,
 	Help,
 	Version,
 	Invalid,
@@ -105,6 +752,8 @@ Cli_Action :: enum {
 Cli :: struct {
 	action:   Cli_Action,
 	debug:    bool,
+	config:   string,
+	explicit_config: bool,
 	invalid:  string,
 }
 #+end_src
@@ -113,19 +762,33 @@ Cli :: struct {
 
 Pseudocode:
 
-1. Read each supplied option once.
-2. Record global =--debug= without changing the selected visible action.
-3. Select help or version for their conventional spellings.
-4. Preserve the first unknown argument for one useful error.
-5. Otherwise select the empty successful run.
+1. Read each supplied argument once.
+2. Record global =--debug= and the one =--config PATH= value.
+3. Select =cfg=, help, or version for their exact spellings.
+4. Reject a missing or repeated configuration path and preserve the first
+   unknown argument for one useful error.
+5. Otherwise retain the seed's empty successful run.
 
 #+begin_src odin :tangle seal/main.odin :name parse-args
 parse_args :: proc(args: []string) -> Cli {
-	cli := Cli{}
-	for arg in args {
+	cli := Cli{config = DEFAULT_CONFIG_PATH}
+	for i := 0; i < len(args); i += 1 {
+		arg := args[i]
 		switch arg {
 		case "--debug":
 			cli.debug = true
+		case "--config":
+			if cli.explicit_config || i + 1 >= len(args) {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = "--config"}
+			}
+			i += 1
+			cli.config = args[i]
+			cli.explicit_config = true
+		case "cfg":
+			if cli.action != .Run {
+				return Cli{action = .Invalid, debug = cli.debug, invalid = arg}
+			}
+			cli.action = .Cfg
 		case "-h", "--help":
 			cli.action = .Help
 		case "-V", "--version":
@@ -138,15 +801,126 @@ parse_args :: proc(args: []string) -> Cli {
 }
 #+end_src
 
+** Configuration display
+
+Pseudocode:
+
+1. Load only the selected configuration file and stop on its first error.
+2. Print selection reason, resolved local coordinates, peer coordinates, pinned
+   local tools, effective debug flags, version, and the fixed transfer profile.
+3. Invoke no tool, contact no peer, and modify no state.
+
+#+begin_src odin :tangle seal/main.odin :name cfg-display
+print_debug_flag :: proc(label, value: string) {
+	fmt.printfln("%s: \"%s\"", label, value)
+}
+
+run_cfg :: proc(cli: Cli) -> int {
+	config, config_problem, ok := seal_config.load_config(cli.config)
+	if !ok {
+		defer seal_config.destroy_config(&config)
+		defer seal_config.destroy_config_error(&config_problem)
+		if config_problem.line > 0 {
+			error("configuration", fmt.tprintf(
+				"%s:%d: %s",
+				config_problem.path,
+				config_problem.line,
+				config_problem.message,
+			))
+		} else {
+			error("configuration", fmt.tprintf(
+				"%s: %s",
+				config_problem.path,
+				config_problem.message,
+			))
+		}
+		return 1
+	}
+	defer seal_config.destroy_config(&config)
+	if cli.debug {
+		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
+		if cwd_error != nil {
+			error("cannot determine current directory", fmt.tprint(cwd_error))
+			return 1
+		}
+		defer delete(cwd)
+		debug("cwd", cwd)
+		if cli.explicit_config {
+			debug("configuration selection", "--config")
+		} else {
+			debug("configuration selection", "default ./seal.toml")
+		}
+		debug("configuration path", config.path)
+		debug("configuration directory", config.directory)
+		debug("local mailbox", config.local_mailbox)
+		debug("peer path", config.peer_path)
+		debug("rsync", config.rsync)
+		if len(config.rsync_debug_flag) == 0 {
+			debug("rsync debug flags", `""`)
+		} else {
+			debug("rsync debug flags", config.rsync_debug_flag)
+		}
+		if len(config.peer_ssh) > 0 {
+			debug("peer ssh", config.peer_ssh)
+			debug("ssh", config.ssh)
+			if len(config.ssh_debug_flag) == 0 {
+				debug("ssh debug flags", `""`)
+			} else {
+				debug("ssh debug flags", config.ssh_debug_flag)
+			}
+		}
+		debug("version", VERSION)
+	}
+
+	if cli.explicit_config {
+		fmt.printfln("configuration selection: --config %s", cli.config)
+	} else {
+		fmt.printfln("configuration selection: default %s", DEFAULT_CONFIG_PATH)
+	}
+	fmt.printfln("configuration path: %s", config.path)
+	fmt.printfln("configuration directory: %s", config.directory)
+	fmt.printfln("local mailbox: %s", config.local_mailbox)
+	if len(config.peer_ssh) > 0 {
+		fmt.println("peer kind: ssh")
+		fmt.printfln("peer ssh: %s", config.peer_ssh)
+	} else {
+		fmt.println("peer kind: local")
+	}
+	fmt.printfln("peer path: %s", config.peer_path)
+	fmt.printfln("rsync: %s", config.rsync)
+	if len(config.ssh) > 0 {
+		fmt.printfln("ssh: %s", config.ssh)
+	} else {
+		fmt.println("ssh: not configured")
+	}
+	print_debug_flag("rsync debug flags", config.rsync_debug_flag)
+	if len(config.peer_ssh) > 0 {
+		print_debug_flag("ssh debug flags", config.ssh_debug_flag)
+	} else {
+		fmt.println("ssh debug flags: not applicable")
+	}
+	fmt.printfln("binary version: %s", VERSION)
+	fmt.println("transfer profile:")
+	for flag in TRANSFER_FLAGS {
+		fmt.printfln("  %s", flag)
+	}
+	if len(config.peer_ssh) > 0 {
+		fmt.printfln("  %s", SSH_TRANSFER_FLAG)
+	}
+	return 0
+}
+#+end_src
+
 ** Dispatch
 
 Pseudocode:
 
 1. Parse arguments and service help or version without filesystem access.
 2. Reject an unknown argument with a plain error and nonzero status.
-3. For an ordinary run without debug, return success without output.
-4. For a debug run, resolve the process working directory.
-5. Report cwd and version to standard error, or report cwd failure and return
+3. Dispatch =cfg= to read-only configuration display.
+4. For an ordinary run without debug, retain seed success without output.
+5. For a debug run, resolve the process working directory.
+6. Report cwd and version to standard error, or report cwd failure and return
    nonzero.
 
 #+begin_src odin :tangle seal/main.odin :name run
@@ -162,6 +936,8 @@ run :: proc(args: []string) -> int {
 	case .Invalid:
 		error("unexpected argument", cli.invalid)
 		return 2
+	case .Cfg:
+		return run_cfg(cli)
 	case .Run:
 	}
 
@@ -224,6 +1000,172 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 	testing.expect_value(t, invalid.invalid, "pull")
 
 	testing.expect_value(t, VERSION, "0.1.0")
-	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS]"))
+	testing.expect(t, strings.contains(HELP_TEXT, "Usage: seal [OPTIONS] cfg"))
+
+	cfg := parse_args([]string{"--config", "elsewhere.toml", "cfg"})
+	testing.expect_value(t, cfg.action, Cli_Action.Cfg)
+	testing.expect_value(t, cfg.config, "elsewhere.toml")
+	testing.expect(t, cfg.explicit_config)
+}
+#+end_src
+
+** Configuration syntax behavior
+
+Focused syntax tests pin borrowed valid lines and representative rejected forms.
+
+#+begin_src odin :tangle seal/config/config_syntax_test.odin :name config-syntax-tests
+package config
+
+import "core:testing"
+
+@(test)
+test_config_syntax_recognizes_complete_lines :: proc(t: ^testing.T) {
+	blank := parse_config_syntax_line(" \t ")
+	testing.expect_value(t, blank.kind, Config_Syntax_Kind.Blank)
+
+	table := parse_config_syntax_line("  [peer]\t")
+	testing.expect_value(t, table.kind, Config_Syntax_Kind.Table)
+	testing.expect_value(t, table.key, "peer")
+
+	assignment := parse_config_syntax_line("local_mailbox \t=  \"mail # box\"")
+	testing.expect_value(t, assignment.kind, Config_Syntax_Kind.Assignment)
+	testing.expect_value(t, assignment.key, "local_mailbox")
+	testing.expect_value(t, assignment.value, "mail # box")
+}
+
+@(test)
+test_config_syntax_rejects_non_contract_forms :: proc(t: ^testing.T) {
+	invalid := []string{
+		"# comment",
+		"[ peer]",
+		"[peer ]",
+		"1key = \"value\"",
+		"key-name = \"value\"",
+		"key = value",
+		"key = \"escaped\\nvalue\"",
+		"key = \"unicode: \xc3\xa9\"",
+		"key = \"value\" trailing",
+		"key = []",
+		"key = [\"-v\"]",
+	}
+	for line in invalid {
+		parsed := parse_config_syntax_line(line)
+		testing.expect_value(t, parsed.kind, Config_Syntax_Kind.Invalid)
+	}
+}
+#+end_src
+
+** Configuration schema behavior
+
+Schema tests cover local and SSH values, scalar debug quiet/default behavior,
+last-seen fields, unknown fields, and syntax errors with source lines.
+
+#+begin_src odin :tangle seal/config/config_test.odin :name config-schema-tests
+package config
+
+import "core:testing"
+
+@(test)
+test_local_config_resolves_from_config_directory :: proc(t: ^testing.T) {
+	text := `local_mailbox = "../mailbox"
+
+[peer]
+path = "peer/mailbox"
+
+[tools]
+rsync = "/run/current-system/sw/bin/rsync"
+
+[debug]
+rsync_debug_flags = ""
+`
+	config, problem, ok := parse_config(text, "/work/seal/config/seal.toml", "/work/seal/config")
+	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
+	testing.expect(t, ok, problem.message)
+	testing.expect_value(t, config.local_mailbox, "/work/seal/mailbox")
+	testing.expect_value(t, config.peer_path, "/work/seal/config/peer/mailbox")
+	testing.expect_value(t, config.peer_ssh, "")
+	testing.expect_value(t, config.ssh, "")
+	testing.expect_value(t, config.rsync_debug_flag, "")
+}
+
+@(test)
+test_ssh_config_keeps_remote_path_and_defaults :: proc(t: ^testing.T) {
+	text := `local_mailbox = "mailbox"
+
+[peer]
+path = "/home/agent/mailbox"
+ssh = "experiment.agent"
+
+[tools]
+rsync = "/bin/rsync"
+ssh = "/bin/ssh"
+
+[debug]
+ssh_debug_flags = "-vvv"
+`
+	config, problem, ok := parse_config(text, "/work/seal.toml", "/work")
+	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
+	testing.expect(t, ok, problem.message)
+	testing.expect_value(t, config.local_mailbox, "/work/mailbox")
+	testing.expect_value(t, config.peer_path, "/home/agent/mailbox")
+	testing.expect_value(t, config.peer_ssh, "experiment.agent")
+	testing.expect_value(t, config.rsync_debug_flag, "-v")
+	testing.expect_value(t, config.ssh_debug_flag, "-vvv")
+}
+
+@(test)
+test_config_policy_rejects_unknown_and_invalid_lines :: proc(t: ^testing.T) {
+	unknown := `local_mailbox = "mailbox"
+[peer]
+destination = "agent"
+`
+	config, problem, ok := parse_config(unknown, "/work/unknown.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 3)
+	testing.expect_value(t, problem.message, "unknown key in current table")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+
+	invalid := `local_mailbox = "mailbox"
+[ peer]
+`
+	config, problem, ok = parse_config(invalid, "/work/invalid.toml", "/work")
+	testing.expect(t, !ok)
+	testing.expect_value(t, problem.line, 2)
+	testing.expect_value(t, problem.message, "invalid configuration syntax")
+	destroy_config(&config)
+	destroy_config_error(&problem)
+}
+
+@(test)
+test_config_document_uses_last_seen_tables_and_fields :: proc(t: ^testing.T) {
+	text := `local_mailbox = "first"
+local_mailbox = ""
+local_mailbox = "mailbox"
+
+[peer]
+path = "first-peer"
+
+[tools]
+rsync = "/bin/false"
+
+[peer]
+path = ""
+
+[peer]
+path = "final-peer"
+
+[tools]
+rsync = "/bin/rsync"
+`
+	config, problem, ok := parse_config(text, "/work/repeated.toml", "/work")
+	defer destroy_config(&config)
+	defer destroy_config_error(&problem)
+	testing.expect(t, ok, problem.message)
+	testing.expect_value(t, config.local_mailbox, "/work/mailbox")
+	testing.expect_value(t, config.peer_path, "/work/final-peer")
+	testing.expect_value(t, config.rsync, "/bin/rsync")
 }
 #+end_src
