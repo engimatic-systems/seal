@@ -2,13 +2,15 @@
 package config_toml
 
 import "base:runtime"
+import "core:mem"
 import "core:strings"
 import toml "../vendor/toml"
 
 @private
 Backend_State :: struct {
-	table:     ^toml.Table,
-	allocator: runtime.Allocator,
+	table:            ^toml.Table,
+	arena:            mem.Dynamic_Arena,
+	parent_allocator: runtime.Allocator,
 }
 
 @private
@@ -51,19 +53,17 @@ parse :: proc(
 	text, source: string,
 	allocator := context.allocator,
 ) -> (Document, Parse_Error, bool) {
-	table, upstream_error := toml.parse(text, source, allocator)
+	state := new(Backend_State, allocator)
+	state.parent_allocator = allocator
+	mem.dynamic_arena_init(&state.arena, allocator, allocator)
+	arena_allocator := mem.dynamic_arena_allocator(&state.arena)
+	table, upstream_error := toml.parse(text, source, arena_allocator)
 	if upstream_error.type == .None {
-		state := new(Backend_State, allocator)
 		state.table = table
-		state.allocator = allocator
 		return Document(rawptr(state)), Parse_Error(nil), true
 	}
-	context.allocator = allocator
-	defer toml.delete_error(&upstream_error)
-	if table != nil {
-		_ = toml.deep_delete(table, allocator)
-	}
-	formatted, _ := toml.format_error(&upstream_error, allocator)
+	context.allocator = arena_allocator
+	formatted, _ := toml.format_error(&upstream_error, arena_allocator)
 	message := formatted
 	if len(formatted) >= len(source) {
 		separator := strings.index_byte(formatted[len(source):], ' ')
@@ -71,11 +71,14 @@ parse :: proc(
 			message = formatted[len(source) + separator + 1:]
 		}
 	}
-	state := new(Error_State, allocator)
-	state.line = upstream_error.line
-	state.message = strings.clone(strings.trim_space(message), allocator)
-	state.allocator = allocator
-	return Document(nil), Parse_Error(rawptr(state)), false
+	problem_state := new(Error_State, allocator)
+	problem_state.line = upstream_error.line
+	problem_state.message = strings.clone(strings.trim_space(message), allocator)
+	problem_state.allocator = allocator
+	toml.delete_error(&upstream_error)
+	mem.dynamic_arena_destroy(&state.arena)
+	free(state, allocator)
+	return Document(nil), Parse_Error(rawptr(problem_state)), false
 }
 
 destroy :: proc(document: ^Document) {
@@ -83,8 +86,8 @@ destroy :: proc(document: ^Document) {
 	if state == nil {
 		return
 	}
-	allocator := state.allocator
-	_ = toml.deep_delete(state.table, allocator)
+	allocator := state.parent_allocator
+	mem.dynamic_arena_destroy(&state.arena)
 	free(state, allocator)
 	document^ = Document(nil)
 }

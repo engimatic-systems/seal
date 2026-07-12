@@ -117,6 +117,16 @@ flags = ["-v"]
 	destroy_parse_error(&broken_problem)
 	destroy_parse_error(&broken_problem)
 
+	duplicate_document, duplicate_problem, duplicate_ok := parse(
+		"a = 1\na = 2\n",
+		"duplicate.toml",
+		allocator_a,
+	)
+	testing.expect(t, !duplicate_ok)
+	context.allocator = allocator_b
+	destroy(&duplicate_document)
+	destroy_parse_error(&duplicate_problem)
+
 	testing.expect_value(t, len(allocator_a_state.bad_free_array), 0)
 	testing.expect_value(t, len(allocator_a_state.allocation_map), 0)
 }

@@ -39,9 +39,11 @@ Car 002 owns a small =config_toml= package facade backed at compile time by the
 pinned parser. Its public API exposes opaque single-owner document and parse
 error handles, =Found=/=Missing=/=Wrong_Type= lookup status, table-key
 enumeration, and owned string/string-array queries. Handles must not be copied;
-destruction zeros the original. Parser state and errors retain their allocation
-allocator, while query results name the allocator callers must use for
-destruction. Upstream types do not cross this package boundary. There is no
+destruction zeros the original. All upstream parse work lives in a private
+dynamic arena backed by the caller's parse allocator, so success and failure
+free reachable and unreachable backend allocations together. Error handles
+retain their allocation allocator, while query results name the allocator
+callers must use for destruction. Upstream types do not cross this package boundary. There is no
 runtime backend selection, reflection unmarshal, generic schema validator, or
 encoder.
 
