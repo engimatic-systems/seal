@@ -1,0 +1,415 @@
+#+title: Seal v0 Live SSH Validation
+
+* Environment And Initial State
+
+Validation ran on 2026-07-14 against accepted integration commit
+=48b4b3f28ed51513195aa19b5c5a917e7e37fd7b= with =target/debug/seal=
+version =0.1.0=. Before any VM query or fixture action, the current head was
+built through the recorded Nix toolchain:
+
+#+begin_src sh
+cargo build > /tmp/seal-v0r2-006-host-cargo.out 2>&1
+printf 'host_cargo_status=%s\n' "$?"
+sed -n '1,6p' /tmp/seal-v0r2-006-host-cargo.out
+nix shell nixpkgs#gcc nixpkgs#cargo nixpkgs#rsync nixpkgs#openssh \
+  --command cargo build
+printf 'nix_build_status=%s\n' "$?"
+#+end_src
+
+#+begin_example
+host_cargo_status=127
+zsh:2: command not found: cargo
+   Compiling seal v0.1.0 (/home/rosin/sys/working/sys-cv8p-r2/006-seal-live-ssh-smoke)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.11s
+nix_build_status=0
+#+end_example
+
+The SSH peer was =experiment.agent=, reporting
+=agent@agent-experiment-01= and remote rsync at
+=/run/current-system/sw/bin/rsync=. State queries then proved the experiment VM
+was already running and persistent/dayjob domain =agent-arch-01= was shut off.
+
+#+begin_src sh
+printf 'experiment_state_before=%s\n' \
+  "$(virsh -c qemu:///system domstate agent-experiment-01 | tr -d '\n')"
+printf 'dayjob_state_before=%s\n' \
+  "$(virsh -c qemu:///system domstate agent-arch-01 | tr -d '\n')"
+ssh -o BatchMode=yes experiment.agent \
+  'printf "remote=%s@%s rsync=%s\n" "$USER" "$(hostname)" "$(command -v rsync)"'
+printf 'experiment_ssh_status=%s\n' "$?"
+#+end_src
+
+#+begin_example
+experiment_state_before=running
+dayjob_state_before=shut off
+remote=agent@agent-experiment-01 rsync=/run/current-system/sw/bin/rsync
+experiment_ssh_status=0
+#+end_example
+
+No VM lifecycle command was issued. In particular, =agent-arch-01= remained
+shut off.
+
+* Help, Fixture, Init, And Configuration
+
+The bare command printed help and failed because a command is required;
+explicit help succeeded. Unique disposable roots and sentinels were proved
+absent independently before setup.
+
+#+begin_src sh
+seal=$PWD/target/debug/seal
+local_root=/tmp/seal-v0r2-006-20260714
+remote_root=/home/agent/seal-v0r2-006-20260714
+local_sentinel=/tmp/seal-v0r2-006-executed-20260714
+remote_sentinel=/tmp/seal-v0r2-006-executed-20260714
+test ! -e "$local_root"; printf 'local_root_absent_before=%s\n' "$?"
+test ! -e "$local_sentinel"; printf 'local_sentinel_absent_before=%s\n' "$?"
+ssh -o BatchMode=yes experiment.agent \
+  "test ! -e '$remote_root' && test ! -e '$remote_sentinel'"
+printf 'remote_root_and_sentinel_absent_before=%s\n' "$?"
+"$seal" > /tmp/seal-v0r2-006-bare.out 2>&1
+rc=$?
+sed -n '1,18p' /tmp/seal-v0r2-006-bare.out
+printf 'bare_status=%s\n' "$rc"
+"$seal" --help >/dev/null
+printf 'help_status=%s\n' "$?"
+#+end_src
+
+#+begin_example
+local_root_absent_before=0
+local_sentinel_absent_before=0
+remote_root_and_sentinel_absent_before=0
+Operator-initiated opaque mailbox transport
+
+Usage: seal [OPTIONS] [COMMAND]
+
+Commands:
+  cfg   Print the effective configuration
+  init  Create a local Seal workspace
+  pull  Pull the peer mailbox into the local mailbox
+  push  Push the local mailbox into the peer mailbox
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --debug          Report process facts on standard error
+      --config <PATH>  Read configuration from PATH
+  -h, --help           Print help
+  -V, --version        Print version
+bare_status=2
+help_status=0
+#+end_example
+
+The remote fixture contained nested regular files, an executable sentinel
+payload, and a relative symlink. Seal never executed the payload.
+
+#+begin_src sh
+ssh -o BatchMode=yes experiment.agent \
+  "mkdir -p '$remote_root/nested/deeper' && \
+   printf '%s\n' remote-root > '$remote_root/root.txt' && \
+   printf '%s\n' remote-item > '$remote_root/nested/deeper/item.txt' && \
+   printf '%s\n' '#!/bin/sh' \
+     'touch /tmp/seal-v0r2-006-executed-20260714' \
+     > '$remote_root/DO_NOT_RUN.sh' && \
+   chmod 755 '$remote_root/DO_NOT_RUN.sh' && \
+   ln -s nested/deeper/item.txt '$remote_root/relative-link'"
+printf 'remote_fixture_status=%s\n' "$?"
+mkdir -p "$local_root" && cd "$local_root"
+"$seal" init "$remote_root" --ssh experiment.agent
+printf 'init_status=%s\n' "$?"
+printf '%s\n' local-only > mailbox/local-destination-only.txt
+"$seal" --debug cfg
+printf 'cfg_status=%s\n' "$?"
+#+end_src
+
+#+begin_example
+remote_fixture_status=0
+[info] :: created configuration: /tmp/seal-v0r2-006-20260714/seal.toml
+[info] :: created mailbox: /tmp/seal-v0r2-006-20260714/mailbox
+[info] :: pinned rsync: /nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync
+[info] :: pinned ssh: /nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh
+init_status=0
+[debug] :: cwd: /tmp/seal-v0r2-006-20260714
+[debug] :: version: 0.1.0
+config selection: default ./seal.toml
+config path: /tmp/seal-v0r2-006-20260714/seal.toml
+local mailbox: /tmp/seal-v0r2-006-20260714/mailbox
+peer kind: ssh
+peer ssh: experiment.agent
+peer path: /home/agent/seal-v0r2-006-20260714
+rsync tool: /nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync
+rsync debug flags: ["-v"]
+ssh tool: /nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh
+ssh debug flags: ["-v"]
+version: 0.1.0
+fixed transfer profile: ["--recursive", "--links", "--perms", "--times", "--checksum"]
+cfg_status=0
+#+end_example
+
+Before pull, the local and remote trees and nonexecution checks were:
+
+#+begin_example
+local:
+d 755  ->
+f 644 local-destination-only.txt ->
+remote:
+d 755  ->
+d 755 nested ->
+d 755 nested/deeper ->
+f 644 nested/deeper/item.txt ->
+f 644 root.txt ->
+f 755 DO_NOT_RUN.sh ->
+l 777 relative-link -> nested/deeper/item.txt
+local_sentinel_absent_before_pull=0
+remote_sentinel_absent_before_pull=0
+#+end_example
+
+* Pull
+
+The normalized archive digest covers names, file bytes, modes, and symlink
+targets while ignoring ownership and timestamps. Equality proves dry-run
+nonmutation.
+
+#+begin_src sh
+cd /tmp/seal-v0r2-006-20260714
+digest() {
+  tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+    -cf - mailbox | sha256sum | cut -d' ' -f1
+}
+before=$(digest); printf 'pull_dry_digest_before=%s\n' "$before"
+"$seal" --debug pull --dry-run > pull-dry.log 2>&1
+printf 'pull_dry_status=%s\n' "$?"
+after=$(digest); printf 'pull_dry_digest_after=%s\n' "$after"
+test "$before" = "$after"; printf 'pull_dry_unchanged=%s\n' "$?"
+grep -E '^\[debug\] :: (rsync executable|rsync argv|child exit status):' \
+  pull-dry.log
+"$seal" --debug pull > pull.log 2>&1
+printf 'pull_status=%s\n' "$?"
+grep -E '^\[debug\] :: (rsync executable|rsync argv|child exit status):' \
+  pull.log
+#+end_src
+
+#+begin_example
+pull_dry_digest_before=8c5a2e5500193cd38dc072c38e5439187b07ca0359be4bcb938ea27d477131f3
+pull_dry_status=0
+pull_dry_digest_after=8c5a2e5500193cd38dc072c38e5439187b07ca0359be4bcb938ea27d477131f3
+pull_dry_unchanged=0
+[debug] :: rsync executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: rsync argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "-v", "--dry-run", "--secluded-args", "--rsh", "'/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh' -v --", "--", "experiment.agent:/home/agent/seal-v0r2-006-20260714/", "/tmp/seal-v0r2-006-20260714/mailbox/"]
+[debug] :: child exit status: exit status: 0
+pull_status=0
+[debug] :: rsync executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: rsync argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "-v", "--secluded-args", "--rsh", "'/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh' -v --", "--", "experiment.agent:/home/agent/seal-v0r2-006-20260714/", "/tmp/seal-v0r2-006-20260714/mailbox/"]
+[debug] :: child exit status: exit status: 0
+#+end_example
+
+The real pull preserved nested content, executable mode, and relative link,
+while retaining the local destination-only file:
+
+#+begin_example
+d 755  ->
+d 755 nested ->
+d 755 nested/deeper ->
+f 644 local-destination-only.txt ->
+f 644 nested/deeper/item.txt ->
+f 644 root.txt ->
+f 755 DO_NOT_RUN.sh ->
+l 777 relative-link -> nested/deeper/item.txt
+local_link_is_symlink=0
+local_link_target=nested/deeper/item.txt
+local_executable_mode_preserved=0
+local_executable_mode=755
+local_destination_only_retained=0
+local_regular_content=0
+local_sentinel_absent_after_pull=0
+remote_sentinel_absent_after_pull=0
+#+end_example
+
+* Push
+
+Ordinary local tools edited one pulled file and added another. Ordinary SSH
+created a remote destination-only entry.
+
+#+begin_src sh
+printf '%s\n' operator-edit >> mailbox/nested/deeper/item.txt
+printf '%s\n' operator-added > mailbox/operator-added.txt
+printf 'local_edit_and_add_status=%s\n' "$?"
+ssh -o BatchMode=yes experiment.agent \
+  "printf '%s\n' remote-only > '$remote_root/remote-destination-only.txt'"
+printf 'remote_destination_only_setup_status=%s\n' "$?"
+remote_digest() {
+  ssh -o BatchMode=yes experiment.agent \
+    "cd '$remote_root' && tar --sort=name --mtime='@0' --owner=0 \
+       --group=0 --numeric-owner -cf - . | sha256sum | cut -d' ' -f1"
+}
+before=$(remote_digest); printf 'push_dry_digest_before=%s\n' "$before"
+"$seal" --debug push --dry-run > push-dry.log 2>&1
+printf 'push_dry_status=%s\n' "$?"
+after=$(remote_digest); printf 'push_dry_digest_after=%s\n' "$after"
+test "$before" = "$after"; printf 'push_dry_unchanged=%s\n' "$?"
+grep -E '^\[debug\] :: (rsync executable|rsync argv|child exit status):' \
+  push-dry.log
+"$seal" --debug push > push.log 2>&1
+printf 'push_status=%s\n' "$?"
+grep -E '^\[debug\] :: (rsync executable|rsync argv|child exit status):' \
+  push.log
+#+end_src
+
+#+begin_example
+local_edit_and_add_status=0
+remote_destination_only_setup_status=0
+push_dry_digest_before=2b2d7776e6a6cf104b52dcc575cf5a47ace84c6bc6c206221b13261c71087902
+push_dry_status=0
+push_dry_digest_after=2b2d7776e6a6cf104b52dcc575cf5a47ace84c6bc6c206221b13261c71087902
+push_dry_unchanged=0
+[debug] :: rsync executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: rsync argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "-v", "--dry-run", "--secluded-args", "--rsh", "'/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh' -v --", "--", "/tmp/seal-v0r2-006-20260714/mailbox/", "experiment.agent:/home/agent/seal-v0r2-006-20260714/"]
+[debug] :: child exit status: exit status: 0
+push_status=0
+[debug] :: rsync executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: rsync argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "-v", "--secluded-args", "--rsh", "'/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh' -v --", "--", "/tmp/seal-v0r2-006-20260714/mailbox/", "experiment.agent:/home/agent/seal-v0r2-006-20260714/"]
+[debug] :: child exit status: exit status: 0
+#+end_example
+
+After real push, peer assertions proved the ordinary edit/add, destination-only
+retention, symlink target, executable mode, and continued nonexecution:
+
+#+begin_example
+d 755  ->
+d 755 nested ->
+d 755 nested/deeper ->
+f 644 local-destination-only.txt ->
+f 644 nested/deeper/item.txt ->
+f 644 operator-added.txt ->
+f 644 remote-destination-only.txt ->
+f 644 root.txt ->
+f 755 DO_NOT_RUN.sh ->
+l 777 relative-link -> nested/deeper/item.txt
+remote_operator_edit_present=0
+remote_operator_file_present=0
+remote_destination_only_retained=0
+remote_link_preserved=0
+remote_executable_mode_preserved=0
+local_sentinel_absent_after_push=0
+remote_sentinel_absent_after_push=0
+#+end_example
+
+* Failed Host
+
+An otherwise identical explicit config changed only =peer.ssh=. Seal exposed
+the executable and exact argv, then propagated the child status unchanged.
+
+#+begin_src sh
+cp seal.toml unreachable.toml
+sed -i 's/ssh = "experiment.agent"/ssh = "seal-unreachable.invalid"/' \
+  unreachable.toml
+"$seal" --config unreachable.toml --debug pull --dry-run \
+  > unreachable.log 2>&1
+rc=$?
+grep -E '^\[debug\] :: (rsync executable|rsync argv):|Could not resolve hostname|rsync error:|^\[debug\] :: child exit status:' \
+  unreachable.log
+printf 'unreachable_seal_status=%s\n' "$rc"
+test "$rc" = 255; printf 'unreachable_status_propagated=%s\n' "$?"
+#+end_src
+
+#+begin_example
+[debug] :: rsync executable: "/nix/store/qy5fwvfkys6bs30y9xczrms0xvk3a04w-rsync-3.4.1/bin/rsync"
+[debug] :: rsync argv: ["--recursive", "--links", "--perms", "--times", "--checksum", "-v", "--dry-run", "--secluded-args", "--rsh", "'/nix/store/mpzrhvrkdzkajhgay1dngqpf062vb1iq-openssh-10.3p1/bin/ssh' -v --", "--", "seal-unreachable.invalid:/home/agent/seal-v0r2-006-20260714/", "/tmp/seal-v0r2-006-20260714/mailbox/"]
+ssh: Could not resolve hostname seal-unreachable.invalid: Name or service not known
+rsync error: unexplained error (code 255) at io.c(232) [Receiver=3.4.1]
+[debug] :: child exit status: exit status: 255
+unreachable_seal_status=255
+unreachable_status_propagated=0
+#+end_example
+
+* Cleanup And Final Power State
+
+Both roots were removed only after sentinel nonexecution checks. Subsequent
+commands independently asserted absence of each root and each sentinel.
+
+#+begin_src sh
+printf 'experiment_state_after_smoke=%s\n' \
+  "$(virsh -c qemu:///system domstate agent-experiment-01 | tr -d '\n')"
+printf 'dayjob_state_after_smoke=%s\n' \
+  "$(virsh -c qemu:///system domstate agent-arch-01 | tr -d '\n')"
+ssh -o BatchMode=yes experiment.agent \
+  "test ! -e '$remote_sentinel' && rm -rf '$remote_root'"
+printf 'remote_cleanup_status=%s\n' "$?"
+test ! -e "$local_sentinel" && rm -rf "$local_root"
+printf 'local_cleanup_status=%s\n' "$?"
+test ! -e "$local_root"; printf 'local_root_absent_final=%s\n' "$?"
+test ! -e "$local_sentinel"; printf 'local_sentinel_absent_final=%s\n' "$?"
+ssh -o BatchMode=yes experiment.agent "test ! -e '$remote_root'"
+printf 'remote_root_absent_final=%s\n' "$?"
+ssh -o BatchMode=yes experiment.agent "test ! -e '$remote_sentinel'"
+printf 'remote_sentinel_absent_final=%s\n' "$?"
+printf 'experiment_state_final=%s\n' \
+  "$(virsh -c qemu:///system domstate agent-experiment-01 | tr -d '\n')"
+printf 'dayjob_state_final=%s\n' \
+  "$(virsh -c qemu:///system domstate agent-arch-01 | tr -d '\n')"
+#+end_src
+
+#+begin_example
+experiment_state_after_smoke=running
+dayjob_state_after_smoke=shut off
+remote_cleanup_status=0
+local_cleanup_status=0
+local_root_absent_final=0
+local_sentinel_absent_final=0
+remote_root_absent_final=0
+remote_sentinel_absent_final=0
+experiment_state_final=running
+dayjob_state_final=shut off
+#+end_example
+
+* Build Checks
+
+#+begin_src sh
+nix shell nixpkgs#emacs-nox --command emacs --batch \
+  --eval '(require (quote ob-tangle))' \
+  --eval '(org-babel-tangle-file "SEAL.org")'
+nix shell nixpkgs#emacs-nox --command emacs --batch \
+  --eval '(require (quote ob-tangle))' \
+  --eval '(org-babel-tangle-file "SEAL.org")'
+git diff --exit-code -- .gitignore Cargo.toml src/config.rs src/init.rs \
+  src/main.rs src/transfer.rs tests/cli.rs \
+  tests/fixtures/local/seal.toml tests/fixtures/ssh.toml \
+  tests/fixtures/invalid.toml
+nix shell nixpkgs#gcc nixpkgs#cargo nixpkgs#rsync nixpkgs#openssh \
+  --command cargo fmt --check
+nix shell nixpkgs#gcc nixpkgs#cargo nixpkgs#rsync nixpkgs#openssh \
+  --command cargo test
+nix shell nixpkgs#gcc nixpkgs#cargo nixpkgs#rsync nixpkgs#openssh \
+  --command cargo build
+git diff --check
+#+end_src
+
+All commands returned status =0=. Both tangles reported =Tangled 33 code blocks
+from SEAL.org=. They generated exactly =.gitignore=, =Cargo.toml=,
+=src/config.rs=, =src/init.rs=, =src/main.rs=, =src/transfer.rs=,
+=tests/cli.rs=, =tests/fixtures/invalid.toml=,
+=tests/fixtures/local/seal.toml=, and =tests/fixtures/ssh.toml=. Second tangle
+left no generated-file diff. Formatter passed; all 13 current tests passed with
+real rsync; final build and whitespace checks passed.
+
+The incremental car diff contains only this =VALIDATION.org= evidence. It adds
+no implementation, =SEAL.org=, generated-file, dependency, test, ticket,
+lifecycle, clobber, or daemon change.
+
+* Observed Friction
+
+- Host shell still had no Cargo: direct =cargo build= failed with status =127=
+  and =zsh:2: command not found: cargo=. Recorded Nix toolchain built cleanly.
+- First Nix toolchain entry unpacked the =nixpkgs-unstable= expression archive
+  into its Git cache before building. This was transient environment hydration,
+  not a Seal failure.
+- An auxiliary zsh cleanup recheck initially used lowercase =path= as a loop
+  variable. Because zsh ties =path= to =PATH=, following =ssh= and =git=
+  lookups failed with status =127=. A fresh shell and neutral variable name
+  completed the recheck; the live cleanup results above were unaffected.
+- Default SSH debug =-v= makes =--debug= output much longer than Seal's exact
+  structured process plan.
+- Remote mailbox creation remains a separate operator step. This matched the
+  v0 contract and did not block use.
+- Remote rsync discovery through the peer's ordinary environment worked.
+- Stabilized rsync =--rsh= encoding worked live: pinned SSH was one quoted word
+  followed by =-v --=, while rsync retained its own =--= before operands. No
+  contract-blocking defect or implementation change was needed.
