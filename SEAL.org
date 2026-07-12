@@ -1169,6 +1169,11 @@ TRANSFER_FLAGS :: [?]string{
 	"--checksum",
 }
 
+DRY_RUN_FLAGS :: [?]string{
+	"--dry-run",
+	"--itemize-changes",
+}
+
 SSH_TRANSFER_FLAG :: "--secluded-args"
 
 Process_Plan :: struct {
@@ -1200,7 +1205,8 @@ append_plan_argument :: proc(plan: ^Process_Plan, argument: string) {
 Pseudocode:
 
 1. Start with the pinned rsync executable and exact ordinary profile.
-2. Add dry-run and configured rsync verbosity only when requested.
+2. Add the dry-run reporting profile and configured rsync verbosity only when
+   requested.
 3. For SSH, quote the pinned SSH path as one token in rsync's remote-shell
    command grammar, then add configured SSH verbosity as a separate token only
    in debug mode.
@@ -1245,7 +1251,9 @@ plan_transfer :: proc(
 		append_plan_argument(&plan, flag)
 	}
 	if dry_run {
-		append_plan_argument(&plan, "--dry-run")
+		for flag in DRY_RUN_FLAGS {
+			append_plan_argument(&plan, flag)
+		}
 	}
 	if debug_enabled && len(config.rsync_debug_flag) > 0 {
 		append_plan_argument(&plan, config.rsync_debug_flag)
@@ -1860,9 +1868,10 @@ test_local_pull_plan_is_exact :: proc(t: ^testing.T) {
 Pseudocode:
 
 1. Plan an SSH pull with both global debug and command dry-run enabled.
-2. Require ordinary fixed flags, dry-run, configured rsync verbosity, secluded
-   arguments, and one remote-shell executable token containing whitespace,
-   quote, and backslash characters before its configured verbosity token.
+2. Require ordinary fixed flags, dry-run reporting flags, configured rsync
+   verbosity, secluded arguments, and one remote-shell executable token
+   containing whitespace, quote, and backslash characters before its configured
+   verbosity token.
 3. Require one opaque SSH source operand and the local destination, both rooted
    at trailing-slash mailbox paths.
 
@@ -1887,6 +1896,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		"--times",
 		"--checksum",
 		"--dry-run",
+		"--itemize-changes",
 		"-vv",
 		"--secluded-args",
 		"--rsh",
@@ -1898,24 +1908,25 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 }
 #+end_src
 
-** Exact reversed local push plan
+** Exact reversed local push dry-run plan
 
 Pseudocode:
 
-1. Plan a local push through the same planner used by pull.
-2. Require only the final mailbox operands to reverse: local source, peer
+1. Plan a non-debug local push dry-run through the same planner used by pull.
+2. Require the dry-run reporting profile without a debug verbosity flag.
+3. Require the final mailbox operands to reverse: local source, peer
    destination.
 
 #+begin_src odin :tangle seal/transfer_test.odin :name push-plan-tests
 @(test)
-test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
+test_local_push_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 	config := Config{
 		local_mailbox = "/work/local mailbox",
 		peer_path = "/work/peer mailbox/",
 		rsync = "/tools/pinned-rsync",
 		rsync_debug_flag = "-vvv",
 	}
-	plan := plan_transfer(config, .Push, false, false)
+	plan := plan_transfer(config, .Push, false, true)
 	defer destroy_process_plan(&plan)
 	expect_arguments(t, plan.argv[:], []string{
 		"--recursive",
@@ -1923,6 +1934,8 @@ test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
 		"--perms",
 		"--times",
 		"--checksum",
+		"--dry-run",
+		"--itemize-changes",
 		"--",
 		"/work/local mailbox/",
 		"/work/peer mailbox/",

@@ -367,6 +367,65 @@ Observed non-blocking friction:
 No command, option, transfer flag, VM machinery, or mailbox interpretation was
 added.
 
+* Dry-run reporting repair
+
+Final cold review found that ordinary non-debug dry-runs returned 0 and did not
+modify the destination, but reported no intended changes. The earlier live
+evidence paired dry-run with global debug or did not record child output, so it
+masked the command-contract defect.
+
+=SEAL.org= now owns a distinct fixed dry-run profile:
+
+#+begin_example
+--dry-run
+--itemize-changes
+#+end_example
+
+The ordinary apply profile is unchanged. =--itemize-changes= affects only
+rsync's inherited dry-run output; Seal still does not parse, rewrite, or
+classify mailbox contents or child output. Existing exact argv tests cover the
+profile in both non-debug local push and debug SSH pull plans.
+
+The repair checks were:
+
+#+begin_src sh
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+/home/rosin/sys/working/sys-269d/003-seal-odin-local-init/.ephemera/tangle-org.sh SEAL.org
+git diff --check
+nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
+#+end_src
+
+Every command returned 0, the second tangle was clean, and all 11 tests passed.
+
+Disposable local non-debug pull and push dry-runs each used a source-only file.
+Both returned 0, produced recognizable itemized output, and left the destination
+file absent:
+
+#+begin_example
+pull-output=>f+++++++++ pull-only.txt
+pull-destination-unmodified=yes
+push-output=>f+++++++++ push-only.txt
+push-destination-unmodified=yes
+local-cleanup=yes
+#+end_example
+
+A bounded live SSH non-debug push dry-run used
+=/tmp/seal-odin-dry-run-ssh-20260712T0509Z= on both machines. It returned 0,
+reported the pending source-only file, and left the peer destination absent:
+
+#+begin_example
+ssh-push-output=<f+++++++++ ssh-push-only.txt
+ssh-destination-unmodified=yes
+ssh-cleanup=yes
+#+end_example
+
+Both local and peer roots were removed. Final VM state remained
+=agent-experiment-01= running and =agent-arch-01= shut off. This section
+supersedes the earlier dry-run evidence for final non-debug reporting behavior;
+an unchanged tree may produce no itemized output.
+
 * Cleanup and final state
 
 #+begin_src sh

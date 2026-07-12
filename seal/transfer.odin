@@ -13,6 +13,11 @@ TRANSFER_FLAGS :: [?]string{
 	"--checksum",
 }
 
+DRY_RUN_FLAGS :: [?]string{
+	"--dry-run",
+	"--itemize-changes",
+}
+
 SSH_TRANSFER_FLAG :: "--secluded-args"
 
 Process_Plan :: struct {
@@ -74,7 +79,9 @@ plan_transfer :: proc(
 		append_plan_argument(&plan, flag)
 	}
 	if dry_run {
-		append_plan_argument(&plan, "--dry-run")
+		for flag in DRY_RUN_FLAGS {
+			append_plan_argument(&plan, flag)
+		}
 	}
 	if debug_enabled && len(config.rsync_debug_flag) > 0 {
 		append_plan_argument(&plan, config.rsync_debug_flag)

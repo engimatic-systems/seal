@@ -58,6 +58,7 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 		"--times",
 		"--checksum",
 		"--dry-run",
+		"--itemize-changes",
 		"-vv",
 		"--secluded-args",
 		"--rsh",
@@ -70,14 +71,14 @@ test_ssh_debug_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 // END org:block ssh-pull-plan-test
 // BEGIN org:block push-plan-tests
 @(test)
-test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
+test_local_push_dry_run_plan_is_exact :: proc(t: ^testing.T) {
 	config := Config{
 		local_mailbox = "/work/local mailbox",
 		peer_path = "/work/peer mailbox/",
 		rsync = "/tools/pinned-rsync",
 		rsync_debug_flag = "-vvv",
 	}
-	plan := plan_transfer(config, .Push, false, false)
+	plan := plan_transfer(config, .Push, false, true)
 	defer destroy_process_plan(&plan)
 	expect_arguments(t, plan.argv[:], []string{
 		"--recursive",
@@ -85,6 +86,8 @@ test_local_push_plan_reverses_operands :: proc(t: ^testing.T) {
 		"--perms",
 		"--times",
 		"--checksum",
+		"--dry-run",
+		"--itemize-changes",
 		"--",
 		"/work/local mailbox/",
 		"/work/peer mailbox/",
