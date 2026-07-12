@@ -19,6 +19,12 @@ pub(crate) struct ProcessPlan {
     argv: Vec<OsString>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Direction {
+    Pull,
+    Push,
+}
+
 impl ProcessPlan {
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
@@ -80,12 +86,13 @@ fn has_trailing_slash(value: &OsStr) -> bool {
     value.as_encoded_bytes().ends_with(b"/")
 }
 
-pub(crate) fn plan_pull(
+pub(crate) fn plan_transfer(
     config: &Config,
     peer_path: &Path,
     local_mailbox: &Path,
     debug_enabled: bool,
     dry_run: bool,
+    direction: Direction,
 ) -> Result<ProcessPlan, PlanError> {
     // Profile controls precede transport-specific arguments.
     let mut argv: Vec<OsString> = FIXED_TRANSFER_FLAGS.iter().map(OsString::from).collect();
@@ -99,7 +106,7 @@ pub(crate) fn plan_pull(
     }
 
     // SSH coordinates stay opaque here; rsync owns their remote interpretation.
-    let source = match &config.peer.ssh {
+    let peer = match &config.peer.ssh {
         Some(destination) => {
             argv.extend(SSH_TRANSFER_FLAGS.iter().map(OsString::from));
             let ssh = config
@@ -118,18 +125,27 @@ pub(crate) fn plan_pull(
             argv.push(REMOTE_SHELL_FLAG.into());
             argv.push(remote_shell);
 
-            let mut source = OsString::from(destination);
-            source.push(":");
-            source.push(trailing_slash(peer_path));
-            source
+            let mut peer = OsString::from(destination);
+            peer.push(":");
+            peer.push(trailing_slash(peer_path));
+            peer
         }
         None => trailing_slash(peer_path),
     };
 
-    // The terminator fixes the remaining operands as pull source then destination.
+    // The terminator fixes the remaining values as operands; direction orders them.
     argv.push("--".into());
-    argv.push(source);
-    argv.push(trailing_slash(local_mailbox));
+    let local = trailing_slash(local_mailbox);
+    match direction {
+        Direction::Pull => {
+            argv.push(peer);
+            argv.push(local);
+        }
+        Direction::Push => {
+            argv.push(local);
+            argv.push(peer);
+        }
+    }
     Ok(ProcessPlan {
         executable: config.tools.rsync.clone(),
         argv,

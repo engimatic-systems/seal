@@ -71,7 +71,25 @@ impl Config {
         toml::to_string_pretty(self)
             .map_err(|error| format!("cannot serialize configuration: {error}"))
     }
+}
 
+fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), String> {
+    let valid = match flags {
+        None | Some([]) => true,
+        Some([flag]) => matches!(flag.as_str(), "-v" | "-vv" | "-vvv"),
+        Some(_) => false,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must be empty or contain exactly one of -v, -vv, or -vvv"
+        ))
+    }
+}
+
+impl Config {
     fn validate(&self) -> Result<(), String> {
         if self.local_mailbox.as_os_str().is_empty() {
             return Err("local_mailbox must not be empty".into());
@@ -109,22 +127,6 @@ impl Config {
         }
 
         Ok(())
-    }
-}
-
-fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), String> {
-    let valid = match flags {
-        None | Some([]) => true,
-        Some([flag]) => matches!(flag.as_str(), "-v" | "-vv" | "-vvv"),
-        Some(_) => false,
-    };
-
-    if valid {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} must be empty or contain exactly one of -v, -vv, or -vvv"
-        ))
     }
 }
 

@@ -56,14 +56,14 @@ toml = "0.9"
 Pseudocode:
 
 #+begin_example
-parse global options + cfg | init | pull
+parse global options + cfg | init | pull | push
 determine current directory; report and fail here if unavailable
 report requested process debug facts
 
-cfg  -> load + display configuration -> success
-init -> initialize workspace         -> success
-pull -> typed transfer orchestration -> child outcome
-none -> success after clap handles ordinary no-argument help
+cfg       -> load + display configuration -> success
+init      -> initialize workspace         -> success
+pull/push -> typed transfer orchestration -> child outcome
+none      -> success after clap handles ordinary no-argument help
 
 convert command error to one plain diagnostic -> failure
 #+end_example
@@ -86,7 +86,7 @@ use clap::{Parser, Subcommand};
 
 use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
 use init::{InitializedWorkspace, initialize_workspace};
-use transfer::{FIXED_TRANSFER_FLAGS, PlanError, plan_pull};
+use transfer::{Direction, FIXED_TRANSFER_FLAGS, PlanError, plan_transfer};
 
 #[derive(Parser)]
 #[command(version, about, arg_required_else_help = true)]
@@ -125,6 +125,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Push the local mailbox into the peer mailbox
+    Push {
+        /// Report changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -150,9 +157,22 @@ fn main() -> ExitCode {
         Some(Command::Init { peer_path, ssh }) => {
             run_init(&cwd, cli.config.as_deref(), peer_path, ssh).map(|()| ExitCode::SUCCESS)
         }
-        Some(Command::Pull { dry_run }) => {
-            pull(&cwd, cli.config.as_deref(), cli.debug, dry_run).map_err(|error| error.to_string())
-        }
+        Some(Command::Pull { dry_run }) => transfer(
+            &cwd,
+            cli.config.as_deref(),
+            cli.debug,
+            dry_run,
+            Direction::Pull,
+        )
+        .map_err(|error| error.to_string()),
+        Some(Command::Push { dry_run }) => transfer(
+            &cwd,
+            cli.config.as_deref(),
+            cli.debug,
+            dry_run,
+            Direction::Push,
+        )
+        .map_err(|error| error.to_string()),
         None => Ok(ExitCode::SUCCESS),
     };
 
@@ -176,20 +196,22 @@ fn info(label: &str, value: impl Display) {
 
 ** Configuration
 
+*** Configuration model
+
 The deserialized types mirror the four TOML tables. Optional fields retain the
 difference between omission and an explicitly empty debug array; effective
 defaults are applied only while printing.
 
-Pseudocode:
+#+begin_example
+Config
+  local mailbox
+  Peer  -> peer path + optional SSH destination
+  Tools -> rsync path + optional SSH path
+  DebugConfig -> optional rsync flags + optional SSH flags
+#+end_example
 
-1. Deserialize exactly the documented fields.
-2. Reject empty local mailbox and peer coordinates without trimming or parsing
-   otherwise opaque path and SSH values.
-3. Require pinned local tools to be absolute and require SSH tool coordinates
-   only for an SSH peer.
-4. Accept each supplied debug array only when empty or when it contains exactly
-   one supported verbosity flag.
-5. Stop at the first useful validation error.
+Serde rejects unknown fields. Projection omits an empty =DebugConfig= only when
+both flag arrays were absent.
 
 #+begin_src rust :tangle src/config.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
@@ -240,6 +262,30 @@ impl DebugConfig {
         self.rsync_debug_flags.is_none() && self.ssh_debug_flags.is_none()
     }
 }
+#+end_src
+
+*** Initial configuration projection
+
+Initialization constructs the one configuration shape Seal owns. Projection
+validates that value before serializing it as TOML.
+
+Pseudocode:
+
+#+begin_example
+initialized(peer path, optional SSH destination, rsync tool, optional SSH tool):
+  local mailbox = "mailbox"
+  peer = supplied peer coordinates
+  tools = supplied pinned tools
+  debug = omitted defaults
+  return Config
+
+to_toml(config):
+  validate config; classify failure as invalid initial configuration
+  serialize pretty TOML; classify serialization failure
+  return text
+#+end_example
+
+#+begin_src rust :tangle src/config.rs
 
 impl Config {
     pub(crate) fn initialized(
@@ -265,7 +311,74 @@ impl Config {
         toml::to_string_pretty(self)
             .map_err(|error| format!("cannot serialize configuration: {error}"))
     }
+}
+#+end_src
 
+*** Debug flag validation
+
+Debug configuration distinguishes omission from an explicit empty array while
+limiting a supplied value to one supported verbosity flag.
+
+Pseudocode:
+
+#+begin_example
+omitted or empty        -> valid
+one of -v | -vv | -vvv -> valid
+anything else           -> fail with field label
+#+end_example
+
+#+begin_src rust :tangle src/config.rs
+
+fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), String> {
+    let valid = match flags {
+        None | Some([]) => true,
+        Some([flag]) => matches!(flag.as_str(), "-v" | "-vv" | "-vvv"),
+        Some(_) => false,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must be empty or contain exactly one of -v, -vv, or -vvv"
+        ))
+    }
+}
+#+end_src
+
+*** Configuration semantics
+
+Semantic validation preserves opaque paths and destinations while enforcing
+the local tool and peer-mode relationships required by later operations.
+
+Pseudocode:
+
+#+begin_example
+require nonempty local mailbox
+require nonempty peer path
+if peer has SSH destination:
+  require nonempty destination
+
+require absolute rsync tool
+validate rsync debug flags
+
+match peer mode + configured SSH tool:
+  SSH peer + SSH tool   -> require absolute SSH tool
+  SSH peer + no tool    -> fail: SSH tool required
+  local peer + SSH tool -> fail: SSH tool forbidden
+  local peer + no tool  -> continue
+
+if peer uses SSH:
+  validate SSH debug flags
+else if SSH debug flags are configured:
+  fail: SSH debug flags forbidden
+
+return valid config
+#+end_example
+
+#+begin_src rust :tangle src/config.rs
+
+impl Config {
     fn validate(&self) -> Result<(), String> {
         if self.local_mailbox.as_os_str().is_empty() {
             return Err("local_mailbox must not be empty".into());
@@ -303,22 +416,6 @@ impl Config {
         }
 
         Ok(())
-    }
-}
-
-fn validate_debug_flags(label: &str, flags: Option<&[String]>) -> Result<(), String> {
-    let valid = match flags {
-        None | Some([]) => true,
-        Some([flag]) => matches!(flag.as_str(), "-v" | "-vv" | "-vvv"),
-        Some(_) => false,
-    };
-
-    if valid {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} must be empty or contain exactly one of -v, -vv, or -vvv"
-        ))
     }
 }
 #+end_src
@@ -514,15 +611,35 @@ pub(crate) struct InitializedWorkspace {
 
 Pseudocode:
 
-1. Preflight: resolve the requested configuration path from the process
-   directory, name its sibling =mailbox= directory, refuse known conflicts,
-   resolve required local tools, and serialize the initial configuration.
-2. Apply: create the mailbox, then create the configuration exclusively as the
-   completion marker. If configuration creation fails, make one bounded attempt
-   to remove the new mailbox; a partial configuration write also gets one
-   bounded removal attempt.
-3. Return owned paths and tools only after both mutations succeed. Do not
-   contact or create the peer.
+#+begin_example
+inputs:
+  current directory, optional config path, peer path, optional SSH destination
+
+preflight paths; fail before mutation on invalid path or conflict
+resolve rsync tool; fail before mutation if unavailable
+
+if peer uses SSH:
+  resolve SSH tool; fail before mutation if unavailable
+else:
+  SSH tool = none
+
+construct + validate + serialize initial config; fail before mutation
+
+create mailbox directory; fail if creation fails
+create configuration exclusively as completion marker
+
+if configuration creation fails:
+  attempt to remove new mailbox
+  if mailbox cleanup also fails:
+    report primary failure + cleanup failure
+  else:
+    report primary failure
+
+return initialized workspace paths + pinned tools
+#+end_example
+
+Configuration creation owns its bounded partial-file cleanup. Initialization
+does not contact or create the peer.
 
 #+begin_src rust :tangle src/init.rs
 pub(crate) fn initialize_workspace(
@@ -713,31 +830,31 @@ fn run_init(
 }
 #+end_src
 
-** Pull transport
+** Transfer transport
 
-*** Pull dataflow
+*** Transfer dataflow
 
 #+begin_example
-pull -> load configuration -> resolve endpoints -> plan_pull -> debug plan
-     -> start child -> debug status -> propagate child exit code
+pull/push -> load configuration -> resolve endpoints -> plan_transfer -> debug plan
+          -> start child -> debug status -> propagate child exit code
 
 failures:
   load configuration -> TransferError::Configuration
-  plan_pull          -> TransferError::Planning
+  plan_transfer      -> TransferError::Planning
   start child        -> TransferError::CannotStart
-  child exit code    -> ordinary pull outcome
+  child exit code    -> ordinary transfer outcome
 #+end_example
 
 The command adapter owns configuration selection, endpoint resolution,
 diagnostics, and classification of configuration, planning, and child-start
-failures. The transfer module owns only the structured pull plan and direct
-child execution.
+failures. The transfer module owns only the structured directional plan and
+direct child execution.
 
 *** Transfer module and profile
 
 Fixed ordinary and SSH-only flags are visible constants rather than
 configuration. The module imports only configuration values needed to plan one
-pull; it does not anticipate push.
+transfer.
 
 #+begin_src rust :tangle src/transfer.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
@@ -770,6 +887,12 @@ pub(crate) struct ProcessPlan {
     argv: Vec<OsString>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Direction {
+    Pull,
+    Push,
+}
+
 impl ProcessPlan {
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
@@ -788,7 +911,7 @@ impl ProcessPlan {
 *** Planning errors
 
 Planning errors retain the specific invalid state until the command adapter can
-add pull context.
+add transfer context.
 
 #+begin_src rust :tangle src/transfer.rs
 
@@ -858,14 +981,14 @@ fn has_trailing_slash(value: &OsStr) -> bool {
 }
 #+end_src
 
-*** Pull plan construction
+*** Transfer plan construction
 
 Pseudocode:
 
 #+begin_example
 inputs:
   config, resolved peer path, resolved local mailbox
-  debug enabled, dry-run enabled
+  debug enabled, dry-run enabled, direction
 
 argv = fixed transfer flags
 
@@ -885,25 +1008,29 @@ if peer uses SSH:
 
   append SSH option terminator to remote-shell value
   append --rsh and remote-shell value to argv
-  source = SSH destination + ":" + peer path with trailing slash
+  peer = SSH destination + ":" + peer path with trailing slash
 else:
-  source = peer path with trailing slash
+  peer = peer path with trailing slash
 
 append rsync option terminator
-append source
-append local mailbox with trailing slash
+
+if direction is pull:
+  append peer, then local mailbox; both with trailing slashes
+else direction is push:
+  append local mailbox, then peer; both with trailing slashes
 
 return process plan using pinned rsync executable and argv
 #+end_example
 
 #+begin_src rust :tangle src/transfer.rs
 
-pub(crate) fn plan_pull(
+pub(crate) fn plan_transfer(
     config: &Config,
     peer_path: &Path,
     local_mailbox: &Path,
     debug_enabled: bool,
     dry_run: bool,
+    direction: Direction,
 ) -> Result<ProcessPlan, PlanError> {
     // Profile controls precede transport-specific arguments.
     let mut argv: Vec<OsString> = FIXED_TRANSFER_FLAGS.iter().map(OsString::from).collect();
@@ -917,7 +1044,7 @@ pub(crate) fn plan_pull(
     }
 
     // SSH coordinates stay opaque here; rsync owns their remote interpretation.
-    let source = match &config.peer.ssh {
+    let peer = match &config.peer.ssh {
         Some(destination) => {
             argv.extend(SSH_TRANSFER_FLAGS.iter().map(OsString::from));
             let ssh = config
@@ -936,18 +1063,27 @@ pub(crate) fn plan_pull(
             argv.push(REMOTE_SHELL_FLAG.into());
             argv.push(remote_shell);
 
-            let mut source = OsString::from(destination);
-            source.push(":");
-            source.push(trailing_slash(peer_path));
-            source
+            let mut peer = OsString::from(destination);
+            peer.push(":");
+            peer.push(trailing_slash(peer_path));
+            peer
         }
         None => trailing_slash(peer_path),
     };
 
-    // The terminator fixes the remaining operands as pull source then destination.
+    // The terminator fixes the remaining values as operands; direction orders them.
     argv.push("--".into());
-    argv.push(source);
-    argv.push(trailing_slash(local_mailbox));
+    let local = trailing_slash(local_mailbox);
+    match direction {
+        Direction::Pull => {
+            argv.push(peer);
+            argv.push(local);
+        }
+        Direction::Push => {
+            argv.push(local);
+            argv.push(peer);
+        }
+    }
     Ok(ProcessPlan {
         executable: config.tools.rsync.clone(),
         argv,
@@ -955,11 +1091,11 @@ pub(crate) fn plan_pull(
 }
 #+end_src
 
-*** Pull command adapter
+*** Transfer command adapter
 
-Pull resolves configuration-relative endpoints and classifies failures only
-where their operator context is known. Its error type is shared transfer
-orchestration vocabulary rather than pull-specific policy.
+Transfer orchestration resolves configuration-relative endpoints and classifies
+failures only where their operator context is known. Its error type is shared
+transfer orchestration vocabulary rather than direction-specific policy.
 
 #+begin_src rust :tangle src/main.rs
 
@@ -995,7 +1131,7 @@ Pseudocode:
 #+begin_example
 inputs:
   current directory, optional config path
-  debug enabled, dry-run enabled
+  debug enabled, dry-run enabled, direction
 
 load selected configuration; classify failure as Configuration
 resolve local mailbox relative to stored configuration directory
@@ -1005,7 +1141,7 @@ if peer uses SSH:
 else:
   resolve peer path relative to stored configuration directory
 
-construct pull process plan; classify failure as Planning
+construct directional process plan; classify failure as Planning
 
 if debug is enabled:
   report config selection and path
@@ -1024,11 +1160,12 @@ else:
 #+end_example
 
 #+begin_src rust :tangle src/main.rs
-fn pull(
+fn transfer(
     cwd: &Path,
     requested_config_path: Option<&Path>,
     debug_enabled: bool,
     dry_run: bool,
+    direction: Direction,
 ) -> Result<ExitCode, TransferError> {
     let LoadedConfig {
         config,
@@ -1041,8 +1178,15 @@ fn pull(
         Some(_) => config.peer.path.clone(),
         None => resolve_local(&directory, &config.peer.path),
     };
-    let plan = plan_pull(&config, &peer_path, &local_mailbox, debug_enabled, dry_run)
-        .map_err(TransferError::Planning)?;
+    let plan = plan_transfer(
+        &config,
+        &peer_path,
+        &local_mailbox,
+        debug_enabled,
+        dry_run,
+        direction,
+    )
+    .map_err(TransferError::Planning)?;
 
     if debug_enabled {
         debug("config selection", selection);
@@ -1075,13 +1219,19 @@ fn pull(
 
 Pseudocode:
 
-1. Run the built binary bare and require clap's ordinary help and missing-command
-   status.
-2. Run it for explicit help and version; require successful, recognizable
-   output. Account only for the current commands appearing in usage.
-3. Run it with debug from a known directory; require current directory and
-   package version on standard error.
-4. Do not duplicate Clap's option-parser test matrix.
+#+begin_example
+built binary
+
+bare invocation -> failure + usage on stderr
+--help           -> success + usage on stdout
+--version        -> success + exact package version
+--debug in known directory
+  -> success
+  -> exact current-directory + version diagnostics
+#+end_example
+
+Coverage stops at Seal's visible command contract; Clap owns its option-parser
+matrix.
 
 #+begin_src rust :tangle tests/cli.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
@@ -1170,14 +1320,24 @@ rsync_debug_flags = ["-vvvv"]
 
 Pseudocode:
 
-1. Run =cfg= from the local fixture directory and require default selection,
-   resolved local paths, the pinned rsync path, and the explicit empty flags.
-2. Select the SSH fixture explicitly and require unchanged peer-side path,
-   pinned SSH tool, and both omitted-field defaults.
-3. Select the invalid fixture and require one nonzero, recognizable validation
-   error.
-4. Require empty local mailbox, peer path, and SSH destination values to fail
-   with their field names.
+#+begin_example
+local fixture + default cfg
+  -> success
+  -> default selection + resolved local paths
+  -> pinned rsync + explicitly empty rsync debug flags
+
+explicit SSH fixture + cfg
+  -> success
+  -> explicit selection + opaque SSH destination and peer path
+  -> pinned SSH tool + default rsync/SSH debug flags + fixed profile
+
+invalid debug fixture + cfg
+  -> failure + supported-verbosity diagnostic
+
+for each empty local mailbox | peer path | SSH destination:
+  write otherwise-valid config
+  run cfg -> failure + field-specific diagnostic
+#+end_example
 
 #+begin_src rust :tangle tests/cli.rs
 
@@ -1271,16 +1431,35 @@ the existing parser and validation path.
 
 Pseudocode:
 
-1. Initialize a local workspace at an explicit configuration path; require one
-   config, one mailbox, pinned rsync, success narration, and a successful =cfg=
-   round-trip.
-2. Initialize an SSH workspace; require the opaque destination, unchanged peer
-   path, and pinned local SSH in the generated configuration and =cfg= output.
-3. Precreate a configuration and, separately, a mailbox; require refusal with
-   no overwrite and no counterpart creation.
-4. Skip a non-executable rsync candidate and pin the later executable.
-5. Make the first rsync candidate fail with an unexpected filesystem error;
-   require that error rather than a generic PATH miss and no mutation.
+#+begin_example
+local workspace + PATH containing rsync
+  -> init at explicit config path
+  -> success + creation/pinned-tool narration
+  -> one config + one mailbox
+  -> cfg round-trip reports local peer
+
+workspace + PATH containing rsync and SSH
+  -> init with opaque SSH destination + remote peer path
+  -> success + both pinned tools
+  -> generated config preserves SSH coordinates
+  -> cfg round-trip reports SSH peer
+
+PATH candidate with unexpected inspection failure
+  -> init fails with inspection error, not generic PATH miss
+  -> no config or mailbox mutation
+
+PATH with non-executable rsync followed by executable rsync
+  -> init skips first candidate
+  -> success + later executable pinned
+
+existing config + absent mailbox
+  -> init refuses conflict
+  -> config unchanged + mailbox absent
+
+existing mailbox + absent config
+  -> init refuses conflict
+  -> mailbox unchanged + config absent
+#+end_example
 
 #+begin_src rust :tangle tests/cli.rs
 
@@ -1426,25 +1605,26 @@ fn initialization_refuses_known_conflicts() {
 }
 #+end_src
 
-** Pull process plans
+** Transfer process plans
 
 One focused interaction uses an inert rsync child that prints its structured
-arguments. This pins both local and SSH plans, including debug-only verbosity,
-dry-run placement, secluded arguments, the quoted pinned remote shell and its
-option terminator, rsync's option terminator, direction, and trailing slashes.
+arguments. This retains both reviewed pull plans and adds one exact reversed
+local push plan, including debug-only verbosity, dry-run placement, secluded
+arguments, the quoted pinned remote shell and its option terminator, rsync's
+option terminator, direction, and trailing slashes.
 
 Pseudocode:
 
-1. Configure a local peer with =-vv= rsync verbosity and run a debug dry-run;
-   require the exact child argv and structured debug plan.
-2. Configure an option-shaped SSH destination with =-vvv= rsync and =-vv= SSH
-   verbosity; require the exact child argv and structured debug plan, including
-   the opaque destination, quoted executable, and remote-shell =--=.
+#+begin_example
+local debug dry-run pull -> exact controls + peer then local operands
+same configuration push  -> same controls + local then peer operands
+SSH debug pull            -> exact opaque peer + quoted remote shell + --
+#+end_example
 
 #+begin_src rust :tangle tests/cli.rs
 
 #[test]
-fn exact_local_and_ssh_pull_plans() {
+fn exact_transfer_plans() {
     let root = test_root("pull-plans");
     let tools = root.join("tools");
     fs::create_dir(&tools).unwrap();
@@ -1484,6 +1664,31 @@ fn exact_local_and_ssh_pull_plans() {
         String::from_utf8_lossy(&local_output.stderr).contains(&format!(
             "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
             rsync, local_args
+        ))
+    );
+
+    let push_output = run_seal(&local, &tools, &["--debug", "push", "--dry-run"]);
+    assert_success(&push_output);
+    let push_args = vec![
+        "--recursive".to_string(),
+        "--links".to_string(),
+        "--perms".to_string(),
+        "--times".to_string(),
+        "--checksum".to_string(),
+        "-vv".to_string(),
+        "--dry-run".to_string(),
+        "--".to_string(),
+        format!("{}/mailbox/", local.display()),
+        format!("{}/peer/", local.display()),
+    ];
+    assert_eq!(
+        String::from_utf8_lossy(&push_output.stdout),
+        format!("{}\n", push_args.join("\n"))
+    );
+    assert!(
+        String::from_utf8_lossy(&push_output.stderr).contains(&format!(
+            "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
+            rsync, push_args
         ))
     );
 
@@ -1661,6 +1866,62 @@ fn real_local_pull_preserves_symlink() {
     assert_eq!(
         fs::read_link(destination.join("link.txt")).unwrap(),
         PathBuf::from("target.txt")
+    );
+}
+#+end_src
+
+** Push execution
+
+One real local transfer proves push copies local mailbox content while the
+profile's deliberate omission of deletion retains a peer-only entry.
+
+Pseudocode:
+
+#+begin_example
+local source file + peer-only file -> push once
+pushed file arrives at peer; peer-only file remains unchanged
+#+end_example
+
+#+begin_src rust :tangle tests/cli.rs
+
+#[test]
+fn real_local_push_retains_destination_only_entry() {
+    let root = test_root("real-push");
+    let source = root.join("mailbox");
+    let destination = root.join("peer");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("pushed.txt"), "local mailbox bytes\n").unwrap();
+    fs::write(destination.join("retained.txt"), "peer-only bytes\n").unwrap();
+
+    let rsync = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("rsync"))
+        .find(|candidate| candidate.is_file())
+        .expect("rsync must be present for the real transfer fixture")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .arg("push")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(destination.join("pushed.txt")).unwrap(),
+        "local mailbox bytes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("retained.txt")).unwrap(),
+        "peer-only bytes\n"
     );
 }
 #+end_src

@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 
 use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
 use init::{InitializedWorkspace, initialize_workspace};
-use transfer::{FIXED_TRANSFER_FLAGS, PlanError, plan_pull};
+use transfer::{Direction, FIXED_TRANSFER_FLAGS, PlanError, plan_transfer};
 
 #[derive(Parser)]
 #[command(version, about, arg_required_else_help = true)]
@@ -54,6 +54,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Push the local mailbox into the peer mailbox
+    Push {
+        /// Report changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -79,9 +86,22 @@ fn main() -> ExitCode {
         Some(Command::Init { peer_path, ssh }) => {
             run_init(&cwd, cli.config.as_deref(), peer_path, ssh).map(|()| ExitCode::SUCCESS)
         }
-        Some(Command::Pull { dry_run }) => {
-            pull(&cwd, cli.config.as_deref(), cli.debug, dry_run).map_err(|error| error.to_string())
-        }
+        Some(Command::Pull { dry_run }) => transfer(
+            &cwd,
+            cli.config.as_deref(),
+            cli.debug,
+            dry_run,
+            Direction::Pull,
+        )
+        .map_err(|error| error.to_string()),
+        Some(Command::Push { dry_run }) => transfer(
+            &cwd,
+            cli.config.as_deref(),
+            cli.debug,
+            dry_run,
+            Direction::Push,
+        )
+        .map_err(|error| error.to_string()),
         None => Ok(ExitCode::SUCCESS),
     };
 
@@ -194,11 +214,12 @@ impl fmt::Display for TransferError {
     }
 }
 
-fn pull(
+fn transfer(
     cwd: &Path,
     requested_config_path: Option<&Path>,
     debug_enabled: bool,
     dry_run: bool,
+    direction: Direction,
 ) -> Result<ExitCode, TransferError> {
     let LoadedConfig {
         config,
@@ -211,8 +232,15 @@ fn pull(
         Some(_) => config.peer.path.clone(),
         None => resolve_local(&directory, &config.peer.path),
     };
-    let plan = plan_pull(&config, &peer_path, &local_mailbox, debug_enabled, dry_run)
-        .map_err(TransferError::Planning)?;
+    let plan = plan_transfer(
+        &config,
+        &peer_path,
+        &local_mailbox,
+        debug_enabled,
+        dry_run,
+        direction,
+    )
+    .map_err(TransferError::Planning)?;
 
     if debug_enabled {
         debug("config selection", selection);
