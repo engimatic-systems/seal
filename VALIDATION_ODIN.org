@@ -333,11 +333,10 @@ attempt to use the quote-bearing directory through =init= stopped before
 workspace creation because Odin's PATH-list parser rejected that entry; this
 was test-fixture friction, not remaining rsync encoding failure.
 
-Reviewer reductions also removed =Config.has_ssh=,
-=Config.has_ssh_debug_flag=, the unused =warn= diagnostic, and duplicated debug
-presentation. =Config_Seen= now owns parse-time presence, with
-=has_peer_ssh= set only after validation. No command, option, transfer flag,
-logging framework, or mailbox interpretation was added.
+Reviewer reductions removed the old Config presence flags, the unused =warn=
+diagnostic, and duplicated debug presentation. The later TOML facade repair
+also removed =Config_Seen= and the handwritten parser entirely. No command,
+option, transfer flag, logging framework, or mailbox interpretation was added.
 
 The earlier raw =--rsh= transcripts above remain historical evidence from the
 pre-review binary. The quoted repair transcript supersedes them for final
@@ -472,22 +471,33 @@ initial state: =agent-experiment-01= running and =agent-arch-01= shut off.
 
 * TOML facade propagation revalidation
 
-This bounded replay supersedes the earlier parser-specific construction claims.
-The Odin tail was rebased onto amended car 002 source
-=94b51267395a43297e212018b734f0464f56736c=. Final implementation source before
-this evidence-only commit was
-=66fe747e6737545983bcb261a7b809e22ee36c8e= on
+The Odin tail was most recently rebased onto allocator-stable car 002 source
+=0e69a25=. Final implementation source before this evidence update was
+=dda4c6d4cad8f3ae0da8b510a29df98f76cff285= on
 =review/odin-v0/006-live-ssh-smoke=, based on amended car 005
-=54c93c4=. No Rust ref or worktree participated.
+=2224d923b500250046365dcfacad8e1a5b3ecae8=. No Rust ref or worktree
+participated.
 
 ** Backend and package boundary
 
 Car 002 vendors exact =Up05/toml_parser= commit
 =10aee3739d1a144efe79e95d8a094e9c1563bb03= under =vendor/toml/= with its MIT
-=LICENSE= and =UPSTREAM.md= provenance. Seal-owned =config_toml= exposes an
-opaque owned document, normalized owned parse error,
-=Found=/=Missing=/=Wrong_Type= status, table enumeration, and owned string and
-string-array queries. =odin doc config_toml -short= exposed no upstream type.
+=LICENSE= and =UPSTREAM.md= provenance. Seal-owned =config_toml= exposes
+=Document= and =Parse_Error= as distinct raw-pointer handles with no ordinary
+external field traversal, plus =Found=/=Missing=/=Wrong_Type= status, table
+enumeration, and owned string and string-array queries. An external package
+attempting =document.state= failed compilation with =Document has no field
+'state'=. Explicit transmutation is outside the ownership contract.
+
+=Document= and =Parse_Error= are single-owner, non-copy handles. Parse state
+stores its parser allocator; destruction uses that allocator regardless of the
+later ambient context and zeros the original handle. Query allocation is
+explicit, and results must be destroyed with the same allocator. A focused test
+allocated parser state, queries, and parse errors through tracking allocator A,
+switched ambient context to independent allocator B, and destroyed them with
+zero bad frees and zero allocator-A leaks. Repeated destruction of the same
+zeroed original handle was safe. Copied owning handles are deliberately not
+claimed safe.
 
 =config_toml= owns TOML syntax only. =seal/config.odin= owns explicit table and
 key names, required values, type and unknown-name rejection, SSH pairing,
@@ -521,8 +531,18 @@ facade tests and fourteen Seal tests passed with scoped vet policy and memory
 tracking clean. Seal check and build passed. The fixed live binary was:
 
 #+begin_example
-fc9b05ee303c311edb0209921d917a9239946950a90a052589407a894a2b7931  seal.bin
+04ed18090c9e0991918e5dfc78f05f163fb82dccc2f0959181a803d385b4483f  seal.bin
 #+end_example
+
+** Allocator-stable handle replay
+
+The bounded repair root was
+=/tmp/seal-odin-handle-repair-20260712T1322Z= on both machines. The rebuilt
+binary initialized an SSH workspace, =cfg= parsed the generated TOML through
+the repaired handle and reported =experiment.agent=, and a debug SSH pull
+dry-run returned 0 with itemized =proof.txt= plus =child status: 0=. The local
+destination remained unchanged. Local and peer roots were removed and
+absence-checked.
 
 ** Bounded SSH replay
 
