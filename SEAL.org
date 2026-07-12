@@ -1,0 +1,138 @@
+#+title: Seal
+
+* Purpose and ownership
+
+This document is Seal's canonical handwritten implementation source. Edit it
+first, then tangle the ordinary Rust files used by Cargo and reviewers.
+
+The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=, and
+=tests/cli.rs=. =Cargo.lock= is Cargo-generated and is not literate source.
+
+Tangle, format, test, and build from the repository root:
+
+#+begin_src sh
+emacs --batch --eval '(require (quote ob-tangle))' \
+  --eval '(org-babel-tangle-file "SEAL.org")'
+cargo fmt --check
+cargo test
+cargo build
+#+end_src
+
+For a clean tangle check, run the tangle command twice and confirm the second
+pass leaves no diff in the generated files.
+
+* Package
+
+Cargo builds one =seal= binary. Clap owns conventional option parsing and its
+built-in help and version surfaces; Seal owns only its present debug behavior.
+
+#+begin_src gitignore :tangle .gitignore
+# Generated from SEAL.org; edit the literate source instead.
+/target/
+#+end_src
+
+#+begin_src toml :tangle Cargo.toml
+# Generated from SEAL.org; edit the literate source instead.
+[package]
+name = "seal"
+version = "0.1.0"
+edition = "2024"
+description = "Operator-initiated opaque mailbox transport"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+#+end_src
+
+* Executable
+
+** Command line
+
+Pseudocode:
+
+1. Parse conventional global options.
+2. When debug is absent, exit successfully without additional output.
+3. When debug is present, read the process working directory.
+4. Report working directory and binary version on standard error using Seal's
+   plain debug label.
+5. If the working directory cannot be read, report one plain error and fail.
+
+#+begin_src rust :tangle src/main.rs :mkdirp yes
+// Generated from SEAL.org; edit the literate source instead.
+use std::{env, fmt::Display, process::ExitCode};
+
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Report process facts on standard error
+    #[arg(long, global = true)]
+    debug: bool,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    if !cli.debug {
+        return ExitCode::SUCCESS;
+    }
+
+    match env::current_dir() {
+        Ok(cwd) => {
+            debug("cwd", cwd.display());
+            debug("version", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("[error] :: cannot determine current directory: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn debug(label: &str, value: impl Display) {
+    eprintln!("[debug] :: {label}: {value}");
+}
+#+end_src
+
+* Tests
+
+** Visible seed behavior
+
+Pseudocode:
+
+1. Run the built binary for help and version; require successful, recognizable
+   output.
+2. Run it with debug from a known directory; require current directory and
+   package version on standard error.
+3. Do not duplicate Clap's option-parser test matrix.
+
+#+begin_src rust :tangle tests/cli.rs :mkdirp yes
+// Generated from SEAL.org; edit the literate source instead.
+use std::process::Command;
+
+#[test]
+fn visible_seed_behavior() {
+    let binary = env!("CARGO_BIN_EXE_seal");
+
+    let help = Command::new(binary).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: seal [OPTIONS]"));
+
+    let version = Command::new(binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8_lossy(&version.stdout), "seal 0.1.0\n");
+
+    let cwd = env!("CARGO_MANIFEST_DIR");
+    let debug = Command::new(binary)
+        .arg("--debug")
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(debug.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&debug.stderr),
+        format!("[debug] :: cwd: {cwd}\n[debug] :: version: 0.1.0\n")
+    );
+}
+#+end_src

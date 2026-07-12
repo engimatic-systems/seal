@@ -1,0 +1,9 @@
+# Generated from SEAL.org; edit the literate source instead.
+[package]
+name = "seal"
+version = "0.1.0"
+edition = "2024"
+description = "Operator-initiated opaque mailbox transport"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
