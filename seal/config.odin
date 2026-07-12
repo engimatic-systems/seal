@@ -2,6 +2,7 @@
 package main
 
 import config_toml "../config_toml"
+import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -64,8 +65,9 @@ validate_table :: proc(
 	missing_message: string,
 	wrong_type_message: string,
 	unknown_message: string,
+	allocator: runtime.Allocator,
 ) -> (config_toml.Lookup_Status, string) {
-	keys, status := config_toml.table_keys(document, ..path)
+	keys, status := config_toml.table_keys(document, path, allocator)
 	if status == .Missing && !required {
 		return status, ""
 	}
@@ -75,7 +77,7 @@ validate_table :: proc(
 	if status == .Wrong_Type {
 		return status, wrong_type_message
 	}
-	defer config_toml.destroy_string_array(keys)
+	defer config_toml.destroy_string_array(keys, allocator)
 	for key in keys {
 		if !contains_key(allowed, key) {
 			return status, unknown_message
@@ -88,8 +90,9 @@ required_string :: proc(
 	document: ^config_toml.Document,
 	path: []string,
 	missing_message, wrong_type_message: string,
+	allocator: runtime.Allocator,
 ) -> (string, string) {
-	value, status := config_toml.get_string(document, ..path)
+	value, status := config_toml.get_string(document, path, allocator)
 	switch status {
 	case .Found:
 		return value, ""
@@ -105,8 +108,9 @@ optional_string :: proc(
 	document: ^config_toml.Document,
 	path: []string,
 	wrong_type_message: string,
+	allocator: runtime.Allocator,
 ) -> (string, config_toml.Lookup_Status, string) {
-	value, status := config_toml.get_string(document, ..path)
+	value, status := config_toml.get_string(document, path, allocator)
 	if status == .Wrong_Type {
 		return "", status, wrong_type_message
 	}
@@ -120,15 +124,20 @@ valid_debug_flag :: proc(value: string) -> bool {
 debug_flag :: proc(
 	document: ^config_toml.Document,
 	key, wrong_type_message: string,
+	allocator: runtime.Allocator,
 ) -> (string, config_toml.Lookup_Status, string) {
-	values, status := config_toml.get_string_array(document, "debug", key)
+	values, status := config_toml.get_string_array(
+		document,
+		[]string{"debug", key},
+		allocator,
+	)
 	if status == .Missing {
 		return "", status, ""
 	}
 	if status == .Wrong_Type {
 		return "", status, wrong_type_message
 	}
-	defer config_toml.destroy_string_array(values)
+	defer config_toml.destroy_string_array(values, allocator)
 	if len(values) > 1 {
 		return "", status, "debug flag array must contain at most one value"
 	}
@@ -150,15 +159,20 @@ resolve_local_path :: proc(directory, path: string) -> string {
 }
 
 parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
+	allocator := context.allocator
 	config := Config{
 		path = strings.clone(path),
 		directory = strings.clone(directory),
 	}
-	document, parse_problem, parsed := config_toml.parse(text, path)
+	document, parse_problem, parsed := config_toml.parse(text, path, allocator)
 	defer config_toml.destroy(&document)
 	defer config_toml.destroy_parse_error(&parse_problem)
 	if !parsed {
-		return config, config_error(path, parse_problem.line, parse_problem.message), false
+		return config, config_error(
+			path,
+			config_toml.parse_error_line(&parse_problem),
+			config_toml.parse_error_message(&parse_problem),
+		), false
 	}
 
 	tables := []struct {
@@ -184,6 +198,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			table.missing_message,
 			table.wrong_type_message,
 			table.unknown_message,
+			allocator,
 		)
 		if i == 3 {
 			debug_table_status = status
@@ -199,6 +214,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		[]string{"local_mailbox"},
 		"missing local_mailbox",
 		"local_mailbox must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -208,6 +224,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		[]string{"peer", "path"},
 		"missing peer.path",
 		"peer.path must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -217,6 +234,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		[]string{"tools", "rsync"},
 		"missing tools.rsync",
 		"tools.rsync must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -227,6 +245,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		&document,
 		[]string{"peer", "ssh"},
 		"peer.ssh must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -236,6 +255,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		&document,
 		[]string{"tools", "ssh"},
 		"tools.ssh must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -248,6 +268,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			&document,
 			"rsync_debug_flags",
 			"debug.rsync_debug_flags must be an array of strings",
+			allocator,
 		)
 		if len(problem) > 0 {
 			return config, config_error(path, 0, problem), false
@@ -256,6 +277,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			&document,
 			"ssh_debug_flags",
 			"debug.ssh_debug_flags must be an array of strings",
+			allocator,
 		)
 		if len(problem) > 0 {
 			return config, config_error(path, 0, problem), false

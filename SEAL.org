@@ -43,40 +43,51 @@ Build output and local tangle machinery are not source artifacts.
 
 ** Contract and implementation
 
-The =config_toml= package is Seal-owned. Its public surface owns an opaque
-=Document=, normalized parse errors, and cloned query results. Upstream TOML
-types remain private to this package. Callers destroy documents, parse errors,
-returned strings, and returned string slices after use.
+The =config_toml= package is Seal-owned. =Document= and =Parse_Error= are
+opaque owning handles; upstream TOML types remain private. A successful
+=Document= must not be copied: pass its address to queries and destroy it
+exactly once. Destruction zeros the original handle and is idempotent there.
+Parse/state destruction uses the allocator captured at allocation time.
+Query results name their allocator explicitly and must be destroyed with that
+same allocator.
 
 Pseudocode:
 
 1. Parse TOML syntax through the pinned backend and normalize any backend error.
-2. Keep the backend table behind opaque document state and destroy it recursively.
+2. Keep the backend table and parser allocator behind an opaque distinct handle;
+   destroy the tree and state with that stored allocator.
 3. Traverse tables without exposing backend types; distinguish missing paths from
    values of the wrong type.
-4. Clone every returned key, string, and string-array item so results are owned by
-   the caller and independent of document lifetime.
+4. Clone every returned key, string, and string-array item with the explicit
+   query allocator so results are owned by the caller and independent of document
+   lifetime.
 
 #+begin_src odin :tangle config_toml/config.odin :name config-toml-package
 package config_toml
 
+import "base:runtime"
 import "core:strings"
 import toml "../vendor/toml"
 
 @private
 Backend_State :: struct {
-	table: ^toml.Table,
+	table:     ^toml.Table,
+	allocator: runtime.Allocator,
 }
 
-// Document owns private backend state and its parser tree.
-Document :: struct {
-	state: ^Backend_State,
+@private
+Error_State :: struct {
+	line:      int,
+	message:   string,
+	allocator: runtime.Allocator,
 }
 
-Parse_Error :: struct {
-	line:    int,
-	message: string,
-}
+// Document is a single-owner handle. Do not copy it after successful parse.
+// Pass its address to queries and destroy exactly once; destroy zeros the handle.
+Document :: distinct rawptr
+
+// Parse_Error is a single-owner error handle returned by parse. Do not copy it.
+Parse_Error :: distinct rawptr
 
 Lookup_Status :: enum {
 	Found,
@@ -85,22 +96,38 @@ Lookup_Status :: enum {
 }
 
 @private
-backend_table :: proc(document: ^Document) -> ^toml.Table {
-	if document.state == nil {
+document_state :: proc(document: ^Document) -> ^Backend_State {
+	if document == nil || document^ == Document(nil) {
 		return nil
 	}
-	return document.state.table
+	return transmute(^Backend_State)document^
 }
 
-parse :: proc(text, source: string) -> (Document, Parse_Error, bool) {
-	table, upstream_error := toml.parse(text, source)
-	if upstream_error.type == .None {
-		state := new(Backend_State)
-		state.table = table
-		return Document{state = state}, Parse_Error{}, true
+@private
+error_state :: proc(problem: ^Parse_Error) -> ^Error_State {
+	if problem == nil || problem^ == Parse_Error(nil) {
+		return nil
 	}
+	return transmute(^Error_State)problem^
+}
+
+parse :: proc(
+	text, source: string,
+	allocator := context.allocator,
+) -> (Document, Parse_Error, bool) {
+	table, upstream_error := toml.parse(text, source, allocator)
+	if upstream_error.type == .None {
+		state := new(Backend_State, allocator)
+		state.table = table
+		state.allocator = allocator
+		return Document(rawptr(state)), Parse_Error(nil), true
+	}
+	context.allocator = allocator
 	defer toml.delete_error(&upstream_error)
-	formatted, _ := toml.format_error(&upstream_error)
+	if table != nil {
+		_ = toml.deep_delete(table, allocator)
+	}
+	formatted, _ := toml.format_error(&upstream_error, allocator)
 	message := formatted
 	if len(formatted) >= len(source) {
 		separator := strings.index_byte(formatted[len(source):], ' ')
@@ -108,25 +135,50 @@ parse :: proc(text, source: string) -> (Document, Parse_Error, bool) {
 			message = formatted[len(source) + separator + 1:]
 		}
 	}
-	return Document{}, Parse_Error{
-		line = upstream_error.line,
-		message = strings.clone(strings.trim_space(message)),
-	}, false
+	state := new(Error_State, allocator)
+	state.line = upstream_error.line
+	state.message = strings.clone(strings.trim_space(message), allocator)
+	state.allocator = allocator
+	return Document(nil), Parse_Error(rawptr(state)), false
 }
 
 destroy :: proc(document: ^Document) {
-	if document.state != nil {
-		_ = toml.deep_delete(backend_table(document))
-		free(document.state)
+	state := document_state(document)
+	if state == nil {
+		return
 	}
-	document^ = {}
+	allocator := state.allocator
+	_ = toml.deep_delete(state.table, allocator)
+	free(state, allocator)
+	document^ = Document(nil)
 }
 
 destroy_parse_error :: proc(problem: ^Parse_Error) {
-	if len(problem.message) > 0 {
-		delete(problem.message)
+	state := error_state(problem)
+	if state == nil {
+		return
 	}
-	problem^ = {}
+	allocator := state.allocator
+	delete(state.message, allocator)
+	free(state, allocator)
+	problem^ = Parse_Error(nil)
+}
+
+parse_error_line :: proc(problem: ^Parse_Error) -> int {
+	state := error_state(problem)
+	return state.line if state != nil else 0
+}
+
+// parse_error_message borrows storage owned by problem until destroy_parse_error.
+parse_error_message :: proc(problem: ^Parse_Error) -> string {
+	state := error_state(problem)
+	return state.message if state != nil else ""
+}
+
+@private
+backend_table :: proc(document: ^Document) -> ^toml.Table {
+	state := document_state(document)
+	return state.table if state != nil else nil
 }
 
 @private
@@ -173,21 +225,31 @@ table_at :: proc(document: ^Document, path: []string) -> (^toml.Table, Lookup_St
 	return table, .Found
 }
 
-table_keys :: proc(document: ^Document, path: ..string) -> ([]string, Lookup_Status) {
+// Returned keys and their slice use allocator; destroy with destroy_string_array.
+table_keys :: proc(
+	document: ^Document,
+	path: []string,
+	allocator := context.allocator,
+) -> ([]string, Lookup_Status) {
 	table, status := table_at(document, path)
 	if status != .Found {
 		return nil, status
 	}
-	keys := make([]string, len(table))
+	keys := make([]string, len(table), allocator)
 	i := 0
 	for key in table {
-		keys[i] = strings.clone(key)
+		keys[i] = strings.clone(key, allocator)
 		i += 1
 	}
 	return keys, .Found
 }
 
-get_string :: proc(document: ^Document, path: ..string) -> (string, Lookup_Status) {
+// Returned string uses allocator and remains valid independently of document.
+get_string :: proc(
+	document: ^Document,
+	path: []string,
+	allocator := context.allocator,
+) -> (string, Lookup_Status) {
 	value, status := lookup(document, path)
 	if status != .Found {
 		return "", status
@@ -196,10 +258,15 @@ get_string :: proc(document: ^Document, path: ..string) -> (string, Lookup_Statu
 	if !ok {
 		return "", .Wrong_Type
 	}
-	return strings.clone(result), .Found
+	return strings.clone(result, allocator), .Found
 }
 
-get_string_array :: proc(document: ^Document, path: ..string) -> ([]string, Lookup_Status) {
+// Returned strings and their slice use allocator; destroy with destroy_string_array.
+get_string_array :: proc(
+	document: ^Document,
+	path: []string,
+	allocator := context.allocator,
+) -> ([]string, Lookup_Status) {
 	value, status := lookup(document, path)
 	if status != .Found {
 		return nil, status
@@ -208,68 +275,76 @@ get_string_array :: proc(document: ^Document, path: ..string) -> ([]string, Look
 	if !ok {
 		return nil, .Wrong_Type
 	}
-	result := make([]string, len(list))
+	result := make([]string, len(list), allocator)
 	for item, i in list {
 		string_item, is_string := item.(string)
 		if !is_string {
-			destroy_string_items(result[:i])
-			delete(result)
+			destroy_string_items(result[:i], allocator)
+			delete(result, allocator)
 			return nil, .Wrong_Type
 		}
-		result[i] = strings.clone(string_item)
+		result[i] = strings.clone(string_item, allocator)
 	}
 	return result, .Found
 }
 
 @private
-destroy_string_items :: proc(values: []string) {
+destroy_string_items :: proc(values: []string, allocator: runtime.Allocator) {
 	for value in values {
-		delete(value)
+		delete(value, allocator)
 	}
 }
 
-destroy_string_array :: proc(values: []string) {
-	destroy_string_items(values)
-	delete(values)
+destroy_string_array :: proc(values: []string, allocator: runtime.Allocator) {
+	destroy_string_items(values, allocator)
+	delete(values, allocator)
 }
 #+end_src
 
 ** Facade behavior
 
 Tests exercise valid enumeration and lookup, missing versus wrong type, parse
-error normalization, and explicit destruction of all owned results.
+error normalization, idempotent same-handle destruction, and destruction after
+switching the ambient allocator away from the allocation allocator.
 
 #+begin_src odin :tangle config_toml/config_test.odin :name config-toml-tests
 package config_toml
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
 @(test)
 test_valid_queries_and_enumeration_are_owned :: proc(t: ^testing.T) {
+	allocator := context.allocator
 	document, problem, ok := parse(`name = "seal"
 [debug]
 flags = ["-v"]
-`, "valid.toml")
+`, "valid.toml", allocator)
 	defer destroy(&document)
 	defer destroy_parse_error(&problem)
-	testing.expect(t, ok, problem.message)
+	testing.expect(t, ok, parse_error_message(&problem))
 
-	keys, status := table_keys(&document)
-	defer destroy_string_array(keys)
+	keys, status := table_keys(&document, nil, allocator)
+	defer destroy_string_array(keys, allocator)
 	testing.expect_value(t, status, Lookup_Status.Found)
 	testing.expect_value(t, len(keys), 2)
 
-	name, name_status := get_string(&document, "name")
-	defer delete(name)
+	name, name_status := get_string(&document, []string{"name"}, allocator)
+	defer delete(name, allocator)
 	testing.expect_value(t, name_status, Lookup_Status.Found)
 	testing.expect_value(t, name, "seal")
 
-	flags, flags_status := get_string_array(&document, "debug", "flags")
-	defer destroy_string_array(flags)
+	flags, flags_status := get_string_array(
+		&document,
+		[]string{"debug", "flags"},
+		allocator,
+	)
+	defer destroy_string_array(flags, allocator)
 	testing.expect_value(t, flags_status, Lookup_Status.Found)
 	testing.expect_value(t, flags[0], "-v")
 
+	destroy(&document)
 	destroy(&document)
 	testing.expect_value(t, name, "seal")
 	testing.expect_value(t, flags[0], "-v")
@@ -284,29 +359,75 @@ flags = ["-v"]
 
 @(test)
 test_queries_distinguish_missing_and_wrong_type :: proc(t: ^testing.T) {
+	allocator := context.allocator
 	document, problem, ok := parse(`name = "seal"
 count = 1
-`, "types.toml")
+`, "types.toml", allocator)
 	defer destroy(&document)
 	defer destroy_parse_error(&problem)
-	testing.expect(t, ok, problem.message)
+	testing.expect(t, ok, parse_error_message(&problem))
 
-	_, missing := get_string(&document, "absent")
-	_, wrong := get_string(&document, "count")
-	_, through_scalar := get_string(&document, "name", "child")
+	_, missing := get_string(&document, []string{"absent"}, allocator)
+	_, wrong := get_string(&document, []string{"count"}, allocator)
+	_, through_scalar := get_string(
+		&document,
+		[]string{"name", "child"},
+		allocator,
+	)
 	testing.expect_value(t, missing, Lookup_Status.Missing)
 	testing.expect_value(t, wrong, Lookup_Status.Wrong_Type)
 	testing.expect_value(t, through_scalar, Lookup_Status.Wrong_Type)
 }
 
 @(test)
-test_syntax_error_is_normalized_and_owned :: proc(t: ^testing.T) {
-	document, problem, ok := parse("name = [\n", "broken.toml")
-	defer destroy(&document)
-	defer destroy_parse_error(&problem)
-	testing.expect(t, !ok)
-	testing.expect(t, problem.line > 0)
-	testing.expect(t, !strings.contains(problem.message, "broken.toml"))
+test_allocator_switch_does_not_change_destruction :: proc(t: ^testing.T) {
+	base_allocator := context.allocator
+	allocator_a_state, allocator_b_state: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&allocator_a_state, base_allocator, base_allocator)
+	mem.tracking_allocator_init(&allocator_b_state, base_allocator, base_allocator)
+	defer {
+		context.allocator = base_allocator
+		mem.tracking_allocator_destroy(&allocator_b_state)
+		mem.tracking_allocator_destroy(&allocator_a_state)
+	}
+	allocator_a := mem.tracking_allocator(&allocator_a_state)
+	allocator_b := mem.tracking_allocator(&allocator_b_state)
+
+	document, problem, ok := parse(`name = "seal"
+[debug]
+flags = ["-v"]
+`, "allocator.toml", allocator_a)
+	testing.expect(t, ok, parse_error_message(&problem))
+	keys, _ := table_keys(&document, nil, allocator_a)
+	name, _ := get_string(&document, []string{"name"}, allocator_a)
+	flags, _ := get_string_array(&document, []string{"debug", "flags"}, allocator_a)
+
+	context.allocator = allocator_b
+	destroy(&document)
+	destroy(&document)
+	destroy_parse_error(&problem)
+	destroy_string_array(keys, allocator_a)
+	delete(name, allocator_a)
+	destroy_string_array(flags, allocator_a)
+
+	broken_document, broken_problem, parsed := parse(
+		"name = [\n",
+		"broken.toml",
+		allocator_a,
+	)
+	testing.expect(t, !parsed)
+	testing.expect(t, parse_error_line(&broken_problem) > 0)
+	testing.expect(t, !strings.contains(
+		parse_error_message(&broken_problem),
+		"broken.toml",
+	))
+	context.allocator = allocator_b
+	destroy(&broken_document)
+	destroy_parse_error(&broken_problem)
+	destroy_parse_error(&broken_problem)
+
+	testing.expect_value(t, len(allocator_a_state.bad_free_array), 0)
+	testing.expect_value(t, len(allocator_a_state.allocation_map), 0)
 }
 #+end_src
 
@@ -334,6 +455,7 @@ Pseudocode:
 package main
 
 import config_toml "../config_toml"
+import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -396,8 +518,9 @@ validate_table :: proc(
 	missing_message: string,
 	wrong_type_message: string,
 	unknown_message: string,
+	allocator: runtime.Allocator,
 ) -> (config_toml.Lookup_Status, string) {
-	keys, status := config_toml.table_keys(document, ..path)
+	keys, status := config_toml.table_keys(document, path, allocator)
 	if status == .Missing && !required {
 		return status, ""
 	}
@@ -407,7 +530,7 @@ validate_table :: proc(
 	if status == .Wrong_Type {
 		return status, wrong_type_message
 	}
-	defer config_toml.destroy_string_array(keys)
+	defer config_toml.destroy_string_array(keys, allocator)
 	for key in keys {
 		if !contains_key(allowed, key) {
 			return status, unknown_message
@@ -420,8 +543,9 @@ required_string :: proc(
 	document: ^config_toml.Document,
 	path: []string,
 	missing_message, wrong_type_message: string,
+	allocator: runtime.Allocator,
 ) -> (string, string) {
-	value, status := config_toml.get_string(document, ..path)
+	value, status := config_toml.get_string(document, path, allocator)
 	switch status {
 	case .Found:
 		return value, ""
@@ -437,8 +561,9 @@ optional_string :: proc(
 	document: ^config_toml.Document,
 	path: []string,
 	wrong_type_message: string,
+	allocator: runtime.Allocator,
 ) -> (string, config_toml.Lookup_Status, string) {
-	value, status := config_toml.get_string(document, ..path)
+	value, status := config_toml.get_string(document, path, allocator)
 	if status == .Wrong_Type {
 		return "", status, wrong_type_message
 	}
@@ -452,15 +577,20 @@ valid_debug_flag :: proc(value: string) -> bool {
 debug_flag :: proc(
 	document: ^config_toml.Document,
 	key, wrong_type_message: string,
+	allocator: runtime.Allocator,
 ) -> (string, config_toml.Lookup_Status, string) {
-	values, status := config_toml.get_string_array(document, "debug", key)
+	values, status := config_toml.get_string_array(
+		document,
+		[]string{"debug", key},
+		allocator,
+	)
 	if status == .Missing {
 		return "", status, ""
 	}
 	if status == .Wrong_Type {
 		return "", status, wrong_type_message
 	}
-	defer config_toml.destroy_string_array(values)
+	defer config_toml.destroy_string_array(values, allocator)
 	if len(values) > 1 {
 		return "", status, "debug flag array must contain at most one value"
 	}
@@ -482,15 +612,20 @@ resolve_local_path :: proc(directory, path: string) -> string {
 }
 
 parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
+	allocator := context.allocator
 	config := Config{
 		path = strings.clone(path),
 		directory = strings.clone(directory),
 	}
-	document, parse_problem, parsed := config_toml.parse(text, path)
+	document, parse_problem, parsed := config_toml.parse(text, path, allocator)
 	defer config_toml.destroy(&document)
 	defer config_toml.destroy_parse_error(&parse_problem)
 	if !parsed {
-		return config, config_error(path, parse_problem.line, parse_problem.message), false
+		return config, config_error(
+			path,
+			config_toml.parse_error_line(&parse_problem),
+			config_toml.parse_error_message(&parse_problem),
+		), false
 	}
 
 	tables := []struct {
@@ -516,6 +651,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			table.missing_message,
 			table.wrong_type_message,
 			table.unknown_message,
+			allocator,
 		)
 		if i == 3 {
 			debug_table_status = status
@@ -531,6 +667,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		[]string{"local_mailbox"},
 		"missing local_mailbox",
 		"local_mailbox must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -540,6 +677,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		[]string{"peer", "path"},
 		"missing peer.path",
 		"peer.path must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -549,6 +687,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		[]string{"tools", "rsync"},
 		"missing tools.rsync",
 		"tools.rsync must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -559,6 +698,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		&document,
 		[]string{"peer", "ssh"},
 		"peer.ssh must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -568,6 +708,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 		&document,
 		[]string{"tools", "ssh"},
 		"tools.ssh must be a string",
+		allocator,
 	)
 	if len(problem) > 0 {
 		return config, config_error(path, 0, problem), false
@@ -580,6 +721,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			&document,
 			"rsync_debug_flags",
 			"debug.rsync_debug_flags must be an array of strings",
+			allocator,
 		)
 		if len(problem) > 0 {
 			return config, config_error(path, 0, problem), false
@@ -588,6 +730,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 			&document,
 			"ssh_debug_flags",
 			"debug.ssh_debug_flags must be an array of strings",
+			allocator,
 		)
 		if len(problem) > 0 {
 			return config, config_error(path, 0, problem), false

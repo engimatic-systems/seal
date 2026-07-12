@@ -1,23 +1,29 @@
 // BEGIN org:block config-toml-package
 package config_toml
 
+import "base:runtime"
 import "core:strings"
 import toml "../vendor/toml"
 
 @private
 Backend_State :: struct {
-	table: ^toml.Table,
+	table:     ^toml.Table,
+	allocator: runtime.Allocator,
 }
 
-// Document owns private backend state and its parser tree.
-Document :: struct {
-	state: ^Backend_State,
+@private
+Error_State :: struct {
+	line:      int,
+	message:   string,
+	allocator: runtime.Allocator,
 }
 
-Parse_Error :: struct {
-	line:    int,
-	message: string,
-}
+// Document is a single-owner handle. Do not copy it after successful parse.
+// Pass its address to queries and destroy exactly once; destroy zeros the handle.
+Document :: distinct rawptr
+
+// Parse_Error is a single-owner error handle returned by parse. Do not copy it.
+Parse_Error :: distinct rawptr
 
 Lookup_Status :: enum {
 	Found,
@@ -26,22 +32,38 @@ Lookup_Status :: enum {
 }
 
 @private
-backend_table :: proc(document: ^Document) -> ^toml.Table {
-	if document.state == nil {
+document_state :: proc(document: ^Document) -> ^Backend_State {
+	if document == nil || document^ == Document(nil) {
 		return nil
 	}
-	return document.state.table
+	return transmute(^Backend_State)document^
 }
 
-parse :: proc(text, source: string) -> (Document, Parse_Error, bool) {
-	table, upstream_error := toml.parse(text, source)
-	if upstream_error.type == .None {
-		state := new(Backend_State)
-		state.table = table
-		return Document{state = state}, Parse_Error{}, true
+@private
+error_state :: proc(problem: ^Parse_Error) -> ^Error_State {
+	if problem == nil || problem^ == Parse_Error(nil) {
+		return nil
 	}
+	return transmute(^Error_State)problem^
+}
+
+parse :: proc(
+	text, source: string,
+	allocator := context.allocator,
+) -> (Document, Parse_Error, bool) {
+	table, upstream_error := toml.parse(text, source, allocator)
+	if upstream_error.type == .None {
+		state := new(Backend_State, allocator)
+		state.table = table
+		state.allocator = allocator
+		return Document(rawptr(state)), Parse_Error(nil), true
+	}
+	context.allocator = allocator
 	defer toml.delete_error(&upstream_error)
-	formatted, _ := toml.format_error(&upstream_error)
+	if table != nil {
+		_ = toml.deep_delete(table, allocator)
+	}
+	formatted, _ := toml.format_error(&upstream_error, allocator)
 	message := formatted
 	if len(formatted) >= len(source) {
 		separator := strings.index_byte(formatted[len(source):], ' ')
@@ -49,25 +71,50 @@ parse :: proc(text, source: string) -> (Document, Parse_Error, bool) {
 			message = formatted[len(source) + separator + 1:]
 		}
 	}
-	return Document{}, Parse_Error{
-		line = upstream_error.line,
-		message = strings.clone(strings.trim_space(message)),
-	}, false
+	state := new(Error_State, allocator)
+	state.line = upstream_error.line
+	state.message = strings.clone(strings.trim_space(message), allocator)
+	state.allocator = allocator
+	return Document(nil), Parse_Error(rawptr(state)), false
 }
 
 destroy :: proc(document: ^Document) {
-	if document.state != nil {
-		_ = toml.deep_delete(backend_table(document))
-		free(document.state)
+	state := document_state(document)
+	if state == nil {
+		return
 	}
-	document^ = {}
+	allocator := state.allocator
+	_ = toml.deep_delete(state.table, allocator)
+	free(state, allocator)
+	document^ = Document(nil)
 }
 
 destroy_parse_error :: proc(problem: ^Parse_Error) {
-	if len(problem.message) > 0 {
-		delete(problem.message)
+	state := error_state(problem)
+	if state == nil {
+		return
 	}
-	problem^ = {}
+	allocator := state.allocator
+	delete(state.message, allocator)
+	free(state, allocator)
+	problem^ = Parse_Error(nil)
+}
+
+parse_error_line :: proc(problem: ^Parse_Error) -> int {
+	state := error_state(problem)
+	return state.line if state != nil else 0
+}
+
+// parse_error_message borrows storage owned by problem until destroy_parse_error.
+parse_error_message :: proc(problem: ^Parse_Error) -> string {
+	state := error_state(problem)
+	return state.message if state != nil else ""
+}
+
+@private
+backend_table :: proc(document: ^Document) -> ^toml.Table {
+	state := document_state(document)
+	return state.table if state != nil else nil
 }
 
 @private
@@ -114,21 +161,31 @@ table_at :: proc(document: ^Document, path: []string) -> (^toml.Table, Lookup_St
 	return table, .Found
 }
 
-table_keys :: proc(document: ^Document, path: ..string) -> ([]string, Lookup_Status) {
+// Returned keys and their slice use allocator; destroy with destroy_string_array.
+table_keys :: proc(
+	document: ^Document,
+	path: []string,
+	allocator := context.allocator,
+) -> ([]string, Lookup_Status) {
 	table, status := table_at(document, path)
 	if status != .Found {
 		return nil, status
 	}
-	keys := make([]string, len(table))
+	keys := make([]string, len(table), allocator)
 	i := 0
 	for key in table {
-		keys[i] = strings.clone(key)
+		keys[i] = strings.clone(key, allocator)
 		i += 1
 	}
 	return keys, .Found
 }
 
-get_string :: proc(document: ^Document, path: ..string) -> (string, Lookup_Status) {
+// Returned string uses allocator and remains valid independently of document.
+get_string :: proc(
+	document: ^Document,
+	path: []string,
+	allocator := context.allocator,
+) -> (string, Lookup_Status) {
 	value, status := lookup(document, path)
 	if status != .Found {
 		return "", status
@@ -137,10 +194,15 @@ get_string :: proc(document: ^Document, path: ..string) -> (string, Lookup_Statu
 	if !ok {
 		return "", .Wrong_Type
 	}
-	return strings.clone(result), .Found
+	return strings.clone(result, allocator), .Found
 }
 
-get_string_array :: proc(document: ^Document, path: ..string) -> ([]string, Lookup_Status) {
+// Returned strings and their slice use allocator; destroy with destroy_string_array.
+get_string_array :: proc(
+	document: ^Document,
+	path: []string,
+	allocator := context.allocator,
+) -> ([]string, Lookup_Status) {
 	value, status := lookup(document, path)
 	if status != .Found {
 		return nil, status
@@ -149,28 +211,28 @@ get_string_array :: proc(document: ^Document, path: ..string) -> ([]string, Look
 	if !ok {
 		return nil, .Wrong_Type
 	}
-	result := make([]string, len(list))
+	result := make([]string, len(list), allocator)
 	for item, i in list {
 		string_item, is_string := item.(string)
 		if !is_string {
-			destroy_string_items(result[:i])
-			delete(result)
+			destroy_string_items(result[:i], allocator)
+			delete(result, allocator)
 			return nil, .Wrong_Type
 		}
-		result[i] = strings.clone(string_item)
+		result[i] = strings.clone(string_item, allocator)
 	}
 	return result, .Found
 }
 
 @private
-destroy_string_items :: proc(values: []string) {
+destroy_string_items :: proc(values: []string, allocator: runtime.Allocator) {
 	for value in values {
-		delete(value)
+		delete(value, allocator)
 	}
 }
 
-destroy_string_array :: proc(values: []string) {
-	destroy_string_items(values)
-	delete(values)
+destroy_string_array :: proc(values: []string, allocator: runtime.Allocator) {
+	destroy_string_items(values, allocator)
+	delete(values, allocator)
 }
 // END org:block config-toml-package

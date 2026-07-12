@@ -36,11 +36,14 @@ license and provenance. Vendored upstream source is not generated from
 * TOML and schema boundary
 
 Car 002 owns a small =config_toml= package facade backed at compile time by the
-pinned parser. Its public API exposes an opaque owned document, normalized owned
-parse error, =Found=/=Missing=/=Wrong_Type= lookup status, table-key enumeration,
-and owned string/string-array queries. Upstream types do not cross this package
-boundary. There is no runtime backend selection, reflection unmarshal, generic
-schema validator, or encoder.
+pinned parser. Its public API exposes opaque single-owner document and parse
+error handles, =Found=/=Missing=/=Wrong_Type= lookup status, table-key
+enumeration, and owned string/string-array queries. Handles must not be copied;
+destruction zeros the original. Parser state and errors retain their allocation
+allocator, while query results name the allocator callers must use for
+destruction. Upstream types do not cross this package boundary. There is no
+runtime backend selection, reflection unmarshal, generic schema validator, or
+encoder.
 
 =config_toml.parse= knows TOML syntax only. =seal/config.odin= owns explicit
 allowed root, peer, tools, and debug keys; required tables and values; unknown

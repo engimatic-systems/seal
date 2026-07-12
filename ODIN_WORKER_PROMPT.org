@@ -42,7 +42,9 @@ Car 002 vendors the exact parser snapshot named in =ODIN_PLAN.org= and keeps its
 types private behind Seal's =config_toml= package facade. Syntax parsing belongs
 to that facade; explicit Seal tables, keys, values, and policy belong in
 =seal/config.odin=. Do not add runtime backend selection, reflection unmarshal,
-a generic schema validator, or serialization.
+a generic schema validator, or serialization. Facade handles are opaque,
+single-owner, and non-copy; their destruction must use stored allocation
+provenance. Query allocations take and retain an explicit allocator contract.
 
 * Source and checks
 
