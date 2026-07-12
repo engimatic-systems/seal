@@ -154,7 +154,7 @@ run_cfg :: proc(cli: Cli) -> int {
 		} else {
 			debug("rsync debug flags", config.rsync_debug_flag)
 		}
-		if len(config.peer_ssh) > 0 {
+		if config.has_peer_ssh {
 			debug("peer ssh", config.peer_ssh)
 			debug("ssh", config.ssh)
 			if len(config.ssh_debug_flag) == 0 {
@@ -174,7 +174,7 @@ run_cfg :: proc(cli: Cli) -> int {
 	fmt.printfln("configuration path: %s", config.path)
 	fmt.printfln("configuration directory: %s", config.directory)
 	fmt.printfln("local mailbox: %s", config.local_mailbox)
-	if len(config.peer_ssh) > 0 {
+	if config.has_peer_ssh {
 		fmt.println("peer kind: ssh")
 		fmt.printfln("peer ssh: %s", config.peer_ssh)
 	} else {
@@ -182,13 +182,13 @@ run_cfg :: proc(cli: Cli) -> int {
 	}
 	fmt.printfln("peer path: %s", config.peer_path)
 	fmt.printfln("rsync: %s", config.rsync)
-	if len(config.ssh) > 0 {
+	if config.has_ssh {
 		fmt.printfln("ssh: %s", config.ssh)
 	} else {
 		fmt.println("ssh: not configured")
 	}
 	print_debug_flag("rsync debug flags", config.rsync_debug_flag)
-	if len(config.peer_ssh) > 0 {
+	if config.has_peer_ssh {
 		print_debug_flag("ssh debug flags", config.ssh_debug_flag)
 	} else {
 		fmt.println("ssh debug flags: not applicable")
@@ -198,7 +198,7 @@ run_cfg :: proc(cli: Cli) -> int {
 	for flag in TRANSFER_FLAGS {
 		fmt.printfln("  %s", flag)
 	}
-	if len(config.peer_ssh) > 0 {
+	if config.has_peer_ssh {
 		fmt.printfln("  %s", SSH_TRANSFER_FLAG)
 	}
 	return 0
