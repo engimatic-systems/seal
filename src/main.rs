@@ -1,14 +1,21 @@
 // Generated from SEAL.org; edit the literate source instead.
 mod config;
+mod init;
 
-use std::{env, fmt::Display, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    fmt::Display,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 
 use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
+use init::{InitializedWorkspace, initialize_workspace};
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, arg_required_else_help = true)]
 struct Cli {
     /// Report process facts on standard error
     #[arg(long, global = true)]
@@ -26,14 +33,21 @@ struct Cli {
 enum Command {
     /// Print the effective configuration
     Cfg,
+
+    /// Create a local Seal workspace
+    Init {
+        /// Peer mailbox path
+        #[arg(value_name = "PEER_PATH")]
+        peer_path: PathBuf,
+
+        /// Reach the peer through this SSH destination
+        #[arg(long, value_name = "SSH_DESTINATION")]
+        ssh: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    if !cli.debug && cli.command.is_none() {
-        return ExitCode::SUCCESS;
-    }
 
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -50,6 +64,9 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref()).and_then(print_config),
+        Some(Command::Init { peer_path, ssh }) => {
+            run_init(&cwd, cli.config.as_deref(), peer_path, ssh)
+        }
         None => Ok(()),
     };
 
@@ -64,6 +81,10 @@ fn main() -> ExitCode {
 
 fn debug(label: &str, value: impl Display) {
     eprintln!("[debug] :: {label}: {value}");
+}
+
+fn info(label: &str, value: impl Display) {
+    eprintln!("[info] :: {label}: {value}");
 }
 
 const FIXED_TRANSFER_PROFILE: &[&str] =
@@ -112,5 +133,27 @@ fn print_config(loaded: LoadedConfig) -> Result<(), String> {
     println!("version: {}", env!("CARGO_PKG_VERSION"));
     println!("fixed transfer profile: {FIXED_TRANSFER_PROFILE:?}");
 
+    Ok(())
+}
+
+fn run_init(
+    cwd: &Path,
+    requested_config_path: Option<&Path>,
+    peer_path: PathBuf,
+    peer_ssh: Option<String>,
+) -> Result<(), String> {
+    let InitializedWorkspace {
+        config_path,
+        mailbox_path,
+        rsync,
+        ssh,
+    } = initialize_workspace(cwd, requested_config_path, peer_path, peer_ssh)?;
+
+    info("created configuration", config_path.display());
+    info("created mailbox", mailbox_path.display());
+    info("pinned rsync", rsync.display());
+    if let Some(ssh) = ssh {
+        info("pinned ssh", ssh.display());
+    }
     Ok(())
 }

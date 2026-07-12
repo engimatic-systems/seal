@@ -6,7 +6,8 @@ This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary Rust files used by Cargo and reviewers.
 
 The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=,
-=src/config.rs=, =tests/cli.rs=, and the three files under =tests/fixtures/=.
+=src/config.rs=, =src/init.rs=, =tests/cli.rs=, and the three files under
+=tests/fixtures/=.
 =Cargo.lock= is Cargo-generated and is not literate source.
 
 Tangle, format, test, and build from the repository root:
@@ -42,6 +43,7 @@ description = "Operator-initiated opaque mailbox transport"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+rustix = { version = "1.0", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 #+end_src
@@ -53,26 +55,33 @@ toml = "0.9"
 Pseudocode:
 
 1. Parse the global debug and optional configuration path, plus the current
-   =cfg= command.
-2. Preserve the seed's no-command behavior: without debug, exit silently; with
-   debug, report current directory and version.
+   =cfg= and =init= commands.
+2. Let clap show ordinary help when invoked without arguments. A global debug
+   invocation without a command still reports current directory and version.
 3. For =cfg=, select only the explicit path or =./seal.toml=, then read and
-   display it.
+   display it. For =init=, create the selected local workspace.
 4. Report the first current-directory or configuration failure with one plain
    error and fail.
 
 #+begin_src rust :tangle src/main.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
 mod config;
+mod init;
 
-use std::{env, fmt::Display, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    fmt::Display,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 
 use config::{LoadedConfig, effective_debug_flags, load_config, resolve_local};
+use init::{InitializedWorkspace, initialize_workspace};
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, arg_required_else_help = true)]
 struct Cli {
     /// Report process facts on standard error
     #[arg(long, global = true)]
@@ -90,14 +99,21 @@ struct Cli {
 enum Command {
     /// Print the effective configuration
     Cfg,
+
+    /// Create a local Seal workspace
+    Init {
+        /// Peer mailbox path
+        #[arg(value_name = "PEER_PATH")]
+        peer_path: PathBuf,
+
+        /// Reach the peer through this SSH destination
+        #[arg(long, value_name = "SSH_DESTINATION")]
+        ssh: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    if !cli.debug && cli.command.is_none() {
-        return ExitCode::SUCCESS;
-    }
 
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -114,6 +130,9 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Some(Command::Cfg) => load_config(&cwd, cli.config.as_deref()).and_then(print_config),
+        Some(Command::Init { peer_path, ssh }) => {
+            run_init(&cwd, cli.config.as_deref(), peer_path, ssh)
+        }
         None => Ok(()),
     };
 
@@ -129,6 +148,10 @@ fn main() -> ExitCode {
 fn debug(label: &str, value: impl Display) {
     eprintln!("[debug] :: {label}: {value}");
 }
+
+fn info(label: &str, value: impl Display) {
+    eprintln!("[info] :: {label}: {value}");
+}
 #+end_src
 
 ** Configuration
@@ -140,11 +163,13 @@ defaults are applied only while printing.
 Pseudocode:
 
 1. Deserialize exactly the documented fields.
-2. Require pinned local tools to be absolute and require SSH tool coordinates
+2. Reject empty local mailbox and peer coordinates without trimming or parsing
+   otherwise opaque path and SSH values.
+3. Require pinned local tools to be absolute and require SSH tool coordinates
    only for an SSH peer.
-3. Accept each supplied debug array only when empty or when it contains exactly
+4. Accept each supplied debug array only when empty or when it contains exactly
    one supported verbosity flag.
-4. Stop at the first useful validation error.
+5. Stop at the first useful validation error.
 
 #+begin_src rust :tangle src/config.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
@@ -153,41 +178,84 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) local_mailbox: PathBuf,
     pub(crate) peer: Peer,
     pub(crate) tools: Tools,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DebugConfig::is_empty")]
     pub(crate) debug: DebugConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Peer {
     pub(crate) path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tools {
     pub(crate) rsync: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh: Option<PathBuf>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DebugConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rsync_debug_flags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh_debug_flags: Option<Vec<String>>,
 }
 
+impl DebugConfig {
+    fn is_empty(&self) -> bool {
+        self.rsync_debug_flags.is_none() && self.ssh_debug_flags.is_none()
+    }
+}
+
 impl Config {
+    pub(crate) fn initialized(
+        peer_path: PathBuf,
+        peer_ssh: Option<String>,
+        rsync: PathBuf,
+        ssh: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            local_mailbox: PathBuf::from("mailbox"),
+            peer: Peer {
+                path: peer_path,
+                ssh: peer_ssh,
+            },
+            tools: Tools { rsync, ssh },
+            debug: DebugConfig::default(),
+        }
+    }
+
+    pub(crate) fn to_toml(&self) -> Result<String, String> {
+        self.validate()
+            .map_err(|error| format!("invalid initial configuration: {error}"))?;
+        toml::to_string_pretty(self)
+            .map_err(|error| format!("cannot serialize configuration: {error}"))
+    }
+
     fn validate(&self) -> Result<(), String> {
+        if self.local_mailbox.as_os_str().is_empty() {
+            return Err("local_mailbox must not be empty".into());
+        }
+        if self.peer.path.as_os_str().is_empty() {
+            return Err("peer.path must not be empty".into());
+        }
+        if matches!(self.peer.ssh.as_deref(), Some("")) {
+            return Err("peer.ssh must not be empty".into());
+        }
         if !self.tools.rsync.is_absolute() {
             return Err("tools.rsync must be an absolute path".into());
         }
@@ -261,28 +329,35 @@ pub(crate) struct LoadedConfig {
 
 pub(crate) fn load_config(
     cwd: &Path,
-    explicit_path: Option<&Path>,
+    requested_config_path: Option<&Path>,
 ) -> Result<LoadedConfig, String> {
-    let (config_path, selection) = match explicit_path {
+    let (resolved_config_path, selection) = match requested_config_path {
         Some(path) if path.is_absolute() => (path.to_path_buf(), "explicit --config PATH"),
         Some(path) => (cwd.join(path), "explicit --config PATH"),
         None => (cwd.join("seal.toml"), "default ./seal.toml"),
     };
-    let source = fs::read_to_string(&config_path).map_err(|error| {
+    let source = fs::read_to_string(&resolved_config_path).map_err(|error| {
         format!(
             "cannot read configuration {}: {error}",
-            config_path.display()
+            resolved_config_path.display()
         )
     })?;
-    let config: Config = toml::from_str(&source)
-        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
-    config
-        .validate()
-        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
+    let config: Config = toml::from_str(&source).map_err(|error| {
+        format!(
+            "invalid configuration {}: {error}",
+            resolved_config_path.display()
+        )
+    })?;
+    config.validate().map_err(|error| {
+        format!(
+            "invalid configuration {}: {error}",
+            resolved_config_path.display()
+        )
+    })?;
 
     Ok(LoadedConfig {
         config,
-        path: config_path,
+        path: resolved_config_path,
         selection,
     })
 }
@@ -354,25 +429,280 @@ fn print_config(loaded: LoadedConfig) -> Result<(), String> {
 }
 #+end_src
 
+** Local workspace initialization
+
+Initialization owns only the selected configuration and its sibling mailbox.
+Tool lookup records local executable paths; it neither runs a tool nor inspects
+the peer.
+
+*** Initialization dataflow
+
+=run_init= passes command inputs to =initialize_workspace=. Initialization
+preflights paths and tools, projects the typed configuration, applies local
+state, and returns owned facts. The command adapter then reports those facts.
+
+*** Initialization result
+
+The result transfers owned workspace paths and pinned tools back to the command
+adapter after initialization is complete.
+
+#+begin_src rust :tangle src/init.rs :mkdirp yes
+// Generated from SEAL.org; edit the literate source instead.
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+use rustix::{
+    fs::{Access, access},
+    io::Errno,
+};
+
+use crate::config::Config;
+
+pub(crate) struct InitializedWorkspace {
+    pub(crate) config_path: PathBuf,
+    pub(crate) mailbox_path: PathBuf,
+    pub(crate) rsync: PathBuf,
+    pub(crate) ssh: Option<PathBuf>,
+}
+#+end_src
+
+*** Workspace orchestration
+
+Pseudocode:
+
+1. Preflight: resolve the requested configuration path from the process
+   directory, name its sibling =mailbox= directory, refuse known conflicts,
+   resolve required local tools, and serialize the initial configuration.
+2. Apply: create the mailbox, then create the configuration exclusively as the
+   completion marker. If configuration creation fails, make one bounded attempt
+   to remove the new mailbox; a partial configuration write also gets one
+   bounded removal attempt.
+3. Return owned paths and tools only after both mutations succeed. Do not
+   contact or create the peer.
+
+#+begin_src rust :tangle src/init.rs
+pub(crate) fn initialize_workspace(
+    cwd: &Path,
+    requested_config_path: Option<&Path>,
+    peer_path: PathBuf,
+    peer_ssh: Option<String>,
+) -> Result<InitializedWorkspace, String> {
+    let (config_path, mailbox_path) = preflight_paths(cwd, requested_config_path)?;
+    let rsync = resolve_tool("rsync")?;
+    let ssh = match peer_ssh {
+        Some(_) => Some(resolve_tool("ssh")?),
+        None => None,
+    };
+    let source = Config::initialized(peer_path, peer_ssh, rsync.clone(), ssh.clone()).to_toml()?;
+
+    fs::create_dir(&mailbox_path)
+        .map_err(|error| format!("cannot create mailbox {}: {error}", mailbox_path.display()))?;
+    if let Err(failure) = create_configuration(&config_path, &source) {
+        return match fs::remove_dir(&mailbox_path) {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(format!(
+                "{failure}; cannot remove mailbox {}: {cleanup_error}",
+                mailbox_path.display()
+            )),
+        };
+    }
+
+    Ok(InitializedWorkspace {
+        config_path,
+        mailbox_path,
+        rsync,
+        ssh,
+    })
+}
+#+end_src
+
+*** Path and conflict preflight
+
+The path helper resolves the requested configuration, derives its mailbox, and
+rejects known conflicts before tool lookup or mutation.
+
+#+begin_src rust :tangle src/init.rs
+fn preflight_paths(
+    cwd: &Path,
+    requested_config_path: Option<&Path>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let requested_config_path = requested_config_path.unwrap_or_else(|| Path::new("seal.toml"));
+    let config_path = if requested_config_path.is_absolute() {
+        requested_config_path.to_path_buf()
+    } else {
+        cwd.join(requested_config_path)
+    };
+    let config_dir = config_path.parent().ok_or_else(|| {
+        format!(
+            "configuration has no parent directory: {}",
+            config_path.display()
+        )
+    })?;
+    let mailbox_path = config_dir.join("mailbox");
+
+    refuse_existing(&config_path, "configuration")?;
+    refuse_existing(&mailbox_path, "mailbox")?;
+
+    Ok((config_path, mailbox_path))
+}
+
+fn refuse_existing(path: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(format!("{label} already exists: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect {label} {}: {error}",
+            path.display()
+        )),
+    }
+}
+#+end_src
+
+*** Tool discovery
+
+Tool discovery scans =PATH= for the first regular file executable by the
+current operator, then records its canonical identity.
+
+#+begin_src rust :tangle src/init.rs
+fn resolve_tool(name: &str) -> Result<PathBuf, String> {
+    let path = env::var_os("PATH").ok_or_else(|| format!("cannot find {name}: PATH is not set"))?;
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(name);
+        let metadata = match fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect {name} candidate {}: {error}",
+                    candidate.display()
+                ));
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        match access(&candidate, Access::EXEC_OK) {
+            Ok(()) => {}
+            Err(Errno::ACCESS | Errno::PERM | Errno::NOENT | Errno::NOTDIR) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot test {name} candidate {} for execution: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+        return candidate
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve {name} {}: {error}", candidate.display()));
+    }
+    Err(format!("cannot find executable {name} in PATH"))
+}
+#+end_src
+
+*** Exclusive configuration creation
+
+Exclusive creation prevents overwrite; partial writes get one bounded cleanup
+attempt before the orchestration removes its new mailbox.
+
+#+begin_src rust :tangle src/init.rs
+fn create_configuration(path: &Path, source: &str) -> Result<(), String> {
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("configuration already exists: {}", path.display()));
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot create configuration {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if let Err(error) = file.write_all(source.as_bytes()) {
+        drop(file);
+        let failure = format!("cannot write configuration {}: {error}", path.display());
+        return match fs::remove_file(path) {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(format!(
+                "{failure}; cannot remove configuration {}: {cleanup_error}",
+                path.display()
+            )),
+        };
+    }
+    Ok(())
+}
+#+end_src
+
+*** Init command adapter
+
+The adapter passes CLI values into initialization and reports returned facts on
+standard error after success.
+
+#+begin_src rust :tangle src/main.rs
+fn run_init(
+    cwd: &Path,
+    requested_config_path: Option<&Path>,
+    peer_path: PathBuf,
+    peer_ssh: Option<String>,
+) -> Result<(), String> {
+    let InitializedWorkspace {
+        config_path,
+        mailbox_path,
+        rsync,
+        ssh,
+    } = initialize_workspace(cwd, requested_config_path, peer_path, peer_ssh)?;
+
+    info("created configuration", config_path.display());
+    info("created mailbox", mailbox_path.display());
+    info("pinned rsync", rsync.display());
+    if let Some(ssh) = ssh {
+        info("pinned ssh", ssh.display());
+    }
+    Ok(())
+}
+#+end_src
+
 * Tests
 
 ** Visible seed behavior
 
 Pseudocode:
 
-1. Run the built binary for help and version; require successful, recognizable
-   output. Account only for the current =cfg= command appearing in usage.
-2. Run it with debug from a known directory; require current directory and
+1. Run the built binary bare and require clap's ordinary help and missing-command
+   status.
+2. Run it for explicit help and version; require successful, recognizable
+   output. Account only for the current commands appearing in usage.
+3. Run it with debug from a known directory; require current directory and
    package version on standard error.
-3. Do not duplicate Clap's option-parser test matrix.
+4. Do not duplicate Clap's option-parser test matrix.
 
 #+begin_src rust :tangle tests/cli.rs :mkdirp yes
 // Generated from SEAL.org; edit the literate source instead.
-use std::process::Command;
+use std::{
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
 
 #[test]
 fn visible_seed_behavior() {
     let binary = env!("CARGO_BIN_EXE_seal");
+
+    let bare = Command::new(binary).output().unwrap();
+    assert!(!bare.status.success());
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: seal [OPTIONS] [COMMAND]"));
 
     let help = Command::new(binary).arg("--help").output().unwrap();
     assert!(help.status.success());
@@ -450,6 +780,8 @@ Pseudocode:
    pinned SSH tool, and both omitted-field defaults.
 3. Select the invalid fixture and require one nonzero, recognizable validation
    error.
+4. Require empty local mailbox, peer path, and SSH destination values to fail
+   with their field names.
 
 #+begin_src rust :tangle tests/cli.rs
 
@@ -498,5 +830,235 @@ fn configuration_inspection() {
     assert!(String::from_utf8_lossy(&invalid.stderr).contains(
         "debug.rsync_debug_flags must be empty or contain exactly one of -v, -vv, or -vvv"
     ));
+}
+
+#[test]
+fn configuration_rejects_empty_coordinates() {
+    let root = test_root("empty-coordinates");
+    let cases = [
+        (
+            "local-mailbox.toml",
+            "local_mailbox = \"\"\n[peer]\npath = \"peer\"\n[tools]\nrsync = \"/bin/true\"\n",
+            "local_mailbox must not be empty",
+        ),
+        (
+            "peer-path.toml",
+            "local_mailbox = \"mailbox\"\n[peer]\npath = \"\"\n[tools]\nrsync = \"/bin/true\"\n",
+            "peer.path must not be empty",
+        ),
+        (
+            "peer-ssh.toml",
+            "local_mailbox = \"mailbox\"\n[peer]\npath = \"/peer\"\nssh = \"\"\n[tools]\nrsync = \"/bin/true\"\nssh = \"/bin/true\"\n",
+            "peer.ssh must not be empty",
+        ),
+    ];
+
+    for (name, source, expected) in cases {
+        let path = root.join(name);
+        fs::write(&path, source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+            .args(["--config", path.to_str().unwrap(), "cfg"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+#+end_src
+
+** Local initialization
+
+Each interaction supplies a private =PATH= containing inert local tool files.
+Reading the generated workspace through =cfg= proves the serialized form uses
+the existing parser and validation path.
+
+Pseudocode:
+
+1. Initialize a local workspace at an explicit configuration path; require one
+   config, one mailbox, pinned rsync, success narration, and a successful =cfg=
+   round-trip.
+2. Initialize an SSH workspace; require the opaque destination, unchanged peer
+   path, and pinned local SSH in the generated configuration and =cfg= output.
+3. Precreate a configuration and, separately, a mailbox; require refusal with
+   no overwrite and no counterpart creation.
+4. Skip a non-executable rsync candidate and pin the later executable.
+5. Make the first rsync candidate fail with an unexpected filesystem error;
+   require that error rather than a generic PATH miss and no mutation.
+
+#+begin_src rust :tangle tests/cli.rs
+
+#[test]
+fn local_initialization() {
+    let root = test_root("local-init");
+    let tools = root.join("tools");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&tools).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    let rsync = write_tool(&tools, "rsync");
+
+    let output = run_seal(
+        &root,
+        &tools,
+        &["--config", "workspace/seal.toml", "init", "../peer-mailbox"],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!(
+        "[info] :: created configuration: {}",
+        workspace.join("seal.toml").display()
+    )));
+    assert!(stderr.contains(&format!(
+        "[info] :: created mailbox: {}",
+        workspace.join("mailbox").display()
+    )));
+    assert!(stderr.contains(&format!("[info] :: pinned rsync: {}", rsync.display())));
+    assert!(workspace.join("mailbox").is_dir());
+    let source = fs::read_to_string(workspace.join("seal.toml")).unwrap();
+    assert!(source.contains("local_mailbox = \"mailbox\""));
+    assert!(source.contains("path = \"../peer-mailbox\""));
+    assert!(source.contains(&format!("rsync = {:?}", rsync.to_string_lossy())));
+    assert!(!source.contains("ssh"));
+
+    let parsed = run_seal(&workspace, &tools, &["cfg"]);
+    assert_success(&parsed);
+    assert!(String::from_utf8_lossy(&parsed.stdout).contains("peer kind: local"));
+}
+
+#[test]
+fn ssh_initialization() {
+    let root = test_root("ssh-init");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let rsync = write_tool(&tools, "rsync");
+    let ssh = write_tool(&tools, "ssh");
+
+    let output = run_seal(
+        &root,
+        &tools,
+        &["init", "/home/agent/mailbox", "--ssh", "experiment.agent"],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("[info] :: pinned rsync: {}", rsync.display())));
+    assert!(stderr.contains(&format!("[info] :: pinned ssh: {}", ssh.display())));
+    assert!(root.join("mailbox").is_dir());
+    let source = fs::read_to_string(root.join("seal.toml")).unwrap();
+    assert!(source.contains("path = \"/home/agent/mailbox\""));
+    assert!(source.contains("ssh = \"experiment.agent\""));
+    assert!(source.contains(&format!("rsync = {:?}", rsync.to_string_lossy())));
+    assert!(source.contains(&format!("ssh = {:?}", ssh.to_string_lossy())));
+
+    let parsed = run_seal(&root, &tools, &["cfg"]);
+    assert_success(&parsed);
+    let stdout = String::from_utf8_lossy(&parsed.stdout);
+    assert!(stdout.contains("peer kind: ssh"));
+    assert!(stdout.contains("peer ssh: experiment.agent"));
+}
+
+#[test]
+fn initialization_preserves_tool_lookup_errors() {
+    let root = test_root("init-tool-error");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    std::os::unix::fs::symlink("rsync", tools.join("rsync")).unwrap();
+
+    let output = run_seal(&root, &tools, &["init", "peer"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot inspect rsync candidate"));
+    assert!(!stderr.contains("cannot find executable rsync in PATH"));
+    assert!(!root.join("seal.toml").exists());
+    assert!(!root.join("mailbox").exists());
+}
+
+#[test]
+fn initialization_skips_nonexecutable_tool_candidates() {
+    let root = test_root("init-nonexec-tool");
+    let nonexec_tools = root.join("nonexec-tools");
+    let valid_tools = root.join("valid-tools");
+    fs::create_dir(&nonexec_tools).unwrap();
+    fs::create_dir(&valid_tools).unwrap();
+    let nonexec = write_tool(&nonexec_tools, "rsync");
+    let mut permissions = fs::metadata(&nonexec).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&nonexec, permissions).unwrap();
+    let rsync = write_tool(&valid_tools, "rsync");
+    let path = env::join_paths([&nonexec_tools, &valid_tools]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .args(["init", "peer"])
+        .env("PATH", path)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let source = fs::read_to_string(root.join("seal.toml")).unwrap();
+    assert!(source.contains(&format!("rsync = {:?}", rsync.to_string_lossy())));
+}
+
+#[test]
+fn initialization_refuses_known_conflicts() {
+    let root = test_root("init-conflicts");
+    let tools = root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    write_tool(&tools, "rsync");
+
+    let config_conflict = root.join("config-conflict");
+    fs::create_dir(&config_conflict).unwrap();
+    fs::write(config_conflict.join("seal.toml"), "keep me\n").unwrap();
+    let output = run_seal(&config_conflict, &tools, &["init", "peer"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("configuration already exists"));
+    assert_eq!(
+        fs::read_to_string(config_conflict.join("seal.toml")).unwrap(),
+        "keep me\n"
+    );
+    assert!(!config_conflict.join("mailbox").exists());
+
+    let mailbox_conflict = root.join("mailbox-conflict");
+    fs::create_dir(&mailbox_conflict).unwrap();
+    fs::write(mailbox_conflict.join("mailbox"), "keep me\n").unwrap();
+    let output = run_seal(&mailbox_conflict, &tools, &["init", "peer"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mailbox already exists"));
+    assert!(!mailbox_conflict.join("seal.toml").exists());
+    assert_eq!(
+        fs::read_to_string(mailbox_conflict.join("mailbox")).unwrap(),
+        "keep me\n"
+    );
+}
+
+fn test_root(name: &str) -> PathBuf {
+    let root = env::temp_dir().join(format!("seal-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).unwrap();
+    root
+}
+
+fn run_seal(cwd: &Path, tools: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_seal"))
+        .args(args)
+        .env("PATH", tools)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn write_tool(directory: &Path, name: &str) -> PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path.canonicalize().unwrap()
 }
 #+end_src
