@@ -24,6 +24,8 @@ absolute_init_path :: proc(path: string) -> (string, bool) {
 // END org:block init-output-path-resolution
 // BEGIN org:block init-tool-discovery
 resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
+	// Phase: Prepare owned PATH search entries.
+
 	directories, split_error := os.split_path_list(path_value, context.allocator)
 	if split_error != nil {
 		return "", false
@@ -35,7 +37,10 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 		delete(directories)
 	}
 
+	// Phase: Inspect candidates in PATH order.
+
 	for path_directory in directories {
+		// Form candidate, treating an empty entry as the current directory.
 		directory := path_directory
 		if len(path_directory) == 0 {
 			directory = "."
@@ -44,6 +49,7 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 		if join_error != nil {
 			continue
 		}
+		// Require a regular file executable by the current process.
 		info, stat_error := os.stat(candidate, context.allocator)
 		if stat_error != nil {
 			delete(candidate)
@@ -62,6 +68,7 @@ resolve_path_tool :: proc(name, path_value: string) -> (string, bool) {
 			continue
 		}
 
+		// Resolve the candidate's absolute identity.
 		absolute, absolute_error := os.get_absolute_path(candidate, context.allocator)
 		delete(candidate)
 		if absolute_error == nil {
@@ -164,7 +171,8 @@ initialize_workspace :: proc(
 	selected_path, peer_path, peer_ssh: string,
 	path_value: string,
 ) -> (config_path, mailbox_path, problem: string, ok: bool) {
-	// Preflight paths, peer input, tools, and rendered config before mutation.
+	// Phase: Preflight paths, peer input, tools, and rendered config.
+
 	// Resolve output paths.
 	resolved: bool
 	config_path, resolved = absolute_init_path(selected_path)
@@ -225,7 +233,8 @@ initialize_workspace :: proc(
 		return config_path, mailbox_path, "peer or tool path cannot be represented", false
 	}
 	defer delete(text)
-	// Apply filesystem changes with exclusive write and bounded rollback.
+	// Phase: Apply filesystem changes with bounded rollback.
+
 	// Create mailbox.
 	if directory_error := os.make_directory(mailbox_path); directory_error != nil {
 		return config_path, mailbox_path, "cannot create mailbox directory", false
