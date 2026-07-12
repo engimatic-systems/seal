@@ -6,16 +6,20 @@ This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary files used by Odin and reviewers.
 
 The complete generated-file boundary is =.gitignore=, =seal/main.odin=,
-=seal/config.odin=, =seal/config_syntax.odin=, =seal/main_test.odin=,
-=seal/config_test.odin=, and =seal/config_syntax_test.odin=. Generated files
-identify their source blocks so compiler diagnostics can be mapped back here.
+=seal/main_test.odin=, =seal/config/config.odin=,
+=seal/config/config_document.odin=, =seal/config/config_syntax.odin=,
+=seal/config/config_test.odin=, and =seal/config/config_syntax_test.odin=.
+Generated files identify their source blocks so compiler diagnostics can be
+mapped back here.
 
 Tangle twice, then check, test, and build from the repository root:
 
 #+begin_src sh
 .ephemera/tangle-org.sh SEAL.org
 .ephemera/tangle-org.sh SEAL.org
+nix shell nixpkgs#odin -c odin check seal/config -no-entry-point -vet-style -vet-tabs
 nix shell nixpkgs#odin -c odin check seal -vet-style -vet-tabs
+nix shell nixpkgs#odin -c odin test seal/config -vet-style -vet-tabs
 nix shell nixpkgs#odin -c odin test seal -vet-style -vet-tabs
 nix shell nixpkgs#odin -c odin build seal -out:./seal.bin -vet-style -vet-tabs
 #+end_src
@@ -32,6 +36,32 @@ Build output and local tangle machinery are not source artifacts.
 /seal.bin
 #+end_src
 
+* Configuration package
+
+The =seal/config= package separates tiny line grammar, document construction,
+and caller-facing configuration lifetime into =config_syntax.odin=,
+=config_document.odin=, and =config.odin= respectively.
+
+Dataflow and ownership:
+
+#+begin_example
+load_config -> parse_config -> parse_config_document -> parse_config_syntax_line
+                                      |
+                                      v
+                         Config payloads + Config_State presence
+                                      |
+                                      v
+ required structure -> static semantics -> defaults -> path interpretation
+                                      |
+                                      v
+                                 owned Config
+#+end_example
+
+Syntax and document values are borrowed slices until known fields clone them.
+Repeated known fields clone the last-seen value before releasing prior owned
+storage. Failures return a partial owned =Config= for caller cleanup; errors own
+their path. Environment probing is outside the configuration package.
+
 * Configuration syntax
 
 ** Result types
@@ -40,9 +70,10 @@ Build output and local tangle machinery are not source artifacts.
 assignment. =Config_Syntax_Line= carries that classification plus borrowed key
 and value slices when applicable.
 
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-result-types
-package main
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-result-types
+package config
 
+@(private)
 Config_Syntax_Kind :: enum {
 	Invalid,
 	Blank,
@@ -50,6 +81,7 @@ Config_Syntax_Kind :: enum {
 	Assignment,
 }
 
+@(private)
 Config_Syntax_Line :: struct {
 	kind:  Config_Syntax_Kind,
 	key:   string,
@@ -66,11 +98,13 @@ Config_Syntax_Line :: struct {
 - =valid_config_key=: accepts a nonempty key that starts with an ASCII letter
   and continues with key bytes.
 
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-predicate-helpers
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-predicate-helpers
+@(private)
 is_horizontal_space :: proc(byte_value: byte) -> bool {
 	return byte_value == ' ' || byte_value == '\t'
 }
 
+@(private)
 trim_horizontal_space :: proc(input: string) -> string {
 	start := 0
 	for start < len(input) && is_horizontal_space(input[start]) {
@@ -83,17 +117,20 @@ trim_horizontal_space :: proc(input: string) -> string {
 	return input[start:end]
 }
 
+@(private)
 is_ascii_alpha :: proc(byte_value: byte) -> bool {
 	return byte_value >= 'A' && byte_value <= 'Z' ||
 		byte_value >= 'a' && byte_value <= 'z'
 }
 
+@(private)
 is_key_byte :: proc(byte_value: byte) -> bool {
 	return is_ascii_alpha(byte_value) ||
 		byte_value >= '0' && byte_value <= '9' ||
 		byte_value == '_'
 }
 
+@(private)
 valid_config_key :: proc(input: string) -> bool {
 	if len(input) == 0 || !is_ascii_alpha(input[0]) {
 		return false
@@ -112,7 +149,8 @@ valid_config_key :: proc(input: string) -> bool {
 Precondition: =line= is nonempty and starts with =[=; =parse_table_line=
 validates the closing bracket and ASCII key and returns the borrowed table key.
 
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-table-production
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-table-production
+@(private)
 parse_table_line :: proc(line: string) -> Config_Syntax_Line {
 	if len(line) < 3 || line[len(line) - 1] != ']' {
 		return Config_Syntax_Line{kind = .Invalid}
@@ -137,7 +175,8 @@ Pseudocode:
 3. Scan printable ASCII value bytes while rejecting backslashes.
 4. Accept only a closing double quote at the end of the line.
 
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-assignment-production
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-assignment-production
+@(private)
 parse_assignment_line :: proc(line: string) -> Config_Syntax_Line {
 	i := 0
 	for i < len(line) && is_key_byte(line[i]) {
@@ -185,7 +224,8 @@ parse_assignment_line :: proc(line: string) -> Config_Syntax_Line {
 The dispatcher trims horizontal whitespace, accepts blank lines, selects table
 or assignment production by the first byte, and rejects every other line.
 
-#+begin_src odin :tangle seal/config_syntax.odin :name config-syntax-complete-line-dispatcher
+#+begin_src odin :tangle seal/config/config_syntax.odin :name config-syntax-complete-line-dispatcher
+@(private)
 parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 	line := trim_horizontal_space(input)
 	if len(line) == 0 {
@@ -208,8 +248,8 @@ parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 =Config= owns selected paths and semantic values; =Config_Error= owns its
 diagnostic path and borrows its static message.
 
-#+begin_src odin :tangle seal/config.odin :name config-model-result-error-types
-package main
+#+begin_src odin :tangle seal/config/config.odin :name config-model-result-error-types
+package config
 
 import "core:os"
 import "core:path/filepath"
@@ -239,7 +279,8 @@ Config_Error :: struct {
 =config_error= clones the diagnostic path, and =destroy_config_error= releases
 that clone and clears the result.
 
-#+begin_src odin :tangle seal/config.odin :name config-model-error-lifetime
+#+begin_src odin :tangle seal/config/config.odin :name config-model-error-lifetime
+@(private)
 config_error :: proc(path: string, line: int, message: string) -> Config_Error {
 	return Config_Error{path = strings.clone(path), line = line, message = message}
 }
@@ -259,7 +300,12 @@ destroy_config_error :: proc(problem: ^Config_Error) {
 =Config_Table= records the current assignment scope; =Config_State= records
 field presence while parsing one document.
 
-#+begin_src odin :tangle seal/config.odin :name config-document-parse-state
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-parse-state
+package config
+
+import "core:strings"
+
+@(private)
 Config_Table :: enum {
 	Root,
 	Peer,
@@ -267,6 +313,7 @@ Config_Table :: enum {
 	Debug,
 }
 
+@(private)
 Config_State :: struct {
 	local_mailbox:    bool,
 	peer_path:        bool,
@@ -283,7 +330,8 @@ Config_State :: struct {
 =select_config_table= selects known table names and reports unknown names;
 repeated known headers select that table again.
 
-#+begin_src odin :tangle seal/config.odin :name config-document-table-structure
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-table-structure
+@(private)
 select_config_table :: proc(name: string) -> (Config_Table, string) {
 	switch name {
 	case "peer":
@@ -303,7 +351,8 @@ select_config_table :: proc(name: string) -> (Config_Table, string) {
 =assign_config_value= replaces an owned field with a clone of its last value;
 =assign_config_field= maps known keys in the active table and rejects unknowns.
 
-#+begin_src odin :tangle seal/config.odin :name config-document-field-structure
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-field-structure
+@(private)
 assign_config_value :: proc(destination: ^string, present: ^bool, value: string) -> string {
 	replacement := strings.clone(value)
 	if len(destination^) > 0 {
@@ -314,6 +363,7 @@ assign_config_value :: proc(destination: ^string, present: ^bool, value: string)
 	return ""
 }
 
+@(private)
 assign_config_field :: proc(
 	config: ^Config,
 	state: ^Config_State,
@@ -364,7 +414,8 @@ assign_config_field :: proc(
 =validate_required_fields= reports the first absent structurally required
 field after the complete document has been consumed.
 
-#+begin_src odin :tangle seal/config.odin :name config-document-required-fields
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-required-fields
+@(private)
 validate_required_fields :: proc(state: ^Config_State) -> string {
 	if !state.local_mailbox {
 		return "missing local_mailbox"
@@ -388,7 +439,8 @@ Pseudocode:
 3. Stop at the first syntax, table, or field problem and return its line.
 4. Otherwise return the final physical line number and an empty problem.
 
-#+begin_src odin :tangle seal/config.odin :name config-document-parser
+#+begin_src odin :tangle seal/config/config_document.odin :name config-document-parser
+@(private)
 parse_config_document :: proc(
 	text: string,
 	config: ^Config,
@@ -431,7 +483,8 @@ parse_config_document :: proc(
 
 =valid_debug_flag= accepts the empty flag or one through three verbose flags.
 
-#+begin_src odin :tangle seal/config.odin :name config-semantics-helpers
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-helpers
+@(private)
 valid_debug_flag :: proc(value: string) -> bool {
 	return len(value) == 0 || value == "-v" || value == "-vv" || value == "-vvv"
 }
@@ -446,7 +499,8 @@ Pseudocode:
 3. Require peer SSH and tools SSH together, and reject SSH debug flags locally.
 4. Accept only the debug flag values named by =valid_debug_flag=.
 
-#+begin_src odin :tangle seal/config.odin :name config-semantics-static-validation
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-static-validation
+@(private)
 validate_config_semantics :: proc(config: ^Config, state: ^Config_State) -> string {
 	if len(config.local_mailbox) == 0 || len(config.peer_path) == 0 || len(config.rsync) == 0 {
 		return "required paths must not be empty"
@@ -475,7 +529,8 @@ validate_config_semantics :: proc(config: ^Config, state: ^Config_State) -> stri
 
 =apply_config_defaults= supplies =-v= only for absent applicable debug fields.
 
-#+begin_src odin :tangle seal/config.odin :name config-semantics-defaults
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-defaults
+@(private)
 apply_config_defaults :: proc(config: ^Config, state: ^Config_State) {
 	if !state.rsync_debug_flag {
 		config.rsync_debug_flag = strings.clone("-v")
@@ -491,7 +546,8 @@ apply_config_defaults :: proc(config: ^Config, state: ^Config_State) {
 =resolve_local_path= clones absolute paths or joins relative paths to the
 configuration directory; =resolve_config_paths= retains SSH peer paths verbatim.
 
-#+begin_src odin :tangle seal/config.odin :name config-semantics-path-interpretation
+#+begin_src odin :tangle seal/config/config.odin :name config-semantics-path-interpretation
+@(private)
 resolve_local_path :: proc(directory, path: string) -> string {
 	if filepath.is_abs(path) {
 		return strings.clone(path)
@@ -500,6 +556,7 @@ resolve_local_path :: proc(directory, path: string) -> string {
 	return joined
 }
 
+@(private)
 resolve_config_paths :: proc(config: ^Config) {
 	resolved_mailbox := resolve_local_path(config.directory, config.local_mailbox)
 	delete(config.local_mailbox)
@@ -526,7 +583,8 @@ Pseudocode:
 3. Validate required structure, then semantics, at the line after the document.
 4. Apply defaults, resolve local paths, and return the complete owned result.
 
-#+begin_src odin :tangle seal/config.odin :name config-assembly-parse-interpret
+#+begin_src odin :tangle seal/config/config.odin :name config-assembly-parse-interpret
+@(private)
 parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
 	config := Config{
 		path = strings.clone(path),
@@ -559,7 +617,7 @@ parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bo
 =destroy_config= releases every owned string in a complete or partial result
 and clears the value.
 
-#+begin_src odin :tangle seal/config.odin :name config-lifetime-destruction
+#+begin_src odin :tangle seal/config/config.odin :name config-lifetime-destruction
 destroy_config :: proc(config: ^Config) {
 	values := []string{
 		config.path,
@@ -586,7 +644,7 @@ destroy_config :: proc(config: ^Config) {
 =load_config= owns temporary absolute-path and file-content buffers while
 constructing configuration from the selected file.
 
-#+begin_src odin :tangle seal/config.odin :name config-lifetime-file-loading
+#+begin_src odin :tangle seal/config/config.odin :name config-lifetime-file-loading
 load_config :: proc(selected_path: string) -> (Config, Config_Error, bool) {
 	absolute_path, path_error := os.get_absolute_path(selected_path, context.allocator)
 	if path_error != nil {
@@ -616,6 +674,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import seal_config "config"
 #+end_src
 
 ** Visible constants
@@ -757,10 +816,10 @@ print_debug_flag :: proc(label, value: string) {
 }
 
 run_cfg :: proc(cli: Cli) -> int {
-	config, config_problem, ok := load_config(cli.config)
+	config, config_problem, ok := seal_config.load_config(cli.config)
 	if !ok {
-		defer destroy_config(&config)
-		defer destroy_config_error(&config_problem)
+		defer seal_config.destroy_config(&config)
+		defer seal_config.destroy_config_error(&config_problem)
 		if config_problem.line > 0 {
 			error("configuration", fmt.tprintf(
 				"%s:%d: %s",
@@ -777,7 +836,7 @@ run_cfg :: proc(cli: Cli) -> int {
 		}
 		return 1
 	}
-	defer destroy_config(&config)
+	defer seal_config.destroy_config(&config)
 	if cli.debug {
 		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
 		if cwd_error != nil {
@@ -954,8 +1013,8 @@ test_visible_seed_behavior :: proc(t: ^testing.T) {
 
 Focused syntax tests pin borrowed valid lines and representative rejected forms.
 
-#+begin_src odin :tangle seal/config_syntax_test.odin :name config-syntax-tests
-package main
+#+begin_src odin :tangle seal/config/config_syntax_test.odin :name config-syntax-tests
+package config
 
 import "core:testing"
 
@@ -1001,8 +1060,8 @@ test_config_syntax_rejects_non_contract_forms :: proc(t: ^testing.T) {
 Schema tests cover local and SSH values, scalar debug quiet/default behavior,
 last-seen fields, unknown fields, and syntax errors with source lines.
 
-#+begin_src odin :tangle seal/config_test.odin :name config-schema-tests
-package main
+#+begin_src odin :tangle seal/config/config_test.odin :name config-schema-tests
+package config
 
 import "core:testing"
 

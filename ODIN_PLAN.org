@@ -12,17 +12,20 @@ files are reference material only. Odin work starts from =origin/main= on
 
 * Implementation shape
 
-=SEAL.org= is canonical. It tangles a small executable package under =seal/=,
-following the visible structure of =engimatic-systems/8x16=: explicit package
-files, Odin core-library imports, named constants, direct procedures, nearby
-tests, tabs, =-vet-style=, and =-vet-tabs=. Do not reproduce 8x16 abstractions;
-copy its legible source organization.
+=SEAL.org= is canonical. It tangles small executable and configuration packages
+under =seal/=, following the visible structure of =engimatic-systems/8x16=:
+explicit package files, Odin core-library imports, named constants, direct
+procedures, nearby tests, tabs, =-vet-style=, and =-vet-tabs=. Do not reproduce
+8x16 abstractions; copy its legible source organization.
 
 Expected generated files may include:
 
 - =seal/main.odin=: arguments, command dispatch, diagnostics;
-- =seal/config.odin=: configuration types, subset parser, resolution;
-- =seal/config_test.odin=: consequential parser/config behavior;
+- =seal/config/config.odin=: public configuration, semantics, and lifetime;
+- =seal/config/config_document.odin=: document schema and construction;
+- =seal/config/config_syntax.odin=: borrowed tiny-line recognition;
+- =seal/config/config_test.odin= and =seal/config/config_syntax_test.odin=:
+  consequential package behavior;
 - =seal/transfer.odin=: process plan and rsync invocation once pull exists.
 
 Files appear only when current behavior needs them. No package manager or
@@ -38,10 +41,11 @@ printable ASCII excluding quote and backslash, with no escapes. Complete trimmed
 lines must be consumed. Lists, Unicode, control bytes, trailing syntax, and
 other value forms are rejected.
 
-=seal/config_syntax.odin= recognizes syntax only. =seal/config.odin= owns exact
-tables and keys, table reselection, last-seen field and required-field policy,
-SSH pairing, absolute tool paths, scalar debug whitelist/defaults, and local
-path resolution. There is no
+=seal/config/config_syntax.odin= recognizes syntax only.
+=seal/config/config_document.odin= owns exact tables and keys, table reselection,
+and last-seen and required-field policy. =seal/config/config.odin= owns SSH
+pairing, absolute tool paths, scalar debug whitelist/defaults, path resolution,
+and caller-facing lifetime. There is no
 document model, map, AST, callback framework, serializer framework, backend
 selection, or error aggregation.
 
@@ -66,7 +70,9 @@ Required implementation checks:
 #+begin_src sh
 .ephemera/tangle-org.sh SEAL.org
 .ephemera/tangle-org.sh SEAL.org
+odin check seal/config -no-entry-point -vet-style -vet-tabs
 odin check seal -vet-style -vet-tabs
+odin test seal/config -vet-style -vet-tabs
 odin test seal -vet-style -vet-tabs
 odin build seal -out:./seal.bin -vet-style -vet-tabs
 #+end_src

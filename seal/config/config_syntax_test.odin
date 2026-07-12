@@ -1,5 +1,5 @@
 // BEGIN org:block config-syntax-tests
-package main
+package config
 
 import "core:testing"
 

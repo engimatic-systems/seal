@@ -3,6 +3,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import seal_config "config"
 // END org:block main-package-imports
 // BEGIN org:block visible-constants
 VERSION :: "0.1.0"
@@ -106,10 +107,10 @@ print_debug_flag :: proc(label, value: string) {
 }
 
 run_cfg :: proc(cli: Cli) -> int {
-	config, config_problem, ok := load_config(cli.config)
+	config, config_problem, ok := seal_config.load_config(cli.config)
 	if !ok {
-		defer destroy_config(&config)
-		defer destroy_config_error(&config_problem)
+		defer seal_config.destroy_config(&config)
+		defer seal_config.destroy_config_error(&config_problem)
 		if config_problem.line > 0 {
 			error("configuration", fmt.tprintf(
 				"%s:%d: %s",
@@ -126,7 +127,7 @@ run_cfg :: proc(cli: Cli) -> int {
 		}
 		return 1
 	}
-	defer destroy_config(&config)
+	defer seal_config.destroy_config(&config)
 	if cli.debug {
 		cwd, cwd_error := os.get_absolute_path(".", context.allocator)
 		if cwd_error != nil {

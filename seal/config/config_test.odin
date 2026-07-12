@@ -1,5 +1,5 @@
 // BEGIN org:block config-schema-tests
-package main
+package config
 
 import "core:testing"
 

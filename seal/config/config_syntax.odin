@@ -1,6 +1,7 @@
 // BEGIN org:block config-syntax-result-types
-package main
+package config
 
+@(private)
 Config_Syntax_Kind :: enum {
 	Invalid,
 	Blank,
@@ -8,6 +9,7 @@ Config_Syntax_Kind :: enum {
 	Assignment,
 }
 
+@(private)
 Config_Syntax_Line :: struct {
 	kind:  Config_Syntax_Kind,
 	key:   string,
@@ -15,10 +17,12 @@ Config_Syntax_Line :: struct {
 }
 // END org:block config-syntax-result-types
 // BEGIN org:block config-syntax-predicate-helpers
+@(private)
 is_horizontal_space :: proc(byte_value: byte) -> bool {
 	return byte_value == ' ' || byte_value == '\t'
 }
 
+@(private)
 trim_horizontal_space :: proc(input: string) -> string {
 	start := 0
 	for start < len(input) && is_horizontal_space(input[start]) {
@@ -31,17 +35,20 @@ trim_horizontal_space :: proc(input: string) -> string {
 	return input[start:end]
 }
 
+@(private)
 is_ascii_alpha :: proc(byte_value: byte) -> bool {
 	return byte_value >= 'A' && byte_value <= 'Z' ||
 		byte_value >= 'a' && byte_value <= 'z'
 }
 
+@(private)
 is_key_byte :: proc(byte_value: byte) -> bool {
 	return is_ascii_alpha(byte_value) ||
 		byte_value >= '0' && byte_value <= '9' ||
 		byte_value == '_'
 }
 
+@(private)
 valid_config_key :: proc(input: string) -> bool {
 	if len(input) == 0 || !is_ascii_alpha(input[0]) {
 		return false
@@ -55,6 +62,7 @@ valid_config_key :: proc(input: string) -> bool {
 }
 // END org:block config-syntax-predicate-helpers
 // BEGIN org:block config-syntax-table-production
+@(private)
 parse_table_line :: proc(line: string) -> Config_Syntax_Line {
 	if len(line) < 3 || line[len(line) - 1] != ']' {
 		return Config_Syntax_Line{kind = .Invalid}
@@ -67,6 +75,7 @@ parse_table_line :: proc(line: string) -> Config_Syntax_Line {
 }
 // END org:block config-syntax-table-production
 // BEGIN org:block config-syntax-assignment-production
+@(private)
 parse_assignment_line :: proc(line: string) -> Config_Syntax_Line {
 	i := 0
 	for i < len(line) && is_key_byte(line[i]) {
@@ -109,6 +118,7 @@ parse_assignment_line :: proc(line: string) -> Config_Syntax_Line {
 }
 // END org:block config-syntax-assignment-production
 // BEGIN org:block config-syntax-complete-line-dispatcher
+@(private)
 parse_config_syntax_line :: proc(input: string) -> Config_Syntax_Line {
 	line := trim_horizontal_space(input)
 	if len(line) == 0 {

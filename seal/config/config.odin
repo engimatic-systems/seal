@@ -1,5 +1,5 @@
 // BEGIN org:block config-model-result-error-types
-package main
+package config
 
 import "core:os"
 import "core:path/filepath"
@@ -24,6 +24,7 @@ Config_Error :: struct {
 }
 // END org:block config-model-result-error-types
 // BEGIN org:block config-model-error-lifetime
+@(private)
 config_error :: proc(path: string, line: int, message: string) -> Config_Error {
 	return Config_Error{path = strings.clone(path), line = line, message = message}
 }
@@ -35,149 +36,14 @@ destroy_config_error :: proc(problem: ^Config_Error) {
 	problem^ = {}
 }
 // END org:block config-model-error-lifetime
-// BEGIN org:block config-document-parse-state
-Config_Table :: enum {
-	Root,
-	Peer,
-	Tools,
-	Debug,
-}
-
-Config_State :: struct {
-	local_mailbox:    bool,
-	peer_path:        bool,
-	peer_ssh:         bool,
-	rsync:            bool,
-	ssh:              bool,
-	rsync_debug_flag: bool,
-	ssh_debug_flag:   bool,
-}
-// END org:block config-document-parse-state
-// BEGIN org:block config-document-table-structure
-select_config_table :: proc(name: string) -> (Config_Table, string) {
-	switch name {
-	case "peer":
-		return .Peer, ""
-	case "tools":
-		return .Tools, ""
-	case "debug":
-		return .Debug, ""
-	case:
-		return .Root, "unknown table"
-	}
-}
-// END org:block config-document-table-structure
-// BEGIN org:block config-document-field-structure
-assign_config_value :: proc(destination: ^string, present: ^bool, value: string) -> string {
-	replacement := strings.clone(value)
-	if len(destination^) > 0 {
-		delete(destination^)
-	}
-	destination^ = replacement
-	present^ = true
-	return ""
-}
-
-assign_config_field :: proc(
-	config: ^Config,
-	state: ^Config_State,
-	table: Config_Table,
-	key, value: string,
-) -> string {
-	switch table {
-	case .Root:
-		if key == "local_mailbox" {
-			return assign_config_value(&config.local_mailbox, &state.local_mailbox, value)
-		}
-	case .Peer:
-		switch key {
-		case "path":
-			return assign_config_value(&config.peer_path, &state.peer_path, value)
-		case "ssh":
-			return assign_config_value(&config.peer_ssh, &state.peer_ssh, value)
-		}
-	case .Tools:
-		switch key {
-		case "rsync":
-			return assign_config_value(&config.rsync, &state.rsync, value)
-		case "ssh":
-			return assign_config_value(&config.ssh, &state.ssh, value)
-		}
-	case .Debug:
-		switch key {
-		case "rsync_debug_flags":
-			return assign_config_value(
-				&config.rsync_debug_flag,
-				&state.rsync_debug_flag,
-				value,
-			)
-		case "ssh_debug_flags":
-			return assign_config_value(
-				&config.ssh_debug_flag,
-				&state.ssh_debug_flag,
-				value,
-			)
-		}
-	}
-	return "unknown key in current table"
-}
-// END org:block config-document-field-structure
-// BEGIN org:block config-document-required-fields
-validate_required_fields :: proc(state: ^Config_State) -> string {
-	if !state.local_mailbox {
-		return "missing local_mailbox"
-	}
-	if !state.peer_path {
-		return "missing peer.path"
-	}
-	if !state.rsync {
-		return "missing tools.rsync"
-	}
-	return ""
-}
-// END org:block config-document-required-fields
-// BEGIN org:block config-document-parser
-parse_config_document :: proc(
-	text: string,
-	config: ^Config,
-	state: ^Config_State,
-) -> (line_number: int, problem: string) {
-	table := Config_Table.Root
-	remaining := text
-	line_number = 0
-	for {
-		line, ok := strings.split_lines_iterator(&remaining)
-		if !ok {
-			break
-		}
-		line_number += 1
-		parsed := parse_config_syntax_line(line)
-		switch parsed.kind {
-		case .Blank:
-			continue
-		case .Table:
-			table, problem = select_config_table(parsed.key)
-			if len(problem) > 0 {
-				return line_number, problem
-			}
-		case .Assignment:
-			problem = assign_config_field(config, state, table, parsed.key, parsed.value)
-			if len(problem) > 0 {
-				return line_number, problem
-			}
-		case .Invalid:
-			return line_number, "invalid configuration syntax"
-		}
-	}
-	return line_number, ""
-}
-// END org:block config-document-parser
 // BEGIN org:block config-semantics-helpers
+@(private)
 valid_debug_flag :: proc(value: string) -> bool {
 	return len(value) == 0 || value == "-v" || value == "-vv" || value == "-vvv"
 }
 // END org:block config-semantics-helpers
 // BEGIN org:block config-semantics-static-validation
+@(private)
 validate_config_semantics :: proc(config: ^Config, state: ^Config_State) -> string {
 	if len(config.local_mailbox) == 0 || len(config.peer_path) == 0 || len(config.rsync) == 0 {
 		return "required paths must not be empty"
@@ -202,6 +68,7 @@ validate_config_semantics :: proc(config: ^Config, state: ^Config_State) -> stri
 }
 // END org:block config-semantics-static-validation
 // BEGIN org:block config-semantics-defaults
+@(private)
 apply_config_defaults :: proc(config: ^Config, state: ^Config_State) {
 	if !state.rsync_debug_flag {
 		config.rsync_debug_flag = strings.clone("-v")
@@ -212,6 +79,7 @@ apply_config_defaults :: proc(config: ^Config, state: ^Config_State) {
 }
 // END org:block config-semantics-defaults
 // BEGIN org:block config-semantics-path-interpretation
+@(private)
 resolve_local_path :: proc(directory, path: string) -> string {
 	if filepath.is_abs(path) {
 		return strings.clone(path)
@@ -220,6 +88,7 @@ resolve_local_path :: proc(directory, path: string) -> string {
 	return joined
 }
 
+@(private)
 resolve_config_paths :: proc(config: ^Config) {
 	resolved_mailbox := resolve_local_path(config.directory, config.local_mailbox)
 	delete(config.local_mailbox)
@@ -232,6 +101,7 @@ resolve_config_paths :: proc(config: ^Config) {
 }
 // END org:block config-semantics-path-interpretation
 // BEGIN org:block config-assembly-parse-interpret
+@(private)
 parse_config :: proc(text, path, directory: string) -> (Config, Config_Error, bool) {
 	config := Config{
 		path = strings.clone(path),
