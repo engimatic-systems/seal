@@ -4,41 +4,84 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) local_mailbox: PathBuf,
     pub(crate) peer: Peer,
     pub(crate) tools: Tools,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DebugConfig::is_empty")]
     pub(crate) debug: DebugConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Peer {
     pub(crate) path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tools {
     pub(crate) rsync: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh: Option<PathBuf>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DebugConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rsync_debug_flags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh_debug_flags: Option<Vec<String>>,
 }
 
+impl DebugConfig {
+    fn is_empty(&self) -> bool {
+        self.rsync_debug_flags.is_none() && self.ssh_debug_flags.is_none()
+    }
+}
+
 impl Config {
+    pub(crate) fn initialized(
+        peer_path: PathBuf,
+        peer_ssh: Option<String>,
+        rsync: PathBuf,
+        ssh: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            local_mailbox: PathBuf::from("mailbox"),
+            peer: Peer {
+                path: peer_path,
+                ssh: peer_ssh,
+            },
+            tools: Tools { rsync, ssh },
+            debug: DebugConfig::default(),
+        }
+    }
+
+    pub(crate) fn to_toml(&self) -> Result<String, String> {
+        self.validate()
+            .map_err(|error| format!("invalid initial configuration: {error}"))?;
+        toml::to_string_pretty(self)
+            .map_err(|error| format!("cannot serialize configuration: {error}"))
+    }
+
     fn validate(&self) -> Result<(), String> {
+        if self.local_mailbox.as_os_str().is_empty() {
+            return Err("local_mailbox must not be empty".into());
+        }
+        if self.peer.path.as_os_str().is_empty() {
+            return Err("peer.path must not be empty".into());
+        }
+        if matches!(self.peer.ssh.as_deref(), Some("")) {
+            return Err("peer.ssh must not be empty".into());
+        }
         if !self.tools.rsync.is_absolute() {
             return Err("tools.rsync must be an absolute path".into());
         }
@@ -93,28 +136,35 @@ pub(crate) struct LoadedConfig {
 
 pub(crate) fn load_config(
     cwd: &Path,
-    explicit_path: Option<&Path>,
+    requested_config_path: Option<&Path>,
 ) -> Result<LoadedConfig, String> {
-    let (config_path, selection) = match explicit_path {
+    let (resolved_config_path, selection) = match requested_config_path {
         Some(path) if path.is_absolute() => (path.to_path_buf(), "explicit --config PATH"),
         Some(path) => (cwd.join(path), "explicit --config PATH"),
         None => (cwd.join("seal.toml"), "default ./seal.toml"),
     };
-    let source = fs::read_to_string(&config_path).map_err(|error| {
+    let source = fs::read_to_string(&resolved_config_path).map_err(|error| {
         format!(
             "cannot read configuration {}: {error}",
-            config_path.display()
+            resolved_config_path.display()
         )
     })?;
-    let config: Config = toml::from_str(&source)
-        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
-    config
-        .validate()
-        .map_err(|error| format!("invalid configuration {}: {error}", config_path.display()))?;
+    let config: Config = toml::from_str(&source).map_err(|error| {
+        format!(
+            "invalid configuration {}: {error}",
+            resolved_config_path.display()
+        )
+    })?;
+    config.validate().map_err(|error| {
+        format!(
+            "invalid configuration {}: {error}",
+            resolved_config_path.display()
+        )
+    })?;
 
     Ok(LoadedConfig {
         config,
-        path: config_path,
+        path: resolved_config_path,
         selection,
     })
 }
