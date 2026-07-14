@@ -258,7 +258,7 @@ fn initialization_refuses_known_conflicts() {
 }
 
 #[test]
-fn exact_local_and_ssh_pull_plans() {
+fn exact_transfer_plans() {
     let root = test_root("pull-plans");
     let tools = root.join("tools");
     fs::create_dir(&tools).unwrap();
@@ -298,6 +298,31 @@ fn exact_local_and_ssh_pull_plans() {
         String::from_utf8_lossy(&local_output.stderr).contains(&format!(
             "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
             rsync, local_args
+        ))
+    );
+
+    let push_output = run_seal(&local, &tools, &["--debug", "push", "--dry-run"]);
+    assert_success(&push_output);
+    let push_args = vec![
+        "--recursive".to_string(),
+        "--links".to_string(),
+        "--perms".to_string(),
+        "--times".to_string(),
+        "--checksum".to_string(),
+        "-vv".to_string(),
+        "--dry-run".to_string(),
+        "--".to_string(),
+        format!("{}/mailbox/", local.display()),
+        format!("{}/peer/", local.display()),
+    ];
+    assert_eq!(
+        String::from_utf8_lossy(&push_output.stdout),
+        format!("{}\n", push_args.join("\n"))
+    );
+    assert!(
+        String::from_utf8_lossy(&push_output.stderr).contains(&format!(
+            "[debug] :: rsync executable: {:?}\n[debug] :: rsync argv: {:?}\n",
+            rsync, push_args
         ))
     );
 
@@ -455,6 +480,47 @@ fn real_local_pull_preserves_symlink() {
     assert_eq!(
         fs::read_link(destination.join("link.txt")).unwrap(),
         PathBuf::from("target.txt")
+    );
+}
+
+#[test]
+fn real_local_push_retains_destination_only_entry() {
+    let root = test_root("real-push");
+    let source = root.join("mailbox");
+    let destination = root.join("peer");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("pushed.txt"), "local mailbox bytes\n").unwrap();
+    fs::write(destination.join("retained.txt"), "peer-only bytes\n").unwrap();
+
+    let rsync = env::split_paths(&env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("rsync"))
+        .find(|candidate| candidate.is_file())
+        .expect("rsync must be present for the real transfer fixture")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        root.join("seal.toml"),
+        format!(
+            "local_mailbox = \"mailbox\"\n\n[peer]\npath = \"peer\"\n\n[tools]\nrsync = {:?}\n",
+            rsync.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seal"))
+        .arg("push")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(destination.join("pushed.txt")).unwrap(),
+        "local mailbox bytes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("retained.txt")).unwrap(),
+        "peer-only bytes\n"
     );
 }
 
