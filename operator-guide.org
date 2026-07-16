@@ -1,0 +1,231 @@
+#+title: Seal v0.1 spike operator guide
+#+date: 2026-07-16
+#+options: toc:2 num:nil
+
+* Status
+
+This guide tells an operator how to exercise the experimental one-shot command
+broker on the =seal-v0.1= branch.
+
+The broker is a manual spike, not a daemon or hardened security boundary.  Each
+invocation considers at most one proposal.  Operator review remains the
+authorization decision.
+
+The agent-facing workflow is recorded separately in [[file:contract.org][contract.org]].  Copy that
+file into the mailbox so an agent can discover the current convention.
+
+* Requirements
+
+Run the spike on Linux with:
+
+- a built =seal= binary;
+- Bash and ordinary GNU userland tools;
+- =bwrap=;
+- =rsync=;
+- =vi=; and
+- Python 3 with =tomllib=.
+
+An SSH-backed peer also requires =ssh=.  =seal init= records absolute paths to
+the =rsync= and =ssh= executables it discovers, so initialize from the intended
+operator environment.
+
+Keep =seal-exec.sh= outside the mailbox.  Run it from the root of an operator
+workspace containing =seal.toml= and =mailbox/=.
+
+* Build the spike
+
+From the Seal source checkout:
+
+#+begin_src bash
+git switch seal-v0.1
+cargo build
+
+SEAL_SOURCE="$(pwd)"
+SEAL="$SEAL_SOURCE/target/debug/seal"
+BROKER="$SEAL_SOURCE/seal-exec.sh"
+CONTRACT="$SEAL_SOURCE/contract.org"
+#+end_src
+
+Keep these shell variables available for the commands below, or replace them
+with absolute paths.  Reconcile the repository's expected tool environment
+before building when Cargo is not already available.
+
+* Create an operator workspace
+
+Choose an empty directory outside both the source checkout and agent mailbox:
+
+#+begin_src bash
+mkdir -p /path/to/operator-workspace
+cd /path/to/operator-workspace
+#+end_src
+
+Ensure the peer mailbox directory already exists and is reachable.  For a
+local peer:
+
+#+begin_src bash
+"$SEAL" init /path/to/agent-mailbox
+#+end_src
+
+For a peer reached through an existing SSH destination:
+
+#+begin_src bash
+"$SEAL" init /path/on/agent-host/mailbox --ssh agent-alias
+#+end_src
+
+Initialization creates exactly:
+
+#+begin_example
+operator-workspace/
+  seal.toml
+  mailbox/
+#+end_example
+
+It refuses an existing configuration or local mailbox rather than adopting
+one.  Inspect the effective coordinates and pinned tools with:
+
+#+begin_src bash
+"$SEAL" cfg
+#+end_src
+
+* Publish the agent contract
+
+First hydrate the local mailbox from the peer.  Then add the contract to the
+local copy and push it:
+
+#+begin_src bash
+"$SEAL" pull
+cp "$CONTRACT" mailbox/contract.org
+"$SEAL" push
+#+end_src
+
+The committed =contract.org= is the reference record.  Its mailbox copy is
+agent-readable guidance and may be replaced as this experiment changes.
+
+* Execute one proposal
+
+The agent publishes a proposal with this minimum shape:
+
+#+begin_example
+mailbox/
+  ready/
+    <command-id>/
+      command.sh
+#+end_example
+
+From the operator workspace root, run:
+
+#+begin_src bash
+cd /path/to/operator-workspace
+SEAL_BIN="$SEAL" "$BROKER" run
+#+end_src
+
+=run= is the default, so omitting it has the same effect:
+
+#+begin_src bash
+SEAL_BIN="$SEAL" "$BROKER"
+#+end_src
+
+The broker performs this cycle:
+
+#+begin_example
+seal pull
+  -> choose newest unclaimed ready command
+  -> move ready/<id> to claimed/<id>
+  -> show ID, SHA-256 digest, line count, and numbered script
+  -> ask operator
+       yes   -> execute
+       edit  -> open vi, then show and ask again
+       other -> refuse
+  -> write disposition and captured output
+  -> seal push
+#+end_example
+
+The script warns when =command.sh= exceeds 40 lines.  The warning does not
+prevent execution.
+
+Typing =edit= changes the proposal under review.  After editing, review the
+redisplayed bytes and digest; the result records =edited= as =true=.
+
+One invocation handles at most one command.  Invoke the broker again when
+another command is ready.  If nothing is ready, it reports that fact and exits
+without pushing.
+
+* Inspect results
+
+After disposition:
+
+#+begin_example
+mailbox/
+  claimed/
+    <command-id>/
+      command.sh
+      result.toml
+      ...ad-hoc command files...
+  output/
+    <command-id>.out
+    <command-id>.err
+  world/
+    ...persistent working state...
+#+end_example
+
+=result.toml= reports =refused=, =invalid=, =started=, or =completed=.  For a
+completed attempt, inspect =exit_code= rather than treating completion as
+success.
+
+Standard output and standard error are displayed during execution and retained
+in =output/=.  After a successful result push, the broker returns the proposed
+command's exit code.
+
+Ordinary Seal synchronization does not propagate deletion.  The peer may
+therefore retain =ready/<id>/= after the operator has claimed it.  Presence of
+=claimed/<id>/= wins, and the broker will not execute that duplicate.
+
+* Execution boundary
+
+Approved =command.sh= runs under =bwrap= with:
+
+- =mailbox/world/= as current directory;
+- the whole mailbox writable;
+- the approved command snapshot mounted read-only at its claimed path;
+- the rest of the host filesystem mounted read-only;
+- =TMPDIR= set to =mailbox/world/.tmp=;
+- the operator's inherited environment; and
+- network access unchanged.
+
+This prevents ordinary host-filesystem writes outside the mailbox.  It does
+not prevent reading host files visible in the namespace, using inherited
+credentials, reaching the network, or mutating external systems.  Inspect for
+those effects before typing =yes=.
+
+Everything written under the mailbox may be transported back to the agent.
+Do not expose secrets through scripts, output, or ad-hoc result files.
+
+* Purge pending proposals
+
+To remove every currently visible unclaimed proposal:
+
+#+begin_src bash
+cd /path/to/operator-workspace
+SEAL_BIN="$SEAL" "$BROKER" purge
+#+end_src
+
+The broker pulls first, displays the scope, and requires the literal response
+=purge=.  It removes local =ready/= and performs a deleting rsync scoped to peer
+=ready/= only.  It does not remove =claimed/=, =output/=, or =world/=.
+
+Purge has no queue lock.  A proposal added by the agent during the pull/delete
+window may be destroyed.  Coordinate before purging.
+
+* Interrupted attempts
+
+Execution records local attempt state under:
+
+#+begin_example
+operator-workspace/.seal-exec/attempts/<command-id>/
+#+end_example
+
+If execution or transport is interrupted, do not infer non-execution from an
+absent remote result.  Inspect local attempt state, =claimed/<id>/result.toml=,
+captured output, persistent world state, and any external system affected by
+the command.  Do not resubmit an effectful operation until its outcome is
+known.
