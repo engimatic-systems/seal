@@ -72,12 +72,27 @@ SH
   cat >"$directory/vi" <<'SH'
 #!/usr/bin/env bash
 cat >"$1" <<'COMMAND'
-#!/usr/bin/env bash
-printf 'edited command\n'
+argv = ["argv-probe", "edited command"]
 COMMAND
 SH
 
-  chmod +x "$directory/seal" "$directory/bwrap" "$directory/vi"
+  cat >"$directory/argv-probe" <<'SH'
+#!/usr/bin/env bash
+printf 'ambient=<%s>\n' "$AMBIENT_TEST_VALUE"
+index=0
+for argument in "$@"; do
+  printf 'arg[%s]=<%s>\n' "$index" "$argument"
+  ((index += 1))
+done
+printf 'command stderr\n' >&2
+printf 'artifact\n' > artifact.txt
+SH
+
+  chmod +x \
+    "$directory/seal" \
+    "$directory/bwrap" \
+    "$directory/vi" \
+    "$directory/argv-probe"
 }
 
 write_local_config() {
@@ -105,6 +120,7 @@ run_spike() {
     PATH="$tools:$PATH" \
       SEAL_TEST_LOG="$workspace/seal.log" \
       BWRAP_TEST_LOG="$workspace/bwrap.log" \
+      AMBIENT_TEST_VALUE="ambient value" \
       "$SCRIPT" run <<<"$input"
   ) >"$transcript" 2>&1
 }
@@ -116,25 +132,34 @@ workspace="$TEST_ROOT/run"
 peer="$TEST_ROOT/run-peer"
 mkdir -p "$workspace/mailbox/ready/20260716-001" "$peer"
 write_local_config "$workspace" "$peer"
-{
-  printf '#!/usr/bin/env bash\n'
-  for number in $(seq 1 40); do
-    printf '# review line %s\n' "$number"
-  done
-  printf 'printf "command stdout\\n"\n'
-  printf 'printf "command stderr\\n" >&2\n'
-  printf 'printf "artifact\\n" > artifact.txt\n'
-} >"$workspace/mailbox/ready/20260716-001/command.sh"
+cat >"$workspace/mailbox/ready/20260716-001/command.toml" <<'TOML'
+argv = [
+  "argv-probe",
+  "two words",
+  "*",
+  "$(printf injected)",
+  "",
+]
+TOML
 
 run_spike "$workspace" "$tools" yes "$workspace/transcript"
 [[ ! -e "$workspace/mailbox/ready/20260716-001" ]] || fail "ready command survived claim"
-[[ -f "$workspace/mailbox/claimed/20260716-001/command.sh" ]] || fail "command was not claimed"
-[[ -f "$workspace/.seal-exec/attempts/20260716-001/command.sh" ]] || fail "approved snapshot missing"
-assert_file_contains "$workspace/transcript" "review threshold is 40"
-assert_file_contains "$workspace/mailbox/output/20260716-001.out" "command stdout"
+[[ -f "$workspace/mailbox/claimed/20260716-001/command.toml" ]] || fail "command was not claimed"
+[[ -f "$workspace/.seal-exec/attempts/20260716-001/command.toml" ]] || fail "approved snapshot missing"
+assert_file_contains "$workspace/transcript" "parsed argv:"
+assert_file_contains "$workspace/mailbox/output/20260716-001.out" "ambient=<ambient value>"
+assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[0]=<two words>"
+assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[1]=<*>"
+assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[2]=<\$(printf injected)>"
+assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[3]=<>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.err" "command stderr"
 assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'status = "completed"'
 assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'exit_code = 0'
+approved_digest="$(sha256sum "$workspace/.seal-exec/attempts/20260716-001/command.toml")"
+approved_digest="${approved_digest%% *}"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-001/result.toml" \
+  "command_sha256 = \"$approved_digest\""
 assert_file_contains "$workspace/mailbox/world/artifact.txt" "artifact"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
 
@@ -142,13 +167,31 @@ workspace="$TEST_ROOT/edit"
 peer="$TEST_ROOT/edit-peer"
 mkdir -p "$workspace/mailbox/ready/20260716-002" "$peer"
 write_local_config "$workspace" "$peer"
-cat >"$workspace/mailbox/ready/20260716-002/command.sh" <<'SH'
-#!/usr/bin/env bash
-printf 'original command\n'
-SH
+printf 'argv = ["argv-probe", "original command"]\n' \
+  >"$workspace/mailbox/ready/20260716-002/command.toml"
 run_spike "$workspace" "$tools" $'edit\nyes' "$workspace/transcript"
-assert_file_contains "$workspace/mailbox/output/20260716-002.out" "edited command"
+assert_file_contains "$workspace/mailbox/output/20260716-002.out" "arg[0]=<edited command>"
 assert_file_contains "$workspace/mailbox/claimed/20260716-002/result.toml" 'edited = true'
+
+workspace="$TEST_ROOT/invalid"
+peer="$TEST_ROOT/invalid-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-003" "$peer"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-003/command.toml" <<'TOML'
+argv = ["argv-probe"]
+cwd = "/tmp"
+TOML
+set +e
+run_spike "$workspace" "$tools" no "$workspace/transcript"
+invalid_status=$?
+set -e
+[[ "$invalid_status" -eq 1 ]] || fail "invalid command did not fail run"
+assert_file_contains "$workspace/transcript" "exactly one top-level argv key"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-003/result.toml" \
+  'status = "invalid"'
+[[ ! -e "$workspace/.seal-exec/attempts/20260716-003" ]] ||
+  fail "invalid command created an attempt"
 
 workspace="$TEST_ROOT/supersede"
 peer="$TEST_ROOT/supersede-peer"
@@ -157,15 +200,15 @@ mkdir -p \
   "$workspace/mailbox/ready/20260716-011" \
   "$peer"
 write_local_config "$workspace" "$peer"
-printf 'printf "old command\\n"\n' \
-  >"$workspace/mailbox/ready/20260716-010/command.sh"
-printf 'printf "new command\\n"\n' \
-  >"$workspace/mailbox/ready/20260716-011/command.sh"
+printf 'argv = ["argv-probe", "old command"]\n' \
+  >"$workspace/mailbox/ready/20260716-010/command.toml"
+printf 'argv = ["argv-probe", "new command"]\n' \
+  >"$workspace/mailbox/ready/20260716-011/command.toml"
 touch -d @100 "$workspace/mailbox/ready/20260716-010"
 touch -d @200 "$workspace/mailbox/ready/20260716-011"
 run_spike "$workspace" "$tools" yes "$workspace/transcript"
 assert_file_contains "$workspace/transcript" "multiple unclaimed proposals"
-assert_file_contains "$workspace/mailbox/output/20260716-011.out" "new command"
+assert_file_contains "$workspace/mailbox/output/20260716-011.out" "arg[0]=<new command>"
 [[ ! -e "$workspace/mailbox/output/20260716-010.out" ]] ||
   fail "superseded command produced output"
 assert_file_contains \
@@ -189,20 +232,15 @@ printf '%s\n' "$count" >"$SLEEP_TEST_LOG"
 if (( count >= 2 )); then
   exit 77
 fi
+mkdir -p "$WATCH_READY/20260716-021"
+printf 'argv = ["argv-probe", "second command"]\n' \
+  >"$WATCH_READY/20260716-021/command.toml"
 exit 0
 SH
 chmod +x "$watch_tools/sleep"
 write_local_config "$workspace" "$peer"
-cat >"$workspace/mailbox/ready/20260716-020/command.sh" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-mkdir -p ../ready/20260716-021
-cat >../ready/20260716-021/command.sh <<'NEXT'
-#!/usr/bin/env bash
-printf 'second command\n'
-NEXT
-printf 'first command\n'
-SH
+printf 'argv = ["argv-probe", "first command"]\n' \
+  >"$workspace/mailbox/ready/20260716-020/command.toml"
 set +e
 (
   cd "$workspace"
@@ -210,6 +248,8 @@ set +e
     SEAL_TEST_LOG="$workspace/seal.log" \
     BWRAP_TEST_LOG="$workspace/bwrap.log" \
     SLEEP_TEST_LOG="$workspace/sleep.log" \
+    WATCH_READY="$workspace/mailbox/ready" \
+    AMBIENT_TEST_VALUE="watch ambient" \
     "$SCRIPT" watch <<'ANSWERS'
 yes
 yes
@@ -219,8 +259,8 @@ watch_status=$?
 set -e
 [[ "$watch_status" -eq 77 ]] || fail "watch did not complete two polling waits"
 assert_file_contains "$workspace/transcript" "watching for one proposal at a time"
-assert_file_contains "$workspace/mailbox/output/20260716-020.out" "first command"
-assert_file_contains "$workspace/mailbox/output/20260716-021.out" "second command"
+assert_file_contains "$workspace/mailbox/output/20260716-020.out" "arg[0]=<first command>"
+assert_file_contains "$workspace/mailbox/output/20260716-021.out" "arg[0]=<second command>"
 assert_file_contains \
   "$workspace/mailbox/claimed/20260716-020/result.toml" \
   'status = "completed"'
@@ -266,8 +306,8 @@ printf 'peer old world\n' >"$peer/world/old.txt"
 printf 'old result\n' >"$peer/claimed/old/result.toml"
 printf 'old output\n' >"$peer/output/old.out"
 printf 'evidence\n' >"$workspace/.seal-exec/attempts/evidence/result.toml"
-printf 'one\n' >"$peer/ready/one/command.sh"
-printf 'two\n' >"$peer/ready/two/command.sh"
+printf 'argv = ["true"]\n' >"$peer/ready/one/command.toml"
+printf 'argv = ["true"]\n' >"$peer/ready/two/command.toml"
 write_local_config "$workspace" "$peer"
 (
   cd "$workspace"
@@ -293,15 +333,23 @@ if [[ -n "${SEAL_E2E_BIN:-}" ]]; then
   peer="$TEST_ROOT/real-peer"
   mkdir -p "$workspace/mailbox" "$peer/ready/20260716-real"
   write_local_config "$workspace" "$peer"
-  cat >"$peer/ready/20260716-real/command.sh" <<'SH'
-#!/usr/bin/env bash
+  cat >"$peer/ready/20260716-real/command.toml" <<'TOML'
+argv = [
+  "sh",
+  "-c",
+  '''
 printf 'real stdout\n'
 printf 'real stderr\n' >&2
 printf 'real artifact\n' > real-artifact.txt
-SH
+printf '%s\n' "$SEAL_E2E_AMBIENT" > ambient.txt
+''',
+]
+TOML
   if ! (
     cd "$workspace"
-    SEAL_BIN="$SEAL_E2E_BIN" "$SCRIPT" run <<<'yes'
+    SEAL_BIN="$SEAL_E2E_BIN" \
+      SEAL_E2E_AMBIENT="real ambient" \
+      "$SCRIPT" run <<<'yes'
   ) >"$workspace/transcript" 2>&1; then
     cat "$workspace/transcript" >&2
     fail "real Seal/bwrap spike failed"
@@ -309,6 +357,7 @@ SH
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"
   assert_file_contains "$workspace/mailbox/world/real-artifact.txt" "real artifact"
+  assert_file_contains "$workspace/mailbox/world/ambient.txt" "real ambient"
   assert_file_contains "$peer/claimed/20260716-real/result.toml" 'status = "completed"'
   assert_file_contains "$peer/output/20260716-real.out" "real stdout"
   assert_file_contains "$peer/world/real-artifact.txt" "real artifact"

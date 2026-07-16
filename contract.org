@@ -22,10 +22,10 @@ mailbox/
   contract.org
   ready/
     <command-id>/
-      command.sh
+      command.toml
   claimed/
     <command-id>/
-      command.sh
+      command.toml
       result.toml
       ...files written by the command...
   output/
@@ -68,7 +68,7 @@ short description is useful:
 20260716T151500Z-clone-terraform
 #+end_example
 
-Create one regular, non-symlink =command.sh=.  Prepare the directory outside
+Create one regular, non-symlink =command.toml=.  Prepare the directory outside
 =ready/= when practical, then rename it into =ready/= only after all proposed
 files are complete.  The current transport is not a transactional queue; this
 staging convention merely reduces partial proposals.
@@ -76,28 +76,34 @@ staging convention merely reduces partial proposals.
 Do not modify a command after publishing it.  A changed request should receive
 a new ID.
 
-** Write =command.sh=
+** Write =command.toml=
 
-=command.sh= is arbitrary Bash interpreted by the operator-side Bash.  Prefer
-one small, independently consequential operation that the operator can review
-and that a later command can correct.  A few sequenced shell operations remain
-appropriate when they form one intelligible effect.  Prefer:
+=command.toml= contains exactly one top-level key: a nonempty array named
+=argv=.  Every element must be a string, and =argv[0]= must not be empty:
 
-#+begin_src bash
-#!/usr/bin/env bash
-set -euo pipefail
+#+begin_src toml
+argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
 #+end_src
 
-Make intended effects and important checks visible in comments and output.
-Use explicit paths and refuse surprising state when a cheap guard exists.
+The broker preserves argument boundaries and executes this vector directly.
+It does not apply shell splitting, expansion, interpolation, redirection, or
+pipeline syntax.  Characters such as spaces, glob metacharacters, dollar
+signs, and quotes remain part of their containing argument.
 
-Seal warns, but does not refuse, when =command.sh= exceeds 40 lines.  Do not
-move consequential logic into opaque helpers merely to evade that warning.  If
-the command delegates, name the delegated files plainly so the operator knows
-what else to inspect.
+Bare executable names resolve through the inherited =PATH=.  If shell semantics
+are genuinely the intended command, name the shell explicitly:
+
+#+begin_src toml
+argv = ["bash", "-lc", "printf '%s\\n' \"$VALUE\" > result.txt"]
+#+end_src
+
+Prefer one small, independently consequential operation that the operator can
+review and that a later command can correct.  Use TOML comments to explain
+intent or cheap preconditions.  Do not add fields for cwd, environment,
+redirection, or sequencing; the current broker rejects unknown top-level keys.
 
 Do not assume that publication implies approval.  The operator may decline or
-edit the script.
+edit the TOML.
 
 ** Wait for disposition
 
@@ -109,15 +115,17 @@ If several unclaimed proposals appear together, the newest is the only one
 reviewed.  Every older proposal moves to =claimed/= with a =superseded= result
 naming the winning command.  Do not treat the mailbox as a backlog.
 
-The operator sees numbered =command.sh= lines, the line count, and a SHA-256
-digest.  The operator then chooses:
+The broker snapshots and parses =command.toml=.  The operator sees its numbered
+exact bytes, a SHA-256 digest, and every parsed argument rendered separately.
+The operator then chooses:
 
-- =yes=: execute the displayed script;
-- =edit=: edit it in =vi=, redisplay it, and decide again; or
+- =yes=: execute the displayed argv;
+- =edit=: edit it in =vi=, reparse, redisplay, and decide again; or
 - anything else: refuse it.
 
 Editing changes the executed proposal.  Inspect =edited= and the claimed
-=command.sh= when interpreting the result.
+=command.toml= when interpreting the result.  Invalid TOML cannot reach =yes=;
+the operator may edit it or reject it with an =invalid= result.
 
 ** Read the result
 
@@ -142,7 +150,7 @@ exit_code = 0
 Known status values in the spike are:
 
 - =refused=: operator did not authorize execution;
-- =invalid=: claimed directory lacked a regular, non-symlink =command.sh=;
+- =invalid=: =command.toml= was missing, non-regular, or failed argv validation;
 - =superseded=: a newer proposal won when several were outstanding;
 - =started=: execution began but the local result has not reached completion;
 - =completed=: the process exited; inspect =exit_code= for success or failure.
@@ -162,14 +170,15 @@ mechanically.
 
 * Execution world
 
-The proposed script runs with:
+The proposed argv runs with:
 
 - current directory =mailbox/world/=;
-- the operator's inherited environment, including any active =mise= context;
+- the broker's inherited environment as captured when the watch process
+  started, including =PATH=, credentials, and any active =mise= context;
 - =TMPDIR= set to =mailbox/world/.tmp=;
 - the host filesystem mounted read-only;
 - the whole mailbox mounted writable;
-- the approved =command.sh= snapshot mounted read-only over its claimed path;
+- the approved =command.toml= snapshot mounted read-only over its claimed path;
   and
 - ordinary network access unchanged.
 
@@ -190,24 +199,26 @@ the safety decision in this experiment.
 Avoid printing credentials or copying secrets into mailbox files.  Everything
 under the mailbox may return to the agent side.
 
+Ambient environment values are not serialized into the proposal or result.
+Changes made in another shell, or environment configuration created after the
+watch process starts, do not update that running process.  Ask the operator to
+restart watch from a reconciled environment when freshness matters.
+
 * Example: establish repository state
 
-The agent might publish:
+The agent might first publish:
 
-#+begin_src bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ ! -d terraform/.git ]]; then
-  git clone https://example.invalid/terraform.git terraform
-fi
-
-git -C terraform fetch origin
-git -C terraform status --short --branch
+#+begin_src toml
+argv = ["git", "clone", "--", "https://example.invalid/terraform.git", "terraform"]
 #+end_src
 
-A later command can run inside that persistent checkout by using explicit
-paths, for example =tofu -chdir=terraform plan=.  Repository state remains an
+After observing that result, a later proposal can inspect persistent state:
+
+#+begin_src toml
+argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
+#+end_src
+
+Another can run =tofu -chdir=terraform plan=.  Repository state remains an
 implicit part of the operator-understood world; Seal does not attest Git
 semantics in this spike.
 
@@ -228,7 +239,7 @@ new unique command ID.
 This spike does not provide:
 
 - agent-side polling, scheduling, or notification;
-- command-language validation or a claim that reviewed code is safe;
+- semantic command-safety validation or a claim that reviewed argv is safe;
 - isolation from network or external credentialed effects;
 - transactional shared-directory queue semantics;
 - reliable deletion propagation during ordinary claim;

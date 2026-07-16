@@ -546,6 +546,54 @@ the reset.
 This operation deliberately destroys history and world state.  It still has no
 distributed lock, so operator and agent must coordinate quiescence around it.
 
+** Current argv experiment
+
+*** Pressure away from implicit shell
+
+The fail-forward dialogue points back toward tiny commands and away from heavy
+scripts.  Once sequencing moves into successive observed turns, arbitrary Bash
+is no longer the natural default proposal language.  Its splitting, expansion,
+redirection, and control flow enlarge the attestation surface even when the
+intended consequence is one ordinary process invocation.
+
+Rosin proposed returning to TOML argv.  The current spike now uses one
+=command.toml= containing exactly one nonempty string array:
+
+#+begin_src toml
+argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
+#+end_src
+
+There are no cwd, environment, stdin, pipeline, or sequencing fields.  A shell
+remains an ordinary explicit executable, for example =argv = ["bash", "-lc",
+"..."]=.  This preserves the permissive arbitrary-command boundary while
+making shell interpretation visible.
+
+*** Ambient environment remains part of =W=
+
+Rosin requires commands to receive ambient environment variables.  The broker
+therefore inherits =PATH=, credentials, active =mise= state, and other variables
+from the operator process.  It serializes none of their values into the
+proposal or result and continues to override =TMPDIR= beneath =world/=.
+
+A long-running watch process captures its environment at startup.  Changes in
+another shell, or new filesystem-hierarchical environment configuration, do
+not mutate that process environment.  The present refresh mechanism is to
+restart watch from a reconciled operator context.  Per-command reconciliation
+remains a possible later experiment, not an implicit behavior.
+
+*** Firm parse and execution waist
+
+The broker snapshots =command.toml= before attestation, parses that snapshot
+without =eval= or shell re-parsing, displays both exact source bytes and each
+parsed argument, and holds the parsed vector through =yes=.  =edit= creates a
+new snapshot and repeats parsing and display.  Invalid or additional fields
+cannot execute.
+
+The approved snapshot moves into host-only attempt evidence and is mounted
+read-only over the claimed proposal.  The held argv vector executes directly
+through =bwrap=.  This narrows representation ambiguity; it does not make the
+named executable or inherited authority safe.
+
 ** A filesystem-write guard
 
 One proposed safety measure is to execute through =bwrap= with host paths
@@ -645,7 +693,7 @@ the eventual transport or was only useful prototype scaffolding.
 *** A writable mailbox includes authority-shaped files
 
 If the proposed command can write all of =mailbox/=, it can rewrite
-=cmd.toml=, other ready commands, captured output, and =result.toml=.  That
+=command.toml=, other ready commands, captured output, and =result.toml=.  That
 weakens the otherwise-firm relationship between displayed proposal, launch,
 and result.
 
@@ -667,9 +715,10 @@ without =eval=, shell re-parsing, or concatenation.  Heavy semantic validation
 can be omitted; lossless argument boundaries cannot.  Otherwise the displayed
 proposal and executed command are different languages.
 
-The current =command.sh= spike avoids this particular parser boundary by
-executing exact reviewed shell bytes.  The argv question remains relevant if a
-later experiment returns to structured command proposals.
+The initial =command.sh= spike avoided this parser boundary by executing exact
+reviewed shell bytes.  The current argv experiment returns to the structured
+proposal and implements the lossless boundary with strict TOML parsing and
+NUL-delimited transfer into a held Bash array.
 
 *** Output capture is part of the experiment's evidence
 

@@ -15,7 +15,6 @@ readonly WORLD="$MAILBOX/world"
 readonly STATE="$ROOT/.seal-exec"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
 readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
-readonly LINE_WARNING=40
 readonly POLL_SECONDS=2
 
 info() {
@@ -81,10 +80,10 @@ write_result() {
 }
 
 command_digest() {
-  local script="$1"
+  local command_file="$1"
 
-  if [[ -f "$script" && ! -L "$script" ]]; then
-    sha256sum -- "$script" | awk '{ print $1 }'
+  if [[ -f "$command_file" && ! -L "$command_file" ]]; then
+    sha256sum -- "$command_file" | awk '{ print $1 }'
   else
     printf 'missing\n'
   fi
@@ -133,7 +132,7 @@ claim_latest() {
 
       superseded_dir="$CLAIMED/$id"
       mv -- "$candidate" "$superseded_dir"
-      digest="$(command_digest "$superseded_dir/command.sh")"
+      digest="$(command_digest "$superseded_dir/command.toml")"
       finished_at="$(timestamp)"
       write_result "$superseded_dir/result.toml" superseded "$id" \
         "$digest" false "" "$finished_at" "" "$selected_id"
@@ -149,19 +148,66 @@ claim_latest() {
   CLAIM_FOUND=true
 }
 
-inspect_command() {
-  local script="$1"
-  COMMAND_LINES="$(awk 'END { print NR }' "$script")"
-  COMMAND_DIGEST="$(sha256sum -- "$script")"
-  COMMAND_DIGEST="${COMMAND_DIGEST%% *}"
+parse_command() {
+  local command_file="$1"
+  local argv_file="$2"
+
+  python3 - "$command_file" >"$argv_file" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tomllib
+
+command_path = Path(sys.argv[1])
+try:
+    with command_path.open("rb") as source:
+        command = tomllib.load(source)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    print(f"cannot parse {command_path.name}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+if set(command) != {"argv"}:
+    print(
+        f"{command_path.name} must contain exactly one top-level argv key",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+argv = command["argv"]
+if not isinstance(argv, list) or not argv:
+    print("argv must be a nonempty array of strings", file=sys.stderr)
+    raise SystemExit(1)
+
+for index, value in enumerate(argv):
+    if not isinstance(value, str):
+        print(f"argv[{index}] must be a string", file=sys.stderr)
+        raise SystemExit(1)
+    if "\0" in value:
+        print(f"argv[{index}] contains a null byte", file=sys.stderr)
+        raise SystemExit(1)
+
+if argv[0] == "":
+    print("argv[0] must not be empty", file=sys.stderr)
+    raise SystemExit(1)
+
+for value in argv:
+    sys.stdout.buffer.write(os.fsencode(value) + b"\0")
+PY
+}
+
+display_command() {
+  local command_file="$1"
+  local index
 
   printf '\ncommand: %s\n' "$CLAIM_ID"
-  printf 'sha256:  %s\n' "$COMMAND_DIGEST"
-  printf 'lines:   %s\n\n' "$COMMAND_LINES"
-  if (( COMMAND_LINES > LINE_WARNING )); then
-    warn "command.sh is $COMMAND_LINES lines; review threshold is $LINE_WARNING"
-  fi
-  nl -ba -- "$script"
+  printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
+  nl -ba -- "$command_file"
+  printf '\nparsed argv:\n'
+  for index in "${!COMMAND_ARGV[@]}"; do
+    printf '  [%s] ' "$index"
+    printf '%q' "${COMMAND_ARGV[$index]}"
+    printf '\n'
+  done
   printf '\n'
 }
 
@@ -171,14 +217,15 @@ record_mailbox_result() {
 }
 
 execute_claim() {
-  local command_script="$CLAIM_DIR/command.sh"
+  local command_file="$CLAIM_DIR/command.toml"
   local answer edited=false
+  local review_dir review argv_file
   local attempt snapshot started_at finished_at exit_code
   local stdout_pipe stderr_pipe stdout_pid stderr_pid stdout_status stderr_status
-  local bash_path
+  local -a COMMAND_ARGV=()
 
-  if [[ ! -f "$command_script" || -L "$command_script" ]]; then
-    warn "claimed command must contain a regular, non-symlink command.sh"
+  if [[ ! -f "$command_file" || -L "$command_file" ]]; then
+    warn "claimed command must contain a regular, non-symlink command.toml"
     COMMAND_DIGEST="missing"
     finished_at="$(timestamp)"
     write_result "$CLAIM_DIR/result.toml" invalid "$CLAIM_ID" \
@@ -188,8 +235,40 @@ execute_claim() {
     return 0
   fi
 
+  mkdir -p "$STATE/reviews"
+  review_dir="$(mktemp -d "$STATE/reviews/$CLAIM_ID.XXXXXX")"
+  review="$review_dir/command.toml"
+  argv_file="$review_dir/argv"
+
   while true; do
-    inspect_command "$command_script"
+    cp -- "$command_file" "$review"
+    COMMAND_DIGEST="$(command_digest "$review")"
+    if ! parse_command "$review" "$argv_file"; then
+      rm -f -- "$argv_file"
+      warn "command.toml is not executable"
+      if ! read -r -p "Type 'edit' to open vi, anything else to reject invalid command: " answer; then
+        answer=""
+      fi
+      if [[ "$answer" == edit ]]; then
+        vi "$command_file"
+        edited=true
+        continue
+      fi
+
+      finished_at="$(timestamp)"
+      write_result "$CLAIM_DIR/result.toml" invalid "$CLAIM_ID" \
+        "$COMMAND_DIGEST" "$edited" "" "$finished_at" ""
+      rm -rf -- "$review_dir"
+      sync_push
+      info "rejected invalid command $CLAIM_ID"
+      LAST_COMMAND_STATUS=1
+      return 0
+    fi
+
+    COMMAND_ARGV=()
+    mapfile -d '' -t COMMAND_ARGV <"$argv_file"
+    rm -f -- "$argv_file"
+    display_command "$review"
     if ! read -r -p "Type 'yes' to execute, 'edit' to open vi, anything else to refuse: " answer; then
       answer=""
     fi
@@ -198,13 +277,14 @@ execute_claim() {
         break
         ;;
       edit)
-        vi "$command_script"
+        vi "$command_file"
         edited=true
         ;;
       *)
         finished_at="$(timestamp)"
         write_result "$CLAIM_DIR/result.toml" refused "$CLAIM_ID" \
           "$COMMAND_DIGEST" "$edited" "" "$finished_at" ""
+        rm -rf -- "$review_dir"
         sync_push
         info "refused command $CLAIM_ID"
         return 0
@@ -215,11 +295,10 @@ execute_claim() {
   attempt="$STATE/attempts/$CLAIM_ID"
   mkdir -p "$STATE/attempts"
   mkdir "$attempt" || die "attempt already exists: $CLAIM_ID"
-  snapshot="$attempt/command.sh"
-  cp -- "$command_script" "$snapshot"
+  snapshot="$attempt/command.toml"
+  mv -- "$review" "$snapshot"
+  rmdir -- "$review_dir"
   chmod 0444 "$snapshot"
-  COMMAND_DIGEST="$(sha256sum -- "$snapshot")"
-  COMMAND_DIGEST="${COMMAND_DIGEST%% *}"
 
   started_at="$(timestamp)"
   write_result "$attempt/result.toml" started "$CLAIM_ID" \
@@ -235,7 +314,6 @@ execute_claim() {
   tee "$attempt/stderr" <"$stderr_pipe" >&2 &
   stderr_pid=$!
 
-  bash_path="$(command -v bash)"
   set +e
   bwrap \
     --die-with-parent \
@@ -243,12 +321,12 @@ execute_claim() {
     --unshare-pid \
     --ro-bind / / \
     --bind "$MAILBOX" "$MAILBOX" \
-    --ro-bind "$snapshot" "$command_script" \
+    --ro-bind "$snapshot" "$command_file" \
     --dev /dev \
     --proc /proc \
     --chdir "$WORLD" \
     --setenv TMPDIR "$WORLD/.tmp" \
-    -- "$bash_path" "$command_script" \
+    -- "${COMMAND_ARGV[@]}" \
     >"$stdout_pipe" 2>"$stderr_pipe"
   exit_code=$?
   wait "$stdout_pid"

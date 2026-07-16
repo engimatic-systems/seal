@@ -109,8 +109,18 @@ The agent publishes a proposal with this minimum shape:
 mailbox/
   ready/
     <command-id>/
-      command.sh
+      command.toml
 #+end_example
+
+=command.toml= contains exactly one nonempty string array:
+
+#+begin_src toml
+argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
+#+end_src
+
+The broker rejects other top-level fields.  It executes argv directly without
+shell parsing.  A proposal may request a shell explicitly when needed, for
+example =argv = ["bash", "-lc", "..."]=.
 
 From the operator workspace root, run:
 
@@ -133,21 +143,21 @@ seal pull
   -> choose strict newest unclaimed ready command
        multiple: warn and mark every older proposal superseded
   -> move ready/<id> to claimed/<id>
-  -> show ID, SHA-256 digest, line count, and numbered script
+  -> snapshot and parse command.toml
+       invalid: offer edit or record invalid result
+  -> show ID, SHA-256 digest, numbered TOML, and indexed argv
   -> ask operator
        yes   -> execute
-       edit  -> open vi, then show and ask again
+       edit  -> open vi, then reparse, show, and ask again
        other -> refuse
   -> write disposition and captured output
   -> seal push
   -> wait two seconds, then pull again
 #+end_example
 
-The script warns when =command.sh= exceeds 40 lines.  The warning does not
-prevent execution.
-
 Typing =edit= changes the proposal under review.  After editing, review the
-redisplayed bytes and digest; the result records =edited= as =true=.
+redisplayed bytes, digest, and parsed arguments; the result records =edited= as
+=true=.
 
 The agent is expected to publish one command, poll for its terminal result,
 then publish the next.  Multiple unclaimed proposals signal protocol drift.
@@ -172,7 +182,7 @@ After disposition:
 mailbox/
   claimed/
     <command-id>/
-      command.sh
+      command.toml
       result.toml
       ...ad-hoc command files...
   output/
@@ -196,15 +206,26 @@ therefore retain =ready/<id>/= after the operator has claimed it.  Presence of
 
 * Execution boundary
 
-Approved =command.sh= runs under =bwrap= with:
+Approved argv runs directly under =bwrap= with:
 
 - =mailbox/world/= as current directory;
 - the whole mailbox writable;
-- the approved command snapshot mounted read-only at its claimed path;
+- the exact reviewed =command.toml= snapshot mounted read-only at its claimed
+  path;
 - the rest of the host filesystem mounted read-only;
 - =TMPDIR= set to =mailbox/world/.tmp=;
-- the operator's inherited environment; and
+- the broker's inherited environment, including =PATH= and credentials; and
 - network access unchanged.
+
+There is no implicit shell splitting, expansion, interpolation, pipeline, or
+redirection.  Bare =argv[0]= names resolve through inherited =PATH=.  Explicit
+=argv = ["bash", ...]= restores shell semantics as part of the reviewed
+proposal.
+
+The inherited environment is the environment present when watch starts.  It is
+not serialized into proposal or result evidence, and changes in another shell
+do not update the running broker.  Stop and restart watch from a reconciled
+environment when ambient variables need refresh.
 
 This prevents ordinary host-filesystem writes outside the mailbox.  It does
 not prevent reading host files visible in the namespace, using inherited
@@ -212,7 +233,7 @@ credentials, reaching the network, or mutating external systems.  Inspect for
 those effects before typing =yes=.
 
 Everything written under the mailbox may be transported back to the agent.
-Do not expose secrets through scripts, output, or ad-hoc result files.
+Do not expose secrets through proposals, output, or ad-hoc result files.
 
 * Purge and reinitialize the mailbox
 
