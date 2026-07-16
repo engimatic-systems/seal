@@ -58,12 +58,15 @@ streams, exit status, and a host-local attempt record.
 
 The proposal contains one argv vector and an optional cwd relative to =world/=.
 Shell execution remains available only when the proposal names a shell
-explicitly.  =bwrap= gives the launched command a read-only view of the host and
-a writable view of the whole mailbox.  It inherits the broker's ambient
-environment, including =PATH= and credentials, while overriding only =TMPDIR=.
-It does not restrict network access, cloud authority, reads from the host, or
-writes made through external APIs.  Operator review is the command-safety
-decision in this experiment.
+explicitly.  The default spike runs directly with the operator's host
+permissions so reconciled ambient sessions remain usable.  An explicit
+=--bwrap= option restores the earlier read-only-host, writable-mailbox sandbox.
+Both modes inherit the broker's ambient environment, including =PATH= and
+credentials, while overriding only =TMPDIR=.  Neither restricts network access,
+cloud authority, reads from the host, or writes made through external APIs.
+Direct mode also permits writes anywhere allowed to the operator account,
+including broker state and host-local attempt evidence.  Operator review is the
+command-safety decision in this experiment.
 
 The normal operator surface is a watch loop.  It automates mailbox polling and
 result publication while leaving every attestation prompt synchronous and
@@ -95,21 +98,24 @@ run:
     invalid:
       edit -> run vi outside sandbox -> snapshot + parse again
       other/EOF -> record invalid result -> seal push -> failure
-  display numbered exact TOML + digest + cwd resolution + indexed escaped argv
+  display execution mode + numbered exact TOML + digest + cwd + escaped argv
   ask operator:
     edit -> run vi outside sandbox -> snapshot + parse + display again
     yes  -> move exact review snapshot into host-only attempt directory
     other/EOF -> record refusal -> seal push -> success
   record started state before launch
   start stdout/stderr collectors into host-only attempt files
-  bwrap command:
-    host root read-only
-    whole mailbox writable
-    approved snapshot mounted read-only over claimed command.toml
-    cwd resolves beneath mailbox/world; TMPDIR points beneath world
-    host /tmp stays read-only
-    ambient broker environment inherited
-    parsed argv executed directly without shell re-parsing
+  launch parsed argv directly without shell re-parsing:
+    default direct mode:
+      operator host permissions unchanged
+      cwd resolves beneath mailbox/world; TMPDIR points beneath world
+    explicit --bwrap mode:
+      host root read-only
+      whole mailbox writable
+      approved snapshot mounted read-only over claimed command.toml
+      cwd resolves beneath mailbox/world; TMPDIR points beneath world
+      host /tmp stays read-only
+    ambient broker environment inherited in either mode
   wait for command and both collectors
   copy captured streams into mailbox/output
   record completed result with exact digest and exit status
@@ -145,6 +151,7 @@ readonly STATE="$ROOT/.seal-exec"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
 readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
 readonly POLL_SECONDS=2
+EXECUTION_MODE=direct
 
 info() {
   printf '[info] :: %s\n' "$*"
@@ -192,6 +199,7 @@ write_result() {
     printf 'command_id = "%s"\n' "$command_id"
     printf 'command_sha256 = "%s"\n' "$digest"
     printf 'edited = %s\n' "$edited"
+    printf 'execution_mode = "%s"\n' "$EXECUTION_MODE"
     if [[ -n "$started_at" ]]; then
       printf 'started_at = "%s"\n' "$started_at"
     fi
@@ -372,6 +380,7 @@ display_command() {
   local index
 
   printf '\ncommand: %s\n' "$CLAIM_ID"
+  printf 'execution mode: %s\n' "$EXECUTION_MODE"
   printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
   nl -ba -- "$command_file"
   printf '\nrequested cwd: '
@@ -502,19 +511,26 @@ execute_claim() {
   stderr_pid=$!
 
   set +e
-  bwrap \
-    --die-with-parent \
-    --new-session \
-    --unshare-pid \
-    --ro-bind / / \
-    --bind "$MAILBOX" "$MAILBOX" \
-    --ro-bind "$snapshot" "$command_file" \
-    --dev /dev \
-    --proc /proc \
-    --chdir "$COMMAND_CWD_PATH" \
-    --setenv TMPDIR "$WORLD/.tmp" \
-    -- "${COMMAND_ARGV[@]}" \
-    >"$stdout_pipe" 2>"$stderr_pipe"
+  if [[ "$EXECUTION_MODE" == bwrap ]]; then
+    bwrap \
+      --die-with-parent \
+      --new-session \
+      --unshare-pid \
+      --ro-bind / / \
+      --bind "$MAILBOX" "$MAILBOX" \
+      --ro-bind "$snapshot" "$command_file" \
+      --dev /dev \
+      --proc /proc \
+      --chdir "$COMMAND_CWD_PATH" \
+      --setenv TMPDIR "$WORLD/.tmp" \
+      -- "${COMMAND_ARGV[@]}" \
+      >"$stdout_pipe" 2>"$stderr_pipe"
+  else
+    (
+      cd -- "$COMMAND_CWD_PATH"
+      TMPDIR="$WORLD/.tmp" "${COMMAND_ARGV[@]}"
+    ) >"$stdout_pipe" 2>"$stderr_pipe"
+  fi
   exit_code=$?
   wait "$stdout_pid"
   stdout_status=$?
@@ -544,7 +560,9 @@ run_one() {
 
   LAST_COMMAND_STATUS=0
   require_command "$SEAL_BIN"
-  require_command bwrap
+  if [[ "$EXECUTION_MODE" == bwrap ]]; then
+    require_command bwrap
+  fi
   require_command vi
   require_command sha256sum
   require_command python3
@@ -666,10 +684,16 @@ purge_mailbox() {
 }
 
 usage() {
-  printf 'Usage: seal-exec.sh [watch|run|purge]\n'
+  printf 'Usage: seal-exec.sh [--bwrap] [watch|run]\n'
+  printf '       seal-exec.sh purge\n'
 }
 
 main() {
+  if [[ "${1:-}" == --bwrap ]]; then
+    EXECUTION_MODE=bwrap
+    shift
+  fi
+
   case "${1:-watch}" in
     watch)
       [[ $# -le 1 ]] || { usage >&2; return 2; }
@@ -680,7 +704,7 @@ main() {
       run_command
       ;;
     purge)
-      [[ $# -eq 1 ]] || { usage >&2; return 2; }
+      [[ $# -eq 1 && "$EXECUTION_MODE" == direct ]] || { usage >&2; return 2; }
       purge_mailbox
       ;;
     -h|--help)
@@ -1867,7 +1891,7 @@ fn transfer(
 Pseudocode:
 
 #+begin_example
-fake seal + fake bwrap + strict argv proposal
+fake seal + strict argv proposal
   run with yes
   -> pull then push
   -> newest ready directory becomes claimed
@@ -1876,6 +1900,12 @@ fake seal + fake bwrap + strict argv proposal
   -> relative cwd resolves beneath world and command runs there
   -> stdout/stderr and completed result are returned
   -> host-only approved snapshot remains
+  -> direct execution mode is recorded and bwrap is not invoked
+
+strict argv proposal
+  run with --bwrap and yes
+  -> existing sandbox launch is used
+  -> bwrap execution mode is recorded
 
 fake vi changes command.toml
   run with edit then yes
@@ -2038,13 +2068,18 @@ run_spike() {
   local tools="$2"
   local input="$3"
   local transcript="$4"
+  local mode="${5:-}"
+  local -a arguments=(run)
+  if [[ -n "$mode" ]]; then
+    arguments=("$mode" run)
+  fi
   (
     cd "$workspace"
     PATH="$tools:$PATH" \
       SEAL_TEST_LOG="$workspace/seal.log" \
       BWRAP_TEST_LOG="$workspace/bwrap.log" \
       AMBIENT_TEST_VALUE="ambient value" \
-      "$SCRIPT" run <<<"$input"
+      "$SCRIPT" "${arguments[@]}" <<<"$input"
   ) >"$transcript" 2>&1
 }
 
@@ -2084,6 +2119,7 @@ assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[2]=<\$(pr
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[3]=<>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.err" "command stderr"
 assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'status = "completed"'
+assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'execution_mode = "direct"'
 assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'exit_code = 0'
 approved_digest="$(sha256sum "$workspace/.seal-exec/attempts/20260716-001/command.toml")"
 approved_digest="${approved_digest%% *}"
@@ -2092,6 +2128,20 @@ assert_file_contains \
   "command_sha256 = \"$approved_digest\""
 assert_file_contains "$workspace/mailbox/world/nested/work/artifact.txt" "artifact"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
+[[ ! -e "$workspace/bwrap.log" ]] || fail "default execution invoked bwrap"
+
+workspace="$TEST_ROOT/bwrap"
+peer="$TEST_ROOT/bwrap-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-bwrap" "$peer"
+write_local_config "$workspace" "$peer"
+printf 'argv = ["argv-probe", "sandboxed"]\n' \
+  >"$workspace/mailbox/ready/20260716-bwrap/command.toml"
+run_spike "$workspace" "$tools" yes "$workspace/transcript" --bwrap
+assert_file_contains "$workspace/mailbox/output/20260716-bwrap.out" "arg[0]=<sandboxed>"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-bwrap/result.toml" \
+  'execution_mode = "bwrap"'
+[[ -s "$workspace/bwrap.log" ]] || fail "--bwrap execution did not invoke bwrap"
 
 workspace="$TEST_ROOT/edit"
 peer="$TEST_ROOT/edit-peer"
@@ -2324,7 +2374,7 @@ TOML
       "$SCRIPT" run <<<'yes'
   ) >"$workspace/transcript" 2>&1; then
     cat "$workspace/transcript" >&2
-    fail "real Seal/bwrap spike failed"
+    fail "real Seal direct-execution spike failed"
   fi
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"

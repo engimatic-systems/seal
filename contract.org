@@ -156,6 +156,7 @@ status = "completed"
 command_id = "20260716T151500Z-clone-terraform"
 command_sha256 = "..."
 edited = false
+execution_mode = "direct"
 started_at = "2026-07-16T15:16:00Z"
 finished_at = "2026-07-16T15:16:03Z"
 exit_code = 0
@@ -184,17 +185,26 @@ mechanically.
 
 * Execution world
 
-The proposed argv runs with:
+Execution mode belongs to the operator invocation, not the proposal.  The
+current spike defaults to =direct=; an operator may instead start the broker
+with =--bwrap=.  =result.toml= records the selected mode.
+
+In either mode, proposed argv runs with:
 
 - current directory =mailbox/world/<cwd>/=, with ="."= as the default;
 - the broker's inherited environment as captured when the watch process
   started, including =PATH=, credentials, and any active =mise= context;
 - =TMPDIR= set to =mailbox/world/.tmp=;
-- the host filesystem mounted read-only;
-- the whole mailbox mounted writable;
-- the approved =command.toml= snapshot mounted read-only over its claimed path;
-  and
 - ordinary network access unchanged.
+
+In default direct mode, the command has the operator process's ordinary host
+permissions.  It can read or write any path available to that account,
+including Seal's host-local broker state and credential state.  Initial cwd
+containment does not constrain later filesystem access.
+
+In optional =--bwrap= mode, the host filesystem is mounted read-only, the whole
+mailbox is mounted writable, and the approved =command.toml= snapshot is mounted
+read-only over its claimed path.
 
 The writable =world/= is intended to carry state between commands: cloned
 repositories, Terraform working directories, saved plans, and similar
@@ -205,10 +215,10 @@ beside their claimed request.  By convention, do not rewrite queue lifecycle,
 other commands, captured outputs, or =contract.org= unless that mutation is the
 explicit reviewed purpose.
 
-Read-only host mounts do not make a command harmless.  A command may read host
-material exposed in the namespace, use inherited credentials, access the
-network, and mutate external systems such as Azure.  The operator's review is
-the safety decision in this experiment.
+Neither mode makes a command harmless.  A command may read host material, use
+inherited credentials, access the network, and mutate external systems such as
+Azure.  Direct mode additionally permits host filesystem mutation.  The
+operator's review is the safety decision in this experiment.
 
 Avoid printing credentials or copying secrets into mailbox files.  Everything
 under the mailbox may return to the agent side.

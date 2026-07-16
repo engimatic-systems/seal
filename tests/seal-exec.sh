@@ -116,13 +116,18 @@ run_spike() {
   local tools="$2"
   local input="$3"
   local transcript="$4"
+  local mode="${5:-}"
+  local -a arguments=(run)
+  if [[ -n "$mode" ]]; then
+    arguments=("$mode" run)
+  fi
   (
     cd "$workspace"
     PATH="$tools:$PATH" \
       SEAL_TEST_LOG="$workspace/seal.log" \
       BWRAP_TEST_LOG="$workspace/bwrap.log" \
       AMBIENT_TEST_VALUE="ambient value" \
-      "$SCRIPT" run <<<"$input"
+      "$SCRIPT" "${arguments[@]}" <<<"$input"
   ) >"$transcript" 2>&1
 }
 
@@ -162,6 +167,7 @@ assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[2]=<\$(pr
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[3]=<>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.err" "command stderr"
 assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'status = "completed"'
+assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'execution_mode = "direct"'
 assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'exit_code = 0'
 approved_digest="$(sha256sum "$workspace/.seal-exec/attempts/20260716-001/command.toml")"
 approved_digest="${approved_digest%% *}"
@@ -170,6 +176,20 @@ assert_file_contains \
   "command_sha256 = \"$approved_digest\""
 assert_file_contains "$workspace/mailbox/world/nested/work/artifact.txt" "artifact"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
+[[ ! -e "$workspace/bwrap.log" ]] || fail "default execution invoked bwrap"
+
+workspace="$TEST_ROOT/bwrap"
+peer="$TEST_ROOT/bwrap-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-bwrap" "$peer"
+write_local_config "$workspace" "$peer"
+printf 'argv = ["argv-probe", "sandboxed"]\n' \
+  >"$workspace/mailbox/ready/20260716-bwrap/command.toml"
+run_spike "$workspace" "$tools" yes "$workspace/transcript" --bwrap
+assert_file_contains "$workspace/mailbox/output/20260716-bwrap.out" "arg[0]=<sandboxed>"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-bwrap/result.toml" \
+  'execution_mode = "bwrap"'
+[[ -s "$workspace/bwrap.log" ]] || fail "--bwrap execution did not invoke bwrap"
 
 workspace="$TEST_ROOT/edit"
 peer="$TEST_ROOT/edit-peer"
@@ -402,7 +422,7 @@ TOML
       "$SCRIPT" run <<<'yes'
   ) >"$workspace/transcript" 2>&1; then
     cat "$workspace/transcript" >&2
-    fail "real Seal/bwrap spike failed"
+    fail "real Seal direct-execution spike failed"
   fi
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"

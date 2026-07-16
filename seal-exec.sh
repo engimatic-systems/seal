@@ -16,6 +16,7 @@ readonly STATE="$ROOT/.seal-exec"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
 readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
 readonly POLL_SECONDS=2
+EXECUTION_MODE=direct
 
 info() {
   printf '[info] :: %s\n' "$*"
@@ -63,6 +64,7 @@ write_result() {
     printf 'command_id = "%s"\n' "$command_id"
     printf 'command_sha256 = "%s"\n' "$digest"
     printf 'edited = %s\n' "$edited"
+    printf 'execution_mode = "%s"\n' "$EXECUTION_MODE"
     if [[ -n "$started_at" ]]; then
       printf 'started_at = "%s"\n' "$started_at"
     fi
@@ -243,6 +245,7 @@ display_command() {
   local index
 
   printf '\ncommand: %s\n' "$CLAIM_ID"
+  printf 'execution mode: %s\n' "$EXECUTION_MODE"
   printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
   nl -ba -- "$command_file"
   printf '\nrequested cwd: '
@@ -373,19 +376,26 @@ execute_claim() {
   stderr_pid=$!
 
   set +e
-  bwrap \
-    --die-with-parent \
-    --new-session \
-    --unshare-pid \
-    --ro-bind / / \
-    --bind "$MAILBOX" "$MAILBOX" \
-    --ro-bind "$snapshot" "$command_file" \
-    --dev /dev \
-    --proc /proc \
-    --chdir "$COMMAND_CWD_PATH" \
-    --setenv TMPDIR "$WORLD/.tmp" \
-    -- "${COMMAND_ARGV[@]}" \
-    >"$stdout_pipe" 2>"$stderr_pipe"
+  if [[ "$EXECUTION_MODE" == bwrap ]]; then
+    bwrap \
+      --die-with-parent \
+      --new-session \
+      --unshare-pid \
+      --ro-bind / / \
+      --bind "$MAILBOX" "$MAILBOX" \
+      --ro-bind "$snapshot" "$command_file" \
+      --dev /dev \
+      --proc /proc \
+      --chdir "$COMMAND_CWD_PATH" \
+      --setenv TMPDIR "$WORLD/.tmp" \
+      -- "${COMMAND_ARGV[@]}" \
+      >"$stdout_pipe" 2>"$stderr_pipe"
+  else
+    (
+      cd -- "$COMMAND_CWD_PATH"
+      TMPDIR="$WORLD/.tmp" "${COMMAND_ARGV[@]}"
+    ) >"$stdout_pipe" 2>"$stderr_pipe"
+  fi
   exit_code=$?
   wait "$stdout_pid"
   stdout_status=$?
@@ -415,7 +425,9 @@ run_one() {
 
   LAST_COMMAND_STATUS=0
   require_command "$SEAL_BIN"
-  require_command bwrap
+  if [[ "$EXECUTION_MODE" == bwrap ]]; then
+    require_command bwrap
+  fi
   require_command vi
   require_command sha256sum
   require_command python3
@@ -537,10 +549,16 @@ purge_mailbox() {
 }
 
 usage() {
-  printf 'Usage: seal-exec.sh [watch|run|purge]\n'
+  printf 'Usage: seal-exec.sh [--bwrap] [watch|run]\n'
+  printf '       seal-exec.sh purge\n'
 }
 
 main() {
+  if [[ "${1:-}" == --bwrap ]]; then
+    EXECUTION_MODE=bwrap
+    shift
+  fi
+
   case "${1:-watch}" in
     watch)
       [[ $# -le 1 ]] || { usage >&2; return 2; }
@@ -551,7 +569,7 @@ main() {
       run_command
       ;;
     purge)
-      [[ $# -eq 1 ]] || { usage >&2; return 2; }
+      [[ $# -eq 1 && "$EXECUTION_MODE" == direct ]] || { usage >&2; return 2; }
       purge_mailbox
       ;;
     -h|--help)
