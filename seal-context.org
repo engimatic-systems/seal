@@ -759,6 +759,57 @@ return to ready, or wait for manual cleanup?  Likewise, interruption after
 launch but before =result.toml= cannot honestly become an automatic retry.
 The prototype can use crude states, but it must not confuse them silently.
 
+*** Ambient authority needs operator-private mutable state
+
+The first successful argv command exposed a substantial limit in the current
+=bwrap= shape: Azure CLI's ambient login is not only inherited environment or
+readable credential material.  Its configuration and token cache live under
+=AZURE_CONFIG_DIR= (normally =~/.azure=), and ordinary use may need to mutate
+cache and lock files.  Mounting the host read-only can therefore make an
+otherwise reconciled Azure session unusable.
+
+Making the real host configuration writable would restore the session, but it
+would also let an attested command corrupt or replace operator credential
+state.  Copying it into =mailbox/world/= would be worse: transported world state
+must not carry operator credentials back to the agent.
+
+This suggests a fourth provisional region beside proposal, shared world, and
+result: operator-private writable runtime state.  It is prepared by environment
+reconciliation, visible and writable during execution, and never transported
+by Seal.  Azure configuration is one likely backend; other tools may need
+caches, sockets, or state directories with different reconciliation behavior.
+
+This region does not make ambient credentials safe.  A networked command which
+can read or use an Azure session can exercise or exfiltrate that authority.
+=bwrap= can protect host filesystem integrity; it cannot contain cloud-side
+effects.  In the permissive experiment, operator review remains the authority
+boundary.
+
+The reviewed argv is also not the full executed meaning.  A tool such as
+=tofu= consumes mutable repository files, plugins, configuration, environment,
+and credentials.  Attestation therefore means "run this argv in this reconciled
+world and runtime," not merely "approve these argument strings."
+
+Longer term, environment reconciliation may need to materialize all required
+private-runtime backends before the broker starts.  More exactly, these are
+persistent authenticated session-state backends, not generic tooling state.
+Seal's command path need not know each backend's internals.  Whether it
+eventually consumes named runtime profiles, mount declarations, or only a
+reconciled directory remains open.
+
+The next spike makes this pressure concrete without designing backend policy.
+It creates a fixed host-only =.seal-exec/runtime/= directory, retains it across
+commands and purge, and mounts it writable when =--bwrap= is selected.  The
+broker sets =SEAL_OPERATOR_RUNTIME= to its absolute path.  Operator-side
+environment reconciliation may establish Azure or AWS sessions beneath it and
+point the corresponding client configuration at those paths.
+
+This is one writable region, not credential isolation.  Every attested command
+can read, mutate, delete, or exfiltrate every backend placed there.  Its present
+claim is narrower: session mutation works inside =bwrap= without making the
+real host configuration writable or transporting session material through the
+mailbox.
+
 * Questions still alive
 
 - What exactly is one proposal: argv, script text, a directory, or another
@@ -778,6 +829,10 @@ The prototype can use crude states, but it must not confuse them silently.
 - When does a world-reconciliation recipe run, and what does its success mean?
 - Which runtime facts remain operator knowledge, and which eventually earn a
   first-class Seal representation?
+- What belongs in operator-private mutable runtime state, and how is each
+  backend reconciled without transporting credentials?
+- Is private runtime state persistent across commands, refreshed per command,
+  or selected per runtime profile?
 - Does recurring friction eventually favor a restricted runner, or does the
   permissive operator-mediated path remain the primary product?
 - Which protections are necessary for exploratory honesty, and which would be

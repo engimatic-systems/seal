@@ -62,8 +62,12 @@ explicitly.  The default spike runs directly with the operator's host
 permissions so reconciled ambient sessions remain usable.  An explicit
 =--bwrap= option restores the earlier read-only-host, writable-mailbox sandbox.
 Both modes inherit the broker's ambient environment, including =PATH= and
-credentials, while overriding only =TMPDIR=.  Neither restricts network access,
-cloud authority, reads from the host, or writes made through external APIs.
+credentials.  The broker exposes persistent operator-private session state at
+=.seal-exec/runtime/=, sets =SEAL_OPERATOR_RUNTIME= to its absolute path, and
+overrides =TMPDIR= beneath =world/=.  In =--bwrap= mode the private runtime is a
+second writable bind beside the transported mailbox.  Neither mode restricts
+network access, cloud authority, reads from the host, or writes made through
+external APIs.
 Direct mode also permits writes anywhere allowed to the operator account,
 including broker state and host-local attempt evidence.  Operator review is the
 command-safety decision in this experiment.
@@ -104,6 +108,7 @@ run:
     yes  -> move exact review snapshot into host-only attempt directory
     other/EOF -> record refusal -> seal push -> success
   record started state before launch
+  prepare persistent host-only .seal-exec/runtime
   start stdout/stderr collectors into host-only attempt files
   launch parsed argv directly without shell re-parsing:
     default direct mode:
@@ -112,6 +117,7 @@ run:
     explicit --bwrap mode:
       host root read-only
       whole mailbox writable
+      operator-private .seal-exec/runtime writable but not transported
       approved snapshot mounted read-only over claimed command.toml
       cwd resolves beneath mailbox/world; TMPDIR points beneath world
       host /tmp stays read-only
@@ -148,6 +154,7 @@ readonly CLAIMED="$MAILBOX/claimed"
 readonly OUTPUT="$MAILBOX/output"
 readonly WORLD="$MAILBOX/world"
 readonly STATE="$ROOT/.seal-exec"
+readonly OPERATOR_RUNTIME="$STATE/runtime"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
 readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
 readonly POLL_SECONDS=2
@@ -180,6 +187,12 @@ sync_pull() {
 
 sync_push() {
   "$SEAL_BIN" push || die "seal push failed"
+}
+
+prepare_operator_runtime() {
+  mkdir -p -- "$OPERATOR_RUNTIME"
+  [[ -d "$OPERATOR_RUNTIME" && ! -L "$OPERATOR_RUNTIME" ]] ||
+    die "operator runtime must be a regular directory: $OPERATOR_RUNTIME"
 }
 
 write_result() {
@@ -381,6 +394,7 @@ display_command() {
 
   printf '\ncommand: %s\n' "$CLAIM_ID"
   printf 'execution mode: %s\n' "$EXECUTION_MODE"
+  printf 'operator runtime: %s\n' "$OPERATOR_RUNTIME"
   printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
   nl -ba -- "$command_file"
   printf '\nrequested cwd: '
@@ -518,17 +532,21 @@ execute_claim() {
       --unshare-pid \
       --ro-bind / / \
       --bind "$MAILBOX" "$MAILBOX" \
+      --bind "$OPERATOR_RUNTIME" "$OPERATOR_RUNTIME" \
       --ro-bind "$snapshot" "$command_file" \
       --dev /dev \
       --proc /proc \
       --chdir "$COMMAND_CWD_PATH" \
       --setenv TMPDIR "$WORLD/.tmp" \
+      --setenv SEAL_OPERATOR_RUNTIME "$OPERATOR_RUNTIME" \
       -- "${COMMAND_ARGV[@]}" \
       >"$stdout_pipe" 2>"$stderr_pipe"
   else
     (
       cd -- "$COMMAND_CWD_PATH"
-      TMPDIR="$WORLD/.tmp" "${COMMAND_ARGV[@]}"
+      TMPDIR="$WORLD/.tmp" \
+        SEAL_OPERATOR_RUNTIME="$OPERATOR_RUNTIME" \
+        "${COMMAND_ARGV[@]}"
     ) >"$stdout_pipe" 2>"$stderr_pipe"
   fi
   exit_code=$?
@@ -568,6 +586,7 @@ run_one() {
   require_command python3
   require_command realpath
   [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
+  prepare_operator_runtime
 
   sync_pull
   mkdir -p "$READY" "$CLAIMED" "$OUTPUT" "$WORLD"
@@ -1905,6 +1924,7 @@ fake seal + strict argv proposal
 strict argv proposal
   run with --bwrap and yes
   -> existing sandbox launch is used
+  -> persistent operator runtime is writable through a distinct bind
   -> bwrap execution mode is recorded
 
 fake vi changes command.toml
@@ -2039,6 +2059,8 @@ for argument in "$@"; do
 done
 printf 'command stderr\n' >&2
 printf 'artifact\n' > artifact.txt
+printf 'operator-runtime=<%s>\n' "$SEAL_OPERATOR_RUNTIME"
+printf 'session state\n' >"$SEAL_OPERATOR_RUNTIME/probe-session"
 SH
 
   chmod +x \
@@ -2127,6 +2149,8 @@ assert_file_contains \
   "$workspace/mailbox/claimed/20260716-001/result.toml" \
   "command_sha256 = \"$approved_digest\""
 assert_file_contains "$workspace/mailbox/world/nested/work/artifact.txt" "artifact"
+assert_file_contains "$workspace/.seal-exec/runtime/probe-session" "session state"
+[[ ! -e "$peer/runtime" ]] || fail "operator runtime was transported to peer"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
 [[ ! -e "$workspace/bwrap.log" ]] || fail "default execution invoked bwrap"
 
@@ -2142,6 +2166,9 @@ assert_file_contains \
   "$workspace/mailbox/claimed/20260716-bwrap/result.toml" \
   'execution_mode = "bwrap"'
 [[ -s "$workspace/bwrap.log" ]] || fail "--bwrap execution did not invoke bwrap"
+assert_file_contains "$workspace/.seal-exec/runtime/probe-session" "session state"
+grep -aF -- "$workspace/.seal-exec/runtime" "$workspace/bwrap.log" >/dev/null ||
+  fail "bwrap did not receive operator runtime bind"
 
 workspace="$TEST_ROOT/edit"
 peer="$TEST_ROOT/edit-peer"
@@ -2364,6 +2391,7 @@ printf 'real stdout\n'
 printf 'real stderr\n' >&2
 printf 'real artifact\n' > real-artifact.txt
 printf '%s\n' "$SEAL_E2E_AMBIENT" > ambient.txt
+printf 'real session\n' > "$SEAL_OPERATOR_RUNTIME/real-session.txt"
 ''',
 ]
 TOML
@@ -2371,15 +2399,16 @@ TOML
     cd "$workspace"
     SEAL_BIN="$SEAL_E2E_BIN" \
       SEAL_E2E_AMBIENT="real ambient" \
-      "$SCRIPT" run <<<'yes'
+      "$SCRIPT" --bwrap run <<<'yes'
   ) >"$workspace/transcript" 2>&1; then
     cat "$workspace/transcript" >&2
-    fail "real Seal direct-execution spike failed"
+    fail "real Seal/bwrap spike failed"
   fi
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"
   assert_file_contains "$workspace/mailbox/world/nested/real-artifact.txt" "real artifact"
   assert_file_contains "$workspace/mailbox/world/nested/ambient.txt" "real ambient"
+  assert_file_contains "$workspace/.seal-exec/runtime/real-session.txt" "real session"
   assert_file_contains "$peer/claimed/20260716-real/result.toml" 'status = "completed"'
   assert_file_contains "$peer/output/20260716-real.out" "real stdout"
   assert_file_contains "$peer/world/nested/real-artifact.txt" "real artifact"

@@ -235,6 +235,7 @@ With =--bwrap=, the broker instead gives the command:
 
 - requested cwd beneath =mailbox/world/=, defaulting to =world/= itself;
 - the whole mailbox writable;
+- =.seal-exec/runtime/= writable as operator-private session state;
 - the exact reviewed =command.toml= snapshot mounted read-only at its claimed
   path;
 - the rest of the host filesystem mounted read-only;
@@ -242,6 +243,8 @@ With =--bwrap=, the broker instead gives the command:
 - network access unchanged.
 
 Both modes inherit the broker environment, including =PATH= and credentials.
+Both set =SEAL_OPERATOR_RUNTIME= to the absolute path of
+=.seal-exec/runtime/=.  The broker creates that directory before execution.
 
 There is no implicit shell splitting, expansion, interpolation, pipeline, or
 redirection.  Bare =argv[0]= names resolve through inherited =PATH=.  Explicit
@@ -262,6 +265,38 @@ command.  Inspect those effects before typing =yes=.
 Everything written under the mailbox may be transported back to the agent.
 Do not expose secrets through proposals, output, or ad-hoc result files.
 
+* Private operator session state
+
+The fixed private runtime directory is:
+
+#+begin_example
+operator-workspace/.seal-exec/runtime/
+#+end_example
+
+It persists across commands and mailbox purge.  Seal does not pull, push, or
+otherwise transport it.  Direct mode can already write it through ordinary
+host permissions; =--bwrap= mounts this directory writable over the read-only
+host view.
+
+Environment reconciliation may create backend-specific directories there,
+establish authenticated sessions, and point client variables at their absolute
+paths.  For example, an operator-side =.env.sh= can derive paths from the
+operator workspace:
+
+#+begin_src bash
+export SEAL_OPERATOR_RUNTIME="$PWD/.seal-exec/runtime"
+export AZURE_CONFIG_DIR="$SEAL_OPERATOR_RUNTIME/azure"
+mkdir -p "$AZURE_CONFIG_DIR"
+#+end_src
+
+AWS and other backends may need several files, caches, sockets, or their own
+home-like directory.  Reconciliation owns that backend-specific layout; the
+broker only supplies one persistent writable root.
+
+This state is private from transport, not private from an approved command.
+Any executed command can read, mutate, delete, or exfiltrate all session state
+under the directory.  The spike does not isolate backends from one another.
+
 * Purge and reinitialize the mailbox
 
 To destroy both mailbox copies and reinstall a fresh shape:
@@ -279,7 +314,8 @@ succeeds.
 
 Purge destroys proposals, dispositions, captured output, ad-hoc files, and
 persistent world state on both sides.  Host-only evidence under
-=.seal-exec/attempts/= is retained.
+=.seal-exec/attempts/= and private session state under =.seal-exec/runtime/=
+are retained.
 
 Purge has no mailbox lock.  Agent writes concurrent with the deleting sync may
 be destroyed or leave a mixed result.  Stop the watch loop and coordinate with

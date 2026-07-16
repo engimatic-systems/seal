@@ -87,6 +87,8 @@ for argument in "$@"; do
 done
 printf 'command stderr\n' >&2
 printf 'artifact\n' > artifact.txt
+printf 'operator-runtime=<%s>\n' "$SEAL_OPERATOR_RUNTIME"
+printf 'session state\n' >"$SEAL_OPERATOR_RUNTIME/probe-session"
 SH
 
   chmod +x \
@@ -175,6 +177,8 @@ assert_file_contains \
   "$workspace/mailbox/claimed/20260716-001/result.toml" \
   "command_sha256 = \"$approved_digest\""
 assert_file_contains "$workspace/mailbox/world/nested/work/artifact.txt" "artifact"
+assert_file_contains "$workspace/.seal-exec/runtime/probe-session" "session state"
+[[ ! -e "$peer/runtime" ]] || fail "operator runtime was transported to peer"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
 [[ ! -e "$workspace/bwrap.log" ]] || fail "default execution invoked bwrap"
 
@@ -190,6 +194,9 @@ assert_file_contains \
   "$workspace/mailbox/claimed/20260716-bwrap/result.toml" \
   'execution_mode = "bwrap"'
 [[ -s "$workspace/bwrap.log" ]] || fail "--bwrap execution did not invoke bwrap"
+assert_file_contains "$workspace/.seal-exec/runtime/probe-session" "session state"
+grep -aF -- "$workspace/.seal-exec/runtime" "$workspace/bwrap.log" >/dev/null ||
+  fail "bwrap did not receive operator runtime bind"
 
 workspace="$TEST_ROOT/edit"
 peer="$TEST_ROOT/edit-peer"
@@ -412,6 +419,7 @@ printf 'real stdout\n'
 printf 'real stderr\n' >&2
 printf 'real artifact\n' > real-artifact.txt
 printf '%s\n' "$SEAL_E2E_AMBIENT" > ambient.txt
+printf 'real session\n' > "$SEAL_OPERATOR_RUNTIME/real-session.txt"
 ''',
 ]
 TOML
@@ -419,15 +427,16 @@ TOML
     cd "$workspace"
     SEAL_BIN="$SEAL_E2E_BIN" \
       SEAL_E2E_AMBIENT="real ambient" \
-      "$SCRIPT" run <<<'yes'
+      "$SCRIPT" --bwrap run <<<'yes'
   ) >"$workspace/transcript" 2>&1; then
     cat "$workspace/transcript" >&2
-    fail "real Seal direct-execution spike failed"
+    fail "real Seal/bwrap spike failed"
   fi
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"
   assert_file_contains "$workspace/mailbox/world/nested/real-artifact.txt" "real artifact"
   assert_file_contains "$workspace/mailbox/world/nested/ambient.txt" "real ambient"
+  assert_file_contains "$workspace/.seal-exec/runtime/real-session.txt" "real session"
   assert_file_contains "$peer/claimed/20260716-real/result.toml" 'status = "completed"'
   assert_file_contains "$peer/output/20260716-real.out" "real stdout"
   assert_file_contains "$peer/world/nested/real-artifact.txt" "real artifact"

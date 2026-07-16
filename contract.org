@@ -195,6 +195,7 @@ In either mode, proposed argv runs with:
 - the broker's inherited environment as captured when the watch process
   started, including =PATH=, credentials, and any active =mise= context;
 - =TMPDIR= set to =mailbox/world/.tmp=;
+- =SEAL_OPERATOR_RUNTIME= naming persistent operator-private session state;
 - ordinary network access unchanged.
 
 In default direct mode, the command has the operator process's ordinary host
@@ -204,7 +205,14 @@ containment does not constrain later filesystem access.
 
 In optional =--bwrap= mode, the host filesystem is mounted read-only, the whole
 mailbox is mounted writable, and the approved =command.toml= snapshot is mounted
-read-only over its claimed path.
+read-only over its claimed path.  The operator runtime is mounted writable as a
+second, non-mailbox region.
+
+Operator runtime state is not transported by Seal and its contents are not
+part of the proposal.  Environment reconciliation may use it for mutable Azure,
+AWS, or other authenticated session state.  Do not assume a particular backend
+or layout.  Commands can nevertheless use, mutate, or disclose any session
+authority made available there; avoid copying it into =mailbox/= or output.
 
 The writable =world/= is intended to carry state between commands: cloned
 repositories, Terraform working directories, saved plans, and similar

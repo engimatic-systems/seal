@@ -13,6 +13,7 @@ readonly CLAIMED="$MAILBOX/claimed"
 readonly OUTPUT="$MAILBOX/output"
 readonly WORLD="$MAILBOX/world"
 readonly STATE="$ROOT/.seal-exec"
+readonly OPERATOR_RUNTIME="$STATE/runtime"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
 readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
 readonly POLL_SECONDS=2
@@ -45,6 +46,12 @@ sync_pull() {
 
 sync_push() {
   "$SEAL_BIN" push || die "seal push failed"
+}
+
+prepare_operator_runtime() {
+  mkdir -p -- "$OPERATOR_RUNTIME"
+  [[ -d "$OPERATOR_RUNTIME" && ! -L "$OPERATOR_RUNTIME" ]] ||
+    die "operator runtime must be a regular directory: $OPERATOR_RUNTIME"
 }
 
 write_result() {
@@ -246,6 +253,7 @@ display_command() {
 
   printf '\ncommand: %s\n' "$CLAIM_ID"
   printf 'execution mode: %s\n' "$EXECUTION_MODE"
+  printf 'operator runtime: %s\n' "$OPERATOR_RUNTIME"
   printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
   nl -ba -- "$command_file"
   printf '\nrequested cwd: '
@@ -383,17 +391,21 @@ execute_claim() {
       --unshare-pid \
       --ro-bind / / \
       --bind "$MAILBOX" "$MAILBOX" \
+      --bind "$OPERATOR_RUNTIME" "$OPERATOR_RUNTIME" \
       --ro-bind "$snapshot" "$command_file" \
       --dev /dev \
       --proc /proc \
       --chdir "$COMMAND_CWD_PATH" \
       --setenv TMPDIR "$WORLD/.tmp" \
+      --setenv SEAL_OPERATOR_RUNTIME "$OPERATOR_RUNTIME" \
       -- "${COMMAND_ARGV[@]}" \
       >"$stdout_pipe" 2>"$stderr_pipe"
   else
     (
       cd -- "$COMMAND_CWD_PATH"
-      TMPDIR="$WORLD/.tmp" "${COMMAND_ARGV[@]}"
+      TMPDIR="$WORLD/.tmp" \
+        SEAL_OPERATOR_RUNTIME="$OPERATOR_RUNTIME" \
+        "${COMMAND_ARGV[@]}"
     ) >"$stdout_pipe" 2>"$stderr_pipe"
   fi
   exit_code=$?
@@ -433,6 +445,7 @@ run_one() {
   require_command python3
   require_command realpath
   [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
+  prepare_operator_runtime
 
   sync_pull
   mkdir -p "$READY" "$CLAIMED" "$OUTPUT" "$WORLD"
