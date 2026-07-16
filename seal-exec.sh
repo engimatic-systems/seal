@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="$(pwd)"
 readonly ROOT
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
 readonly CONFIG="$ROOT/seal.toml"
 readonly MAILBOX="$ROOT/mailbox"
 readonly READY="$MAILBOX/ready"
@@ -12,7 +14,9 @@ readonly OUTPUT="$MAILBOX/output"
 readonly WORLD="$MAILBOX/world"
 readonly STATE="$ROOT/.seal-exec"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
+readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
 readonly LINE_WARNING=40
+readonly POLL_SECONDS=2
 
 info() {
   printf '[info] :: %s\n' "$*"
@@ -36,11 +40,11 @@ timestamp() {
 }
 
 sync_pull() {
-  "$SEAL_BIN" pull
+  "$SEAL_BIN" pull || die "seal pull failed"
 }
 
 sync_push() {
-  "$SEAL_BIN" push
+  "$SEAL_BIN" push || die "seal push failed"
 }
 
 write_result() {
@@ -52,6 +56,7 @@ write_result() {
   local started_at="${6:-}"
   local finished_at="${7:-}"
   local exit_code="${8:-}"
+  local superseded_by="${9:-}"
   local temporary="${destination}.tmp.$$"
 
   {
@@ -68,16 +73,32 @@ write_result() {
     if [[ -n "$exit_code" ]]; then
       printf 'exit_code = %s\n' "$exit_code"
     fi
+    if [[ -n "$superseded_by" ]]; then
+      printf 'superseded_by = "%s"\n' "$superseded_by"
+    fi
   } >"$temporary"
   mv -- "$temporary" "$destination"
 }
 
+command_digest() {
+  local script="$1"
+
+  if [[ -f "$script" && ! -L "$script" ]]; then
+    sha256sum -- "$script" | awk '{ print $1 }'
+  else
+    printf 'missing\n'
+  fi
+}
+
 claim_latest() {
-  local candidate id modified
+  local candidate id modified digest finished_at superseded_dir
+  local candidate_count=0
   local selected=""
   local selected_id=""
   local selected_modified=-1
 
+  CLAIM_FOUND=false
+  SUPERSEDED_COUNT=0
   shopt -s nullglob
   for candidate in "$READY"/*; do
     [[ -d "$candidate" && ! -L "$candidate" ]] || continue
@@ -87,6 +108,7 @@ claim_latest() {
       continue
     fi
     [[ ! -e "$CLAIMED/$id" ]] || continue
+    ((candidate_count += 1))
     modified="$(stat -c %Y -- "$candidate")"
     if (( modified > selected_modified )) ||
       { (( modified == selected_modified )) && [[ "$id" > "$selected_id" ]]; }; then
@@ -95,12 +117,36 @@ claim_latest() {
       selected_modified="$modified"
     fi
   done
+
+  if [[ -z "$selected" ]]; then
+    shopt -u nullglob
+    return 0
+  fi
+
+  if (( candidate_count > 1 )); then
+    for candidate in "$READY"/*; do
+      [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+      id="${candidate##*/}"
+      [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+      [[ ! -e "$CLAIMED/$id" ]] || continue
+      [[ "$id" != "$selected_id" ]] || continue
+
+      superseded_dir="$CLAIMED/$id"
+      mv -- "$candidate" "$superseded_dir"
+      digest="$(command_digest "$superseded_dir/command.sh")"
+      finished_at="$(timestamp)"
+      write_result "$superseded_dir/result.toml" superseded "$id" \
+        "$digest" false "" "$finished_at" "" "$selected_id"
+      ((SUPERSEDED_COUNT += 1))
+    done
+    warn "multiple unclaimed proposals; newest $selected_id wins and supersedes $SUPERSEDED_COUNT older proposal(s)"
+  fi
   shopt -u nullglob
 
-  [[ -n "$selected" ]] || return 1
   CLAIM_ID="$selected_id"
   CLAIM_DIR="$CLAIMED/$selected_id"
   mv -- "$selected" "$CLAIM_DIR"
+  CLAIM_FOUND=true
 }
 
 inspect_command() {
@@ -138,7 +184,8 @@ execute_claim() {
     write_result "$CLAIM_DIR/result.toml" invalid "$CLAIM_ID" \
       "$COMMAND_DIGEST" "$edited" "" "$finished_at" ""
     sync_push
-    return 1
+    LAST_COMMAND_STATUS=1
+    return 0
   fi
 
   while true; do
@@ -223,10 +270,14 @@ execute_claim() {
   record_mailbox_result "$attempt/result.toml"
   sync_push
   info "completed command $CLAIM_ID with exit code $exit_code"
-  return "$exit_code"
+  LAST_COMMAND_STATUS="$exit_code"
+  return 0
 }
 
 run_one() {
+  local report_empty="$1"
+
+  LAST_COMMAND_STATUS=0
   require_command "$SEAL_BIN"
   require_command bwrap
   require_command vi
@@ -236,24 +287,40 @@ run_one() {
 
   sync_pull
   mkdir -p "$READY" "$CLAIMED" "$OUTPUT" "$WORLD"
-  if ! claim_latest; then
-    info "no unclaimed ready command"
+  claim_latest
+  if [[ "$CLAIM_FOUND" != true ]]; then
+    if [[ "$report_empty" == true ]]; then
+      info "no unclaimed ready command"
+    fi
     return 0
   fi
   info "claimed command $CLAIM_ID"
   execute_claim
 }
 
+run_command() {
+  run_one true
+  return "$LAST_COMMAND_STATUS"
+}
+
+watch_mailbox() {
+  info "watching for one proposal at a time; press Ctrl-C to stop"
+  while true; do
+    run_one false
+    sleep "$POLL_SECONDS"
+  done
+}
+
 purge_plan() {
-  local empty_ready="$1"
-  python3 - "$CONFIG" "$empty_ready" <<'PY'
+  local fresh_mailbox="$1"
+  python3 - "$CONFIG" "$fresh_mailbox" <<'PY'
 import os
 from pathlib import Path
 import sys
 import tomllib
 
 config_path = Path(sys.argv[1]).resolve()
-empty_ready = Path(sys.argv[2]).resolve()
+fresh_mailbox = Path(sys.argv[2]).resolve()
 with config_path.open("rb") as source:
     config = tomllib.load(source)
 
@@ -272,59 +339,83 @@ if "ssh" in peer:
     ssh = config["tools"]["ssh"]
     quoted_ssh = "'" + ssh.replace("'", "''") + "' --"
     argv.extend(["--secluded-args", "--rsh", quoted_ssh])
-    peer_ready = peer["path"].rstrip("/") + "/ready/"
-    destination = f"{peer['ssh']}:{peer_ready}"
+    peer_mailbox = peer["path"].rstrip("/") + "/"
+    destination = f"{peer['ssh']}:{peer_mailbox}"
 else:
     peer_path = Path(peer["path"])
     if not peer_path.is_absolute():
         peer_path = config_path.parent / peer_path
-    destination = str(peer_path / "ready") + "/"
+    destination = str(peer_path) + "/"
 
-argv.extend(["--", str(empty_ready) + "/", destination])
+argv.extend(["--", str(fresh_mailbox) + "/", destination])
 for value in [rsync, *argv]:
     sys.stdout.buffer.write(os.fsencode(value) + b"\0")
 PY
 }
 
-purge_ready() {
-  local answer temporary
+purge_mailbox() {
+  local answer temporary fresh_mailbox old_mailbox
   local -a plan
 
-  require_command "$SEAL_BIN"
   require_command python3
   [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
+  [[ -d "$MAILBOX" && ! -L "$MAILBOX" ]] ||
+    die "mailbox must be a regular directory: $MAILBOX"
+  [[ -f "$CONTRACT_SOURCE" && ! -L "$CONTRACT_SOURCE" ]] ||
+    die "missing regular contract beside broker: $CONTRACT_SOURCE"
 
-  sync_pull
-  info "purge removes every command currently under local and peer ready/"
+  info "purge destroys local and peer mailbox contents, then installs a fresh contract and directory shape"
+  info "host-only attempt evidence under $STATE is retained"
   if ! read -r -p "Type 'purge' to continue: " answer || [[ "$answer" != purge ]]; then
     info "purge cancelled"
     return 0
   fi
 
-  rm -rf -- "$READY"
   mkdir -p "$STATE"
   temporary="$(mktemp -d "$STATE/purge.XXXXXX")"
-  mkdir "$temporary/ready"
-  mapfile -d '' -t plan < <(purge_plan "$temporary/ready")
+  fresh_mailbox="$temporary/mailbox"
+  old_mailbox="$temporary/old-mailbox"
+  mkdir -p \
+    "$fresh_mailbox/ready" \
+    "$fresh_mailbox/claimed" \
+    "$fresh_mailbox/output" \
+    "$fresh_mailbox/world"
+  cp -- "$CONTRACT_SOURCE" "$fresh_mailbox/contract.org"
+
+  mapfile -d '' -t plan < <(purge_plan "$fresh_mailbox")
   (( ${#plan[@]} > 1 )) || die "cannot construct purge rsync plan"
-  "${plan[0]}" "${plan[@]:1}"
-  rm -rf -- "$temporary"
-  info "purged ready commands"
+  if ! "${plan[0]}" "${plan[@]:1}"; then
+    die "cannot replace peer mailbox; staged mailbox retained at $fresh_mailbox"
+  fi
+
+  mv -- "$MAILBOX" "$old_mailbox" ||
+    die "peer reset, but cannot stage old local mailbox at $old_mailbox"
+  if ! mv -- "$fresh_mailbox" "$MAILBOX"; then
+    mv -- "$old_mailbox" "$MAILBOX" ||
+      warn "cannot restore old local mailbox from $old_mailbox"
+    die "peer reset, but cannot install fresh local mailbox"
+  fi
+  rm -rf -- "$old_mailbox" "$temporary"
+  info "purged and reinitialized local and peer mailboxes"
 }
 
 usage() {
-  printf 'Usage: seal-exec.sh [run|purge]\n'
+  printf 'Usage: seal-exec.sh [watch|run|purge]\n'
 }
 
 main() {
-  case "${1:-run}" in
+  case "${1:-watch}" in
+    watch)
+      [[ $# -le 1 ]] || { usage >&2; return 2; }
+      watch_mailbox
+      ;;
     run)
       [[ $# -le 1 ]] || { usage >&2; return 2; }
-      run_one
+      run_command
       ;;
     purge)
       [[ $# -eq 1 ]] || { usage >&2; return 2; }
-      purge_ready
+      purge_mailbox
       ;;
     -h|--help)
       usage

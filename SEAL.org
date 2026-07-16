@@ -49,7 +49,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 #+end_src
 
-* Experimental one-shot broker
+* Experimental watched broker
 
 This spike is deliberately uneven.  The operator-owned shell is disposable
 workflow machinery.  The execution waist preserves the exact approved
@@ -62,14 +62,28 @@ It does not restrict network access, cloud authority, reads from the host, or
 writes made through external APIs.  Operator review is the command-safety
 decision in this experiment.
 
+The normal operator surface is a watch loop.  It automates mailbox polling and
+result publication while leaving every attestation prompt synchronous and
+operator-controlled.  =run= exposes one iteration for diagnosis and tests.
+
 Pseudocode:
 
 #+begin_example
-run (default):
+watch (default):
+  repeat:
+    run one iteration
+    wait two seconds
+
+run:
   seal pull
-  select newest ready command whose ID is not already claimed
+  find ready commands whose IDs are not already claimed
     none -> report no command -> success
-  move ready command to claimed
+    several:
+      strict newest wins
+      move every older proposal to claimed
+      record each older proposal as superseded by newest
+      warn that multiple proposals signal protocol drift
+  move newest proposal to claimed
   require a regular, non-symlink command.sh
     invalid -> record invalid result -> seal push -> failure
   display numbered exact script + digest
@@ -93,12 +107,14 @@ run (default):
   return command status
 
 purge:
-  seal pull so operator sees current ready entries
+  require a regular contract.org beside seal-exec.sh
   require literal purge confirmation
-  remove local ready directory
+  stage a fresh mailbox containing contract.org + ready/claimed/output/world
   construct fixed rsync plan from seal.toml
-  sync an empty ready directory to peer ready with --delete
-  leave other mailbox subtrees untouched
+  deleting-sync fresh mailbox to the peer mailbox
+    failure -> preserve local mailbox and staged recovery material
+  replace local mailbox with the same fresh mailbox
+  retain host-only .seal-exec attempt evidence
 #+end_example
 
 #+begin_src bash :tangle seal-exec.sh :shebang "#!/usr/bin/env bash"
@@ -107,6 +123,8 @@ set -euo pipefail
 
 ROOT="$(pwd)"
 readonly ROOT
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
 readonly CONFIG="$ROOT/seal.toml"
 readonly MAILBOX="$ROOT/mailbox"
 readonly READY="$MAILBOX/ready"
@@ -115,7 +133,9 @@ readonly OUTPUT="$MAILBOX/output"
 readonly WORLD="$MAILBOX/world"
 readonly STATE="$ROOT/.seal-exec"
 readonly SEAL_BIN="${SEAL_BIN:-seal}"
+readonly CONTRACT_SOURCE="$SCRIPT_DIR/contract.org"
 readonly LINE_WARNING=40
+readonly POLL_SECONDS=2
 
 info() {
   printf '[info] :: %s\n' "$*"
@@ -139,11 +159,11 @@ timestamp() {
 }
 
 sync_pull() {
-  "$SEAL_BIN" pull
+  "$SEAL_BIN" pull || die "seal pull failed"
 }
 
 sync_push() {
-  "$SEAL_BIN" push
+  "$SEAL_BIN" push || die "seal push failed"
 }
 
 write_result() {
@@ -155,6 +175,7 @@ write_result() {
   local started_at="${6:-}"
   local finished_at="${7:-}"
   local exit_code="${8:-}"
+  local superseded_by="${9:-}"
   local temporary="${destination}.tmp.$$"
 
   {
@@ -171,16 +192,32 @@ write_result() {
     if [[ -n "$exit_code" ]]; then
       printf 'exit_code = %s\n' "$exit_code"
     fi
+    if [[ -n "$superseded_by" ]]; then
+      printf 'superseded_by = "%s"\n' "$superseded_by"
+    fi
   } >"$temporary"
   mv -- "$temporary" "$destination"
 }
 
+command_digest() {
+  local script="$1"
+
+  if [[ -f "$script" && ! -L "$script" ]]; then
+    sha256sum -- "$script" | awk '{ print $1 }'
+  else
+    printf 'missing\n'
+  fi
+}
+
 claim_latest() {
-  local candidate id modified
+  local candidate id modified digest finished_at superseded_dir
+  local candidate_count=0
   local selected=""
   local selected_id=""
   local selected_modified=-1
 
+  CLAIM_FOUND=false
+  SUPERSEDED_COUNT=0
   shopt -s nullglob
   for candidate in "$READY"/*; do
     [[ -d "$candidate" && ! -L "$candidate" ]] || continue
@@ -190,6 +227,7 @@ claim_latest() {
       continue
     fi
     [[ ! -e "$CLAIMED/$id" ]] || continue
+    ((candidate_count += 1))
     modified="$(stat -c %Y -- "$candidate")"
     if (( modified > selected_modified )) ||
       { (( modified == selected_modified )) && [[ "$id" > "$selected_id" ]]; }; then
@@ -198,12 +236,36 @@ claim_latest() {
       selected_modified="$modified"
     fi
   done
+
+  if [[ -z "$selected" ]]; then
+    shopt -u nullglob
+    return 0
+  fi
+
+  if (( candidate_count > 1 )); then
+    for candidate in "$READY"/*; do
+      [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+      id="${candidate##*/}"
+      [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+      [[ ! -e "$CLAIMED/$id" ]] || continue
+      [[ "$id" != "$selected_id" ]] || continue
+
+      superseded_dir="$CLAIMED/$id"
+      mv -- "$candidate" "$superseded_dir"
+      digest="$(command_digest "$superseded_dir/command.sh")"
+      finished_at="$(timestamp)"
+      write_result "$superseded_dir/result.toml" superseded "$id" \
+        "$digest" false "" "$finished_at" "" "$selected_id"
+      ((SUPERSEDED_COUNT += 1))
+    done
+    warn "multiple unclaimed proposals; newest $selected_id wins and supersedes $SUPERSEDED_COUNT older proposal(s)"
+  fi
   shopt -u nullglob
 
-  [[ -n "$selected" ]] || return 1
   CLAIM_ID="$selected_id"
   CLAIM_DIR="$CLAIMED/$selected_id"
   mv -- "$selected" "$CLAIM_DIR"
+  CLAIM_FOUND=true
 }
 
 inspect_command() {
@@ -241,7 +303,8 @@ execute_claim() {
     write_result "$CLAIM_DIR/result.toml" invalid "$CLAIM_ID" \
       "$COMMAND_DIGEST" "$edited" "" "$finished_at" ""
     sync_push
-    return 1
+    LAST_COMMAND_STATUS=1
+    return 0
   fi
 
   while true; do
@@ -326,10 +389,14 @@ execute_claim() {
   record_mailbox_result "$attempt/result.toml"
   sync_push
   info "completed command $CLAIM_ID with exit code $exit_code"
-  return "$exit_code"
+  LAST_COMMAND_STATUS="$exit_code"
+  return 0
 }
 
 run_one() {
+  local report_empty="$1"
+
+  LAST_COMMAND_STATUS=0
   require_command "$SEAL_BIN"
   require_command bwrap
   require_command vi
@@ -339,24 +406,40 @@ run_one() {
 
   sync_pull
   mkdir -p "$READY" "$CLAIMED" "$OUTPUT" "$WORLD"
-  if ! claim_latest; then
-    info "no unclaimed ready command"
+  claim_latest
+  if [[ "$CLAIM_FOUND" != true ]]; then
+    if [[ "$report_empty" == true ]]; then
+      info "no unclaimed ready command"
+    fi
     return 0
   fi
   info "claimed command $CLAIM_ID"
   execute_claim
 }
 
+run_command() {
+  run_one true
+  return "$LAST_COMMAND_STATUS"
+}
+
+watch_mailbox() {
+  info "watching for one proposal at a time; press Ctrl-C to stop"
+  while true; do
+    run_one false
+    sleep "$POLL_SECONDS"
+  done
+}
+
 purge_plan() {
-  local empty_ready="$1"
-  python3 - "$CONFIG" "$empty_ready" <<'PY'
+  local fresh_mailbox="$1"
+  python3 - "$CONFIG" "$fresh_mailbox" <<'PY'
 import os
 from pathlib import Path
 import sys
 import tomllib
 
 config_path = Path(sys.argv[1]).resolve()
-empty_ready = Path(sys.argv[2]).resolve()
+fresh_mailbox = Path(sys.argv[2]).resolve()
 with config_path.open("rb") as source:
     config = tomllib.load(source)
 
@@ -375,59 +458,83 @@ if "ssh" in peer:
     ssh = config["tools"]["ssh"]
     quoted_ssh = "'" + ssh.replace("'", "''") + "' --"
     argv.extend(["--secluded-args", "--rsh", quoted_ssh])
-    peer_ready = peer["path"].rstrip("/") + "/ready/"
-    destination = f"{peer['ssh']}:{peer_ready}"
+    peer_mailbox = peer["path"].rstrip("/") + "/"
+    destination = f"{peer['ssh']}:{peer_mailbox}"
 else:
     peer_path = Path(peer["path"])
     if not peer_path.is_absolute():
         peer_path = config_path.parent / peer_path
-    destination = str(peer_path / "ready") + "/"
+    destination = str(peer_path) + "/"
 
-argv.extend(["--", str(empty_ready) + "/", destination])
+argv.extend(["--", str(fresh_mailbox) + "/", destination])
 for value in [rsync, *argv]:
     sys.stdout.buffer.write(os.fsencode(value) + b"\0")
 PY
 }
 
-purge_ready() {
-  local answer temporary
+purge_mailbox() {
+  local answer temporary fresh_mailbox old_mailbox
   local -a plan
 
-  require_command "$SEAL_BIN"
   require_command python3
   [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
+  [[ -d "$MAILBOX" && ! -L "$MAILBOX" ]] ||
+    die "mailbox must be a regular directory: $MAILBOX"
+  [[ -f "$CONTRACT_SOURCE" && ! -L "$CONTRACT_SOURCE" ]] ||
+    die "missing regular contract beside broker: $CONTRACT_SOURCE"
 
-  sync_pull
-  info "purge removes every command currently under local and peer ready/"
+  info "purge destroys local and peer mailbox contents, then installs a fresh contract and directory shape"
+  info "host-only attempt evidence under $STATE is retained"
   if ! read -r -p "Type 'purge' to continue: " answer || [[ "$answer" != purge ]]; then
     info "purge cancelled"
     return 0
   fi
 
-  rm -rf -- "$READY"
   mkdir -p "$STATE"
   temporary="$(mktemp -d "$STATE/purge.XXXXXX")"
-  mkdir "$temporary/ready"
-  mapfile -d '' -t plan < <(purge_plan "$temporary/ready")
+  fresh_mailbox="$temporary/mailbox"
+  old_mailbox="$temporary/old-mailbox"
+  mkdir -p \
+    "$fresh_mailbox/ready" \
+    "$fresh_mailbox/claimed" \
+    "$fresh_mailbox/output" \
+    "$fresh_mailbox/world"
+  cp -- "$CONTRACT_SOURCE" "$fresh_mailbox/contract.org"
+
+  mapfile -d '' -t plan < <(purge_plan "$fresh_mailbox")
   (( ${#plan[@]} > 1 )) || die "cannot construct purge rsync plan"
-  "${plan[0]}" "${plan[@]:1}"
-  rm -rf -- "$temporary"
-  info "purged ready commands"
+  if ! "${plan[0]}" "${plan[@]:1}"; then
+    die "cannot replace peer mailbox; staged mailbox retained at $fresh_mailbox"
+  fi
+
+  mv -- "$MAILBOX" "$old_mailbox" ||
+    die "peer reset, but cannot stage old local mailbox at $old_mailbox"
+  if ! mv -- "$fresh_mailbox" "$MAILBOX"; then
+    mv -- "$old_mailbox" "$MAILBOX" ||
+      warn "cannot restore old local mailbox from $old_mailbox"
+    die "peer reset, but cannot install fresh local mailbox"
+  fi
+  rm -rf -- "$old_mailbox" "$temporary"
+  info "purged and reinitialized local and peer mailboxes"
 }
 
 usage() {
-  printf 'Usage: seal-exec.sh [run|purge]\n'
+  printf 'Usage: seal-exec.sh [watch|run|purge]\n'
 }
 
 main() {
-  case "${1:-run}" in
+  case "${1:-watch}" in
+    watch)
+      [[ $# -le 1 ]] || { usage >&2; return 2; }
+      watch_mailbox
+      ;;
     run)
       [[ $# -le 1 ]] || { usage >&2; return 2; }
-      run_one
+      run_command
       ;;
     purge)
       [[ $# -eq 1 ]] || { usage >&2; return 2; }
-      purge_ready
+      purge_mailbox
       ;;
     -h|--help)
       usage
@@ -1627,11 +1734,29 @@ fake vi changes command.sh
   -> edited bytes execute
   -> result records edited=true
 
-local peer with two ready commands
+two unclaimed proposals with distinct modification times
+  run with yes
+  -> newest proposal executes
+  -> older proposal receives superseded result naming newest
+  -> multiple-proposal drift warning is visible
+
+first approved command publishes one successor
+  start watch with two yes responses
+  -> first command completes and publishes its successor
+  -> watch waits, pulls, and reviews successor
+  -> second command completes under a separate result
+
+local and peer mailboxes containing old state
   purge with literal confirmation
-  -> local ready removed
-  -> peer ready emptied through scoped --delete
-  -> peer world remains
+  -> peer mailbox is deleting-synced to fresh shape
+  -> local mailbox is replaced with identical fresh shape
+  -> both contain contract.org + ready/claimed/output/world
+  -> host-only attempt evidence remains
+
+peer deleting-sync failure
+  purge with literal confirmation
+  -> local and peer old contents remain
+  -> staged fresh mailbox remains for diagnosis
 
 when SEAL_E2E_BIN names a built Seal binary:
   real local peer + real rsync + real bwrap
@@ -1723,6 +1848,7 @@ SH
 write_local_config() {
   local workspace="$1"
   local peer="$2"
+  local rsync="${3:-$REAL_RSYNC}"
   cat >"$workspace/seal.toml" <<EOF
 local_mailbox = "mailbox"
 
@@ -1730,7 +1856,7 @@ local_mailbox = "mailbox"
 path = "$peer"
 
 [tools]
-rsync = "$REAL_RSYNC"
+rsync = "$rsync"
 EOF
 }
 
@@ -1744,7 +1870,7 @@ run_spike() {
     PATH="$tools:$PATH" \
       SEAL_TEST_LOG="$workspace/seal.log" \
       BWRAP_TEST_LOG="$workspace/bwrap.log" \
-      "$SCRIPT" <<<"$input"
+      "$SCRIPT" run <<<"$input"
   ) >"$transcript" 2>&1
 }
 
@@ -1789,10 +1915,122 @@ run_spike "$workspace" "$tools" $'edit\nyes' "$workspace/transcript"
 assert_file_contains "$workspace/mailbox/output/20260716-002.out" "edited command"
 assert_file_contains "$workspace/mailbox/claimed/20260716-002/result.toml" 'edited = true'
 
+workspace="$TEST_ROOT/supersede"
+peer="$TEST_ROOT/supersede-peer"
+mkdir -p \
+  "$workspace/mailbox/ready/20260716-010" \
+  "$workspace/mailbox/ready/20260716-011" \
+  "$peer"
+write_local_config "$workspace" "$peer"
+printf 'printf "old command\\n"\n' \
+  >"$workspace/mailbox/ready/20260716-010/command.sh"
+printf 'printf "new command\\n"\n' \
+  >"$workspace/mailbox/ready/20260716-011/command.sh"
+touch -d @100 "$workspace/mailbox/ready/20260716-010"
+touch -d @200 "$workspace/mailbox/ready/20260716-011"
+run_spike "$workspace" "$tools" yes "$workspace/transcript"
+assert_file_contains "$workspace/transcript" "multiple unclaimed proposals"
+assert_file_contains "$workspace/mailbox/output/20260716-011.out" "new command"
+[[ ! -e "$workspace/mailbox/output/20260716-010.out" ]] ||
+  fail "superseded command produced output"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-010/result.toml" \
+  'status = "superseded"'
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-010/result.toml" \
+  'superseded_by = "20260716-011"'
+
+workspace="$TEST_ROOT/watch"
+peer="$TEST_ROOT/watch-peer"
+watch_tools="$TEST_ROOT/watch-tools"
+mkdir -p "$workspace/mailbox/ready/20260716-020" "$peer" "$watch_tools"
+cp -a "$tools/." "$watch_tools/"
+cat >"$watch_tools/sleep" <<'SH'
+#!/usr/bin/env bash
+count=0
+[[ ! -f "$SLEEP_TEST_LOG" ]] || read -r count <"$SLEEP_TEST_LOG"
+((count += 1))
+printf '%s\n' "$count" >"$SLEEP_TEST_LOG"
+if (( count >= 2 )); then
+  exit 77
+fi
+exit 0
+SH
+chmod +x "$watch_tools/sleep"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-020/command.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p ../ready/20260716-021
+cat >../ready/20260716-021/command.sh <<'NEXT'
+#!/usr/bin/env bash
+printf 'second command\n'
+NEXT
+printf 'first command\n'
+SH
+set +e
+(
+  cd "$workspace"
+  PATH="$watch_tools:$PATH" \
+    SEAL_TEST_LOG="$workspace/seal.log" \
+    BWRAP_TEST_LOG="$workspace/bwrap.log" \
+    SLEEP_TEST_LOG="$workspace/sleep.log" \
+    "$SCRIPT" watch <<'ANSWERS'
+yes
+yes
+ANSWERS
+) >"$workspace/transcript" 2>&1
+watch_status=$?
+set -e
+[[ "$watch_status" -eq 77 ]] || fail "watch did not complete two polling waits"
+assert_file_contains "$workspace/transcript" "watching for one proposal at a time"
+assert_file_contains "$workspace/mailbox/output/20260716-020.out" "first command"
+assert_file_contains "$workspace/mailbox/output/20260716-021.out" "second command"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-020/result.toml" \
+  'status = "completed"'
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-021/result.toml" \
+  'status = "completed"'
+[[ "$(printf 'pull\npush\npull\npush\n')" == "$(cat "$workspace/seal.log")" ]] ||
+  fail "watch did not alternate pull/result publication"
+
+workspace="$TEST_ROOT/purge-failure"
+peer="$TEST_ROOT/purge-failure-peer"
+mkdir -p "$workspace/mailbox/world" "$peer/world"
+printf 'local survives\n' >"$workspace/mailbox/world/old.txt"
+printf 'peer survives\n' >"$peer/world/old.txt"
+write_local_config "$workspace" "$peer" /bin/false
+set +e
+(
+  cd "$workspace"
+  PATH="$tools:$PATH" "$SCRIPT" purge <<<'purge'
+) >"$workspace/transcript" 2>&1
+purge_status=$?
+set -e
+[[ "$purge_status" -ne 0 ]] || fail "failed peer purge reported success"
+assert_file_contains "$workspace/mailbox/world/old.txt" "local survives"
+assert_file_contains "$peer/world/old.txt" "peer survives"
+assert_file_contains "$workspace/transcript" "staged mailbox retained"
+[[ -n "$(find "$workspace/.seal-exec" -path '*/mailbox/contract.org' -print -quit)" ]] ||
+  fail "failed purge did not retain staged mailbox"
+
 workspace="$TEST_ROOT/purge"
 peer="$TEST_ROOT/purge-peer"
-mkdir -p "$workspace/mailbox/ready/local" "$peer/ready/one" "$peer/ready/two" "$peer/world"
-printf 'preserve\n' >"$peer/world/preserved.txt"
+mkdir -p \
+  "$workspace/mailbox/ready/local" \
+  "$workspace/mailbox/world" \
+  "$workspace/.seal-exec/attempts/evidence" \
+  "$peer/ready/one" \
+  "$peer/ready/two" \
+  "$peer/claimed/old" \
+  "$peer/output" \
+  "$peer/world"
+printf 'local old world\n' >"$workspace/mailbox/world/old.txt"
+printf 'peer old world\n' >"$peer/world/old.txt"
+printf 'old result\n' >"$peer/claimed/old/result.toml"
+printf 'old output\n' >"$peer/output/old.out"
+printf 'evidence\n' >"$workspace/.seal-exec/attempts/evidence/result.toml"
 printf 'one\n' >"$peer/ready/one/command.sh"
 printf 'two\n' >"$peer/ready/two/command.sh"
 write_local_config "$workspace" "$peer"
@@ -1800,10 +2038,20 @@ write_local_config "$workspace" "$peer"
   cd "$workspace"
   PATH="$tools:$PATH" SEAL_TEST_LOG="$workspace/seal.log" "$SCRIPT" purge <<<'purge'
 ) >"$workspace/transcript" 2>&1
-[[ ! -e "$workspace/mailbox/ready" ]] || fail "local ready directory survived purge"
-[[ -d "$peer/ready" ]] || fail "peer ready directory missing after purge"
-[[ -z "$(find "$peer/ready" -mindepth 1 -print -quit)" ]] || fail "peer ready is not empty"
-assert_file_contains "$peer/world/preserved.txt" "preserve"
+for fresh in "$workspace/mailbox" "$peer"; do
+  [[ -f "$fresh/contract.org" ]] || fail "fresh contract missing from $fresh"
+  cmp "$PROJECT_ROOT/contract.org" "$fresh/contract.org" ||
+    fail "fresh contract differs in $fresh"
+  for directory in ready claimed output world; do
+    [[ -d "$fresh/$directory" ]] || fail "fresh $directory missing from $fresh"
+    [[ -z "$(find "$fresh/$directory" -mindepth 1 -print -quit)" ]] ||
+      fail "fresh $directory is not empty in $fresh"
+  done
+done
+assert_file_contains \
+  "$workspace/.seal-exec/attempts/evidence/result.toml" \
+  "evidence"
+assert_file_contains "$workspace/transcript" "purged and reinitialized"
 
 if [[ -n "${SEAL_E2E_BIN:-}" ]]; then
   workspace="$TEST_ROOT/real"
@@ -1818,7 +2066,7 @@ printf 'real artifact\n' > real-artifact.txt
 SH
   if ! (
     cd "$workspace"
-    SEAL_BIN="$SEAL_E2E_BIN" "$SCRIPT" <<<'yes'
+    SEAL_BIN="$SEAL_E2E_BIN" "$SCRIPT" run <<<'yes'
   ) >"$workspace/transcript" 2>&1; then
     cat "$workspace/transcript" >&2
     fail "real Seal/bwrap spike failed"

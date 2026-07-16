@@ -11,8 +11,9 @@ This is a workflow convention, not a security proof or stable protocol.  The
 operator may replace it as the experiment changes.  A copy placed in a mailbox
 is a courtesy copy; the copy committed with Seal is the reference record.
 
-There is no watcher.  The operator manually asks Seal to consider one command.
-Publishing a command does not authorize or schedule it.
+The operator normally runs a watch loop.  It polls for proposals but stops for
+human review before every execution.  Publishing a command does not authorize
+it.
 
 * Mailbox shape
 
@@ -52,6 +53,11 @@ Read this contract and inspect the current mailbox:
 Presence of =claimed/<command-id>/= wins over a duplicate
 =ready/<command-id>/=.  Never reuse a command ID.
 
+Publish only one unclaimed proposal at a time.  Wait for its terminal result
+before proposing the next command.  Multiple unclaimed proposals signal
+protocol drift: strict newest wins and every older proposal is marked
+=superseded= without execution.
+
 ** Prepare one command
 
 Choose a unique ID containing only ASCII letters, digits, period, underscore,
@@ -72,8 +78,10 @@ a new ID.
 
 ** Write =command.sh=
 
-=command.sh= is arbitrary Bash interpreted by the operator-side Bash.  It may
-perform several sequenced operations and may invoke sibling scripts.  Prefer:
+=command.sh= is arbitrary Bash interpreted by the operator-side Bash.  Prefer
+one small, independently consequential operation that the operator can review
+and that a later command can correct.  A few sequenced shell operations remain
+appropriate when they form one intelligible effect.  Prefer:
 
 #+begin_src bash
 #!/usr/bin/env bash
@@ -93,9 +101,13 @@ edit the script.
 
 ** Wait for disposition
 
-The operator manually runs =seal-exec.sh=.  It pulls the mailbox and selects
-the most recently modified ready command that has no same-ID claimed entry.
-When modification times tie, the lexicographically greatest ID wins.
+The operator's =seal-exec.sh= watch loop pulls the mailbox repeatedly.  It
+selects the most recently modified ready command that has no same-ID claimed
+entry.  When modification times tie, the lexicographically greatest ID wins.
+
+If several unclaimed proposals appear together, the newest is the only one
+reviewed.  Every older proposal moves to =claimed/= with a =superseded= result
+naming the winning command.  Do not treat the mailbox as a backlog.
 
 The operator sees numbered =command.sh= lines, the line count, and a SHA-256
 digest.  The operator then chooses:
@@ -131,8 +143,14 @@ Known status values in the spike are:
 
 - =refused=: operator did not authorize execution;
 - =invalid=: claimed directory lacked a regular, non-symlink =command.sh=;
+- =superseded=: a newer proposal won when several were outstanding;
 - =started=: execution began but the local result has not reached completion;
 - =completed=: the process exited; inspect =exit_code= for success or failure.
+
+After a known failure, inspect returned evidence and current world state, then
+propose a new command under a new ID.  Fail forward rather than asking the
+operator to replay an old attempt.  Even an intentional repetition is a fresh
+proposal and receives fresh attestation.
 
 An absent or incomplete remote result does not prove that execution never
 began.  Transport happens after execution.  Ask the operator rather than
@@ -196,19 +214,20 @@ semantics in this spike.
 * Purge behavior
 
 The operator may explicitly run =seal-exec.sh purge=.  After a literal =purge=
-confirmation, it removes local =ready/= and uses a deleting rsync scoped to
-peer =ready/= only.
+confirmation, it replaces both operator and agent mailboxes with a fresh shape
+containing this contract and empty =ready/=, =claimed/=, =output/=, and
+=world/= directories.
 
-Purge intentionally destroys every unclaimed command visible in that subtree.
-There is no agent/operator lock protocol yet.  If a ready command disappears
-without a claimed result, coordinate with the operator before submitting a new
-unique request.
+Purge intentionally destroys proposals, results, captured output, and world
+state.  There is no agent/operator lock protocol yet.  Do not publish while a
+purge is in progress.  After reset, reread the fresh contract and begin with a
+new unique command ID.
 
 * Non-claims
 
 This spike does not provide:
 
-- automatic polling, scheduling, or notification;
+- agent-side polling, scheduling, or notification;
 - command-language validation or a claim that reviewed code is safe;
 - isolation from network or external credentialed effects;
 - transactional shared-directory queue semantics;

@@ -7,9 +7,9 @@
 This guide tells an operator how to exercise the experimental one-shot command
 broker on the =seal-v0.1= branch.
 
-The broker is a manual spike, not a daemon or hardened security boundary.  Each
-invocation considers at most one proposal.  Operator review remains the
-authorization decision.
+The broker is a watched manual spike, not a daemon or hardened security
+boundary.  It polls automatically, processes one proposal at a time, and
+stops for operator review before every execution.
 
 The agent-facing workflow is recorded separately in [[file:contract.org][contract.org]].  Copy that
 file into the mailbox so an agent can discover the current convention.
@@ -101,7 +101,7 @@ cp "$CONTRACT" mailbox/contract.org
 The committed =contract.org= is the reference record.  Its mailbox copy is
 agent-readable guidance and may be replaced as this experiment changes.
 
-* Execute one proposal
+* Watch for proposals
 
 The agent publishes a proposal with this minimum shape:
 
@@ -116,10 +116,10 @@ From the operator workspace root, run:
 
 #+begin_src bash
 cd /path/to/operator-workspace
-SEAL_BIN="$SEAL" "$BROKER" run
+SEAL_BIN="$SEAL" "$BROKER" watch
 #+end_src
 
-=run= is the default, so omitting it has the same effect:
+=watch= is the default, so omitting it has the same effect:
 
 #+begin_src bash
 SEAL_BIN="$SEAL" "$BROKER"
@@ -129,7 +129,9 @@ The broker performs this cycle:
 
 #+begin_example
 seal pull
-  -> choose newest unclaimed ready command
+  -> no proposal: wait two seconds, then pull again
+  -> choose strict newest unclaimed ready command
+       multiple: warn and mark every older proposal superseded
   -> move ready/<id> to claimed/<id>
   -> show ID, SHA-256 digest, line count, and numbered script
   -> ask operator
@@ -138,6 +140,7 @@ seal pull
        other -> refuse
   -> write disposition and captured output
   -> seal push
+  -> wait two seconds, then pull again
 #+end_example
 
 The script warns when =command.sh= exceeds 40 lines.  The warning does not
@@ -146,9 +149,20 @@ prevent execution.
 Typing =edit= changes the proposal under review.  After editing, review the
 redisplayed bytes and digest; the result records =edited= as =true=.
 
-One invocation handles at most one command.  Invoke the broker again when
-another command is ready.  If nothing is ready, it reports that fact and exits
-without pushing.
+The agent is expected to publish one command, poll for its terminal result,
+then publish the next.  Multiple unclaimed proposals signal protocol drift.
+The broker still behaves deterministically: newest wins and older proposals
+receive =superseded= results without execution.
+
+Press =Ctrl-C= to stop watching.  For one pull/review iteration instead, run:
+
+#+begin_src bash
+SEAL_BIN="$SEAL" "$BROKER" run
+#+end_src
+
+If nothing is ready, =run= reports that fact and exits without pushing.  After
+a completed command, =run= returns that command's exit code; =watch= records
+the exit code and continues so the agent can fail forward.
 
 * Inspect results
 
@@ -168,13 +182,13 @@ mailbox/
     ...persistent working state...
 #+end_example
 
-=result.toml= reports =refused=, =invalid=, =started=, or =completed=.  For a
-completed attempt, inspect =exit_code= rather than treating completion as
-success.
+=result.toml= reports =refused=, =invalid=, =superseded=, =started=, or
+=completed=.  For a completed attempt, inspect =exit_code= rather than treating
+completion as success.
 
 Standard output and standard error are displayed during execution and retained
-in =output/=.  After a successful result push, the broker returns the proposed
-command's exit code.
+in =output/=.  After a successful result push, =run= returns the proposed
+command's exit code; =watch= records it and resumes polling.
 
 Ordinary Seal synchronization does not propagate deletion.  The peer may
 therefore retain =ready/<id>/= after the operator has claimed it.  Presence of
@@ -200,21 +214,28 @@ those effects before typing =yes=.
 Everything written under the mailbox may be transported back to the agent.
 Do not expose secrets through scripts, output, or ad-hoc result files.
 
-* Purge pending proposals
+* Purge and reinitialize the mailbox
 
-To remove every currently visible unclaimed proposal:
+To destroy both mailbox copies and reinstall a fresh shape:
 
 #+begin_src bash
 cd /path/to/operator-workspace
 SEAL_BIN="$SEAL" "$BROKER" purge
 #+end_src
 
-The broker pulls first, displays the scope, and requires the literal response
-=purge=.  It removes local =ready/= and performs a deleting rsync scoped to peer
-=ready/= only.  It does not remove =claimed/=, =output/=, or =world/=.
+The broker displays the scope and requires the literal response =purge=.  It
+stages a mailbox containing the current =contract.org= and empty =ready/=,
+=claimed/=, =output/=, and =world/= directories.  It deleting-syncs that shape
+to the peer, then replaces the local mailbox only after peer synchronization
+succeeds.
 
-Purge has no queue lock.  A proposal added by the agent during the pull/delete
-window may be destroyed.  Coordinate before purging.
+Purge destroys proposals, dispositions, captured output, ad-hoc files, and
+persistent world state on both sides.  Host-only evidence under
+=.seal-exec/attempts/= is retained.
+
+Purge has no mailbox lock.  Agent writes concurrent with the deleting sync may
+be destroyed or leave a mixed result.  Stop the watch loop and coordinate with
+the agent before purging.
 
 * Interrupted attempts
 

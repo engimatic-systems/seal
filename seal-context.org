@@ -402,7 +402,7 @@ state for such things as a cloned Terraform repository and generated plans.
 This was the first concrete sketch.  The implemented spike below deliberately
 changes its execution unit from =cmd.toml= argv to one =command.sh=.
 
-There is no watcher or poll loop.  The operator manually invokes
+At this stage there was no watcher or poll loop.  The operator manually invoked
 =seal-exec.sh= when ready to consider one command.
 
 ** Proposed interaction
@@ -427,7 +427,7 @@ proposed invocation and refuses dangerous or surprising commands.  This is an
 intentional use of operator judgment during discovery, not an assertion that
 the script has validated arbitrary command safety.
 
-** Implemented spike revision: one =command.sh=
+** Initial implemented spike revision: one =command.sh=
 
 Further grilling moved the experiment closer to the usability of the original
 mailbox.  One command is now a directory containing a single =command.sh=:
@@ -463,14 +463,88 @@ read-only over the claimed script path during execution.  Host filesystem paths
 outside the mailbox are mounted read-only; network and external authority are
 not constrained.
 
-The spike also includes an explicit =purge= operation.  It removes local
-=ready/= and builds a queue-scoped =rsync --delete= invocation that empties only
+The initial spike also included an explicit =purge= operation.  It removed local
+=ready/= and built a queue-scoped =rsync --delete= invocation that emptied only
 peer =ready/=, leaving the rest of the mailbox outside that destructive sync.
 This is operator-requested destructive cleanup, not ordinary claim propagation.
 
 The larger scope and weaker mailbox isolation are intentional.  They move the
 experience closer to the intended workflow so the experiment can reveal useful
 friction.  They are not a claim that this is the eventual Seal boundary.
+
+** Friction from retry and merge-only history
+
+*** Observation
+
+Early use immediately exposed two related liabilities.  There was no useful
+operator-side retry mechanic, and failed or obsolete material accumulated
+because ordinary Seal transfers merge trees rather than propagate deletion.
+
+An execution retry and a result-publication retry are not the same operation.
+Re-executing old bytes may repeat an external effect.  Republishing evidence
+should not execute anything.  A transport failure after launch can leave an
+unknown outcome that permits neither blind replay nor ordinary progress.
+
+*** Fail-forward answer
+
+Rosin prefers fail-forward over a privileged execution retry.  If the agent
+proposes one small command at a time, a known failure becomes evidence for the
+next proposal:
+
+#+begin_example
+command fails
+  -> preserve result and changed world
+  -> agent observes them
+  -> agent proposes one corrective command under a new ID
+  -> operator attests the new consequence
+#+end_example
+
+Even an intentional repetition is a fresh proposal and receives fresh review.
+This favors small commands over heavy scripts.  The useful unit is not exactly
+one argv or a line limit; it is one consequence that can be understood and
+corrected independently.
+
+Old attempts may remain as evidence.  Their accumulation is then history, not
+queue state.  Destructive cleanup can be explicit maintenance rather than a
+precondition for protocol correctness.
+
+** Watched operator-agent dialogue
+
+*** Hypothesis
+
+Two polling loops can form a lockstep dialogue through the mailbox.  The agent
+publishes one command and polls for its result.  The operator-side broker polls
+for a fresh command, stops for =yes= or =edit= attestation, executes it, and
+publishes the terminal result.  The agent then proposes the next command.
+
+The loop automates availability and result transport, not authorization.  A
+known command failure is returned and watching continues.  A pull or push
+failure stops the broker; a failed post-execution push must never cause
+automatic re-execution.
+
+*** Multiple proposals signal drift
+
+The expected cardinality is one unclaimed proposal.  If several appear, strict
+newest-first behavior applies.  Merely choosing newest would be insufficient:
+the next watch iteration could otherwise execute the remaining commands in
+reverse order.
+
+The current spike therefore marks every older simultaneously visible proposal
+=superseded=, names the winning command, and executes none of them.  The newest
+proposal alone reaches operator review.  Surviving peer-side =ready/= copies
+remain ineligible because same-ID =claimed/= markers win.
+
+*** Full mailbox reset
+
+Queue-scoped purge was too narrow for rapid experimentation.  The current
+=purge= operation is an explicit reset: after literal confirmation it stages a
+fresh mailbox containing =contract.org= and empty =ready/=, =claimed/=,
+=output/=, and =world/= directories, deleting-syncs that shape to the peer,
+then replaces the local mailbox.  Host-only attempt evidence remains outside
+the reset.
+
+This operation deliberately destroys history and world state.  It still has no
+distributed lock, so operator and agent must coordinate quiescence around it.
 
 ** A filesystem-write guard
 
@@ -509,10 +583,11 @@ various delete timing modes change when deletion occurs, not the underlying
 ownership mistake.  A bidirectional, concurrently written mailbox cannot use
 whole-tree mirror deletion to express a one-party queue transition.
 
-Possible exploratory responses include treating =claimed/X= as a marker that
+Possible exploratory responses included treating =claimed/X= as a marker that
 makes any surviving =ready/X= ineligible, copying rather than pretending the
 transport performed a move, asking the agent to clean acknowledged ready
-entries, or later adding a queue-specific mutation.  None has been selected.
+entries, or later adding a queue-specific mutation.  The current spike selects
+the additive claimed-marker interpretation; deletion remains maintenance.
 
 *** Late reconciliation of =ready/=
 
@@ -621,8 +696,10 @@ The prototype can use crude states, but it must not confuse them silently.
 - Is attestation separate from execution, or one deliberate interaction?
 - Which failures are retryable publication failures, and which create an
   unknown execution outcome?
-- Does the agent submit one command only after seeing the preceding result, or
-  can it queue speculative successors?
+- What operator recovery surface republishes a result after post-execution
+  transport failure without exposing an execution retry?
+- Is filesystem modification time sufficient for strict-newest identity, or
+  will the dialogue eventually need an explicit sequence relation?
 - How much of a command directory returns to the agent?
 - What minimum result must survive output-file clobbering?
 - When does a world-reconciliation recipe run, and what does its success mean?
