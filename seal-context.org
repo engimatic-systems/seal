@@ -886,6 +886,72 @@ For the present plan/apply case, two related identities matter:
 Recording both makes the local handoff inspectable.  Neither represents remote
 cloud state, ambient credentials, or every external input used by the tools.
 
+*** Evidence from a Terraform offboarding field run
+
+Rosin returned an agent-side mailbox archive from one end-to-end Azure and
+Terraform offboarding run.  It contains 25 claimed proposals: 19 completed
+with exit zero, four completed with exit one, and two were refused.  All 25
+also remain under =ready/=, giving concrete scale to the non-deleting transport
+and queue-compaction problem.
+
+The strongest observed value was semantic review, not generic containment.
+Small plan and apply commands exposed several consequential but out-of-scope
+effects before mutation.  Captured plan stdout was sufficient for operator
+review without auxiliary log commands.  Fail-forward proposals localized each
+failure and kept retry identity unambiguous.
+
+Pure argv plus =cwd= carried clone, init, plan, apply, and git operations.  A
+small explicit shell escape remained useful for fixed Azure CLI loops.  This
+supports the current language shape: direct argv is the ordinary path; shell is
+visible when sequencing is genuinely part of one reviewed operation.
+
+The proposals also use TOML comments heavily.  Those comments state expected
+effects, sequencing, recovery, and reasons for narrowed plans.  They are part
+of the exact displayed and hashed proposal even though they are not structured
+fields.  This is evidence that the current proposal already carries a useful
+human review layer without prematurely standardizing an intent schema.
+
+The archive spans execution revisions.  Early init output records Azure CLI
+failing to write =~/.azure/az.sess= under the read-only host mount.  Later
+=bwrap= Azure commands complete successfully after operator-private session
+state was introduced.  A later plan fails for missing AWS profiles, showing
+that the writable surface solved the Azure mechanism while environment
+reconciliation still needs to establish each required session backend.
+
+Terraform failure semantics need care.  Two nonzero plans printed a plausible
+=Plan: ...= summary but did not print the successful =Saved the plan to:= line.
+The same =plan.tfplan= pathname was reused across fresh proposal IDs.  Therefore
+artifact presence cannot safely override =exit_code=: an old successful plan
+may survive a later failed re-plan.  Fresh command identity did not create
+fresh artifact identity.
+
+A generic produced-artifact convention would need at least provenance and
+freshness: a unique output path, or a broker-observed pre/post artifact digest
+bound to the producing attempt.  Tool-specific validity remains separate.  A
+nonzero command which rendered a partial diff should not silently become an
+applyable plan merely because bytes exist at the requested path.
+
+Two refusals have no reason.  This leaves the agent unable to distinguish a
+semantic rejection from operator input error.  An optional operator-authored
+reason appears low-cost and directly useful, while retry would still require a
+fresh proposal ID.
+
+The agent currently treats a terminal =result.toml= beneath =claimed/<id>/= as
+the completion signal.  That works, but the archive's complete duplication of
+=ready/= and =claimed/= shows why explicit terminal visibility and eventual
+compaction remain related lifecycle questions rather than cosmetic cleanup.
+
+One agent publication failed before atomic rename because its staging path was
+relative to an unexpected cwd.  This is outside broker execution, but suggests
+agent-side publication tooling should use absolute paths and verify that the
+final =ready/<id>/= rename landed before polling.
+
+The returned archive's =world/= contains only =.tmp/=, not the repository or
+saved plan files used in the run.  The command and output record supports the
+workflow conclusions above, but cannot establish actual final plan-file bytes,
+worktree state, or world size.  Whether world was intentionally omitted remains
+to be confirmed.
+
 * Questions still alive
 
 - What exactly is one proposal: argv, script text, a directory, or another
@@ -919,6 +985,12 @@ cloud state, ambient credentials, or every external input used by the tools.
   enforce writable access only to declared scopes?
 - What explicit operator action adopts initial, recovered, or intentionally
   out-of-band world state into the broker's continuity chain?
+- How does a produced artifact prove freshness when commands reuse a pathname?
+- Is artifact identity a generic broker result, a proposal-declared output, or
+  a tool-specific convention layered above Seal?
+- What operator interaction captures an optional refusal reason without making
+  the attest loop cumbersome?
+- When and by whom are terminal ready/claimed entries compacted?
 - Does recurring friction eventually favor a restricted runner, or does the
   permissive operator-mediated path remain the primary product?
 - Which protections are necessary for exploratory honesty, and which would be
