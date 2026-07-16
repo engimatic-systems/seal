@@ -438,6 +438,23 @@ Seal v0 intentionally does not propagate deletions.  If the operator locally
 moves =ready/X= to =claimed/X= and then pushes, the peer receives the claimed
 copy but retains =ready/X=.  A later pull can recreate the local ready entry.
 
+Adding whole-tree =rsync --delete= does not safely repair this.  Rsync deletes
+receiver-side entries that are absent from the sender within synchronized
+directories.  Consider this interleaving:
+
+#+begin_example
+operator pulls ready/X
+agent publishes ready/Y
+operator moves local ready/X to claimed/X
+operator pushes its now-stale mailbox with --delete
+#+end_example
+
+During the push, the operator mailbox is the sending side.  The agent's new
+=ready/Y= exists only on the receiving side, so =--delete= may remove it.  The
+various delete timing modes change when deletion occurs, not the underlying
+ownership mistake.  A bidirectional, concurrently written mailbox cannot use
+whole-tree mirror deletion to express a one-party queue transition.
+
 Possible exploratory responses include treating =claimed/X= as a marker that
 makes any surviving =ready/X= ineligible, copying rather than pretending the
 transport performed a move, asking the agent to clean acknowledged ready
