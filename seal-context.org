@@ -810,6 +810,82 @@ claim is narrower: session mutation works inside =bwrap= without making the
 real host configuration writable or transporting session material through the
 mailbox.
 
+*** World revisions provide continuity, not innocence
+
+The live Terraform workflow now generates a saved plan beneath =world/= and
+applies it in a later attested command.  Operator attention currently supplies
+the missing continuity claim: the apply is intended to consume the same local
+inputs and exact plan produced by the reviewed plan step.
+
+One possible mechanical claim is an expected digest of =world/= in each
+proposal.  This detects drift only if the expected digest has an independent
+trusted anchor.  An agent which can modify shared world state can also hash its
+modified bytes and propose that digest.  Agreement between agent claim and
+current bytes proves identity, not safety or provenance.
+
+A stronger exploratory shape is a broker-held hash chain:
+
+#+begin_example
+before pull or execution:
+  trusted digest = previous attested command's recorded post-state
+
+after pull, before attestation:
+  hash current scoped world
+  require it to equal trusted digest
+  require proposal's expected digest to equal it
+
+after every attempted command, including known failure:
+  hash resulting scoped world
+  record before and after digests in host evidence and returned result
+  make after digest the next trusted digest
+
+after interrupted or unknown execution:
+  do not silently advance trust; require operator reconciliation
+#+end_example
+
+This would detect shared-world additions or modifications arriving through a
+later =seal pull=, even if the accompanying proposal names their new digest.  It
+would not make an attested state transition safe.  An approved command can
+still deliberately or unexpectedly corrupt world state; the chain says which
+reviewed transition produced the bytes.
+
+Hashing a compressed tar archive is not necessary for the identity claim and
+adds format variability.  A deterministic tree digest can stream relative
+paths, entry types, selected metadata, symlink targets, and file bytes in a
+defined order without writing an archive.  Its exact filesystem semantics
+remain a contract question: modes, hard links, sparse files, extended
+attributes, and ignored caches can all change what "same world" means.
+
+Hashing all of a large =world/= is necessarily proportional to its readable
+content.  Separate =world/<workstream>/= directories could make revision scope,
+ownership, and cost more legible.  A proposal would name one or more workstream
+scopes and their expected revisions.  This helps Terraform repositories and
+saved artifacts without pretending unrelated work shares one revision.
+
+Scope declarations alone do not enforce scope.  The current =bwrap= shape
+mounts the whole mailbox writable, so a command claiming workstream A can still
+alter B.  A later enforcement experiment could mount all of =world/= read-only
+and add writable nested binds only for declared workstreams.  Until then, the
+broker would need to rehash every potentially reachable scope to detect such a
+mutation after the fact.
+
+A digest is also point-in-time evidence.  It detects an out-of-band mutation at
+the next check, but does not stop another process from changing files between
+pre-execution validation and the command's reads.  The single broker loop and
+=bwrap= process lifetime may narrow that race; direct execution and detached
+writers broaden it.  Stronger prevention would require immutable snapshots or
+read-only input revisions with separately bound outputs, not only hashes.
+
+For the present plan/apply case, two related identities matter:
+
+- scoped workstream digest, covering the local context from which the plan is
+  consumed; and
+- saved plan-file digest, binding the apply command to the exact artifact
+  returned by the plan command.
+
+Recording both makes the local handoff inspectable.  Neither represents remote
+cloud state, ambient credentials, or every external input used by the tools.
+
 * Questions still alive
 
 - What exactly is one proposal: argv, script text, a directory, or another
@@ -833,6 +909,16 @@ mailbox.
   backend reconciled without transporting credentials?
 - Is private runtime state persistent across commands, refreshed per command,
   or selected per runtime profile?
+- Does Seal maintain a host-side trusted world revision, or only validate an
+  agent-supplied expected revision?
+- What filesystem facts belong in a deterministic workstream digest?
+- Does a command claim one workstream revision or an explicit set of them?
+- Should important handoff artifacts such as saved Terraform plans receive
+  separate digests in addition to their containing workstream revision?
+- Does a declared workstream revision remain observational, or does =bwrap=
+  enforce writable access only to declared scopes?
+- What explicit operator action adopts initial, recovered, or intentionally
+  out-of-band world state into the broker's continuity chain?
 - Does recurring friction eventually favor a restricted runner, or does the
   permissive operator-mediated path remain the primary product?
 - Which protections are necessary for exploratory honesty, and which would be
