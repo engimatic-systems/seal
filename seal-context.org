@@ -946,11 +946,24 @@ relative to an unexpected cwd.  This is outside broker execution, but suggests
 agent-side publication tooling should use absolute paths and verify that the
 final =ready/<id>/= rename landed before polling.
 
-The returned archive's =world/= contains only =.tmp/=, not the repository or
-saved plan files used in the run.  The command and output record supports the
-workflow conclusions above, but cannot establish actual final plan-file bytes,
-worktree state, or world size.  Whether world was intentionally omitted remains
-to be confirmed.
+The returned archive's =world/= contains only =.tmp/= because Rosin
+intentionally omitted the large proprietary company repository before sharing
+the evidence.  During the run, world held a Terraform repository checked out to
+the working branch, with saved plan files inside individual stack directories.
+The command and output record supports the workflow conclusions above, but the
+redacted archive cannot establish actual final plan-file bytes or worktree
+state.
+
+This layout sharpens revision scope.  The repository checkout is a plausible
+workstream boundary, while each saved plan is a nested handoff artifact.  A
+stack directory alone may be too narrow: branch changes, root configuration,
+shared inputs, generated files, and commands such as =git pull= operate across
+the checkout.  Conversely, hashing the complete checkout may include large
+tool caches and provider material.  A possible later representation is
+therefore composite rather than one undifferentiated tar digest: checkout
+revision and dirty state, plus exact digests for named saved-plan artifacts.
+Which ignored or generated files affect planning remains an open semantic
+question rather than a safe exclusion list already known to Seal.
 
 * Questions still alive
 
