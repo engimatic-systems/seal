@@ -78,11 +78,13 @@ a new ID.
 
 ** Write =command.toml=
 
-=command.toml= contains exactly one top-level key: a nonempty array named
-=argv=.  Every element must be a string, and =argv[0]= must not be empty:
+=command.toml= requires a nonempty array named =argv= and permits one optional
+top-level string named =cwd=.  Every argv element must be a string, and
+=argv[0]= must not be empty:
 
 #+begin_src toml
-argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
+cwd = "terraform"
+argv = ["git", "status", "--short", "--branch"]
 #+end_src
 
 The broker preserves argument boundaries and executes this vector directly.
@@ -99,8 +101,20 @@ argv = ["bash", "-lc", "printf '%s\\n' \"$VALUE\" > result.txt"]
 
 Prefer one small, independently consequential operation that the operator can
 review and that a later command can correct.  Use TOML comments to explain
-intent or cheap preconditions.  Do not add fields for cwd, environment,
-redirection, or sequencing; the current broker rejects unknown top-level keys.
+intent or cheap preconditions.
+
+=cwd= defaults to ="."=, meaning =mailbox/world/=.  A supplied cwd must be a
+nonempty relative path without =..= components.  It must already name a
+directory whose resolved physical location remains beneath =world/=.  Absolute
+paths, missing directories, and symlinks escaping =world/= are invalid.  To
+create a future cwd, first propose from the default cwd:
+
+#+begin_src toml
+argv = ["mkdir", "-p", "terraform"]
+#+end_src
+
+Do not add fields for environment, redirection, or sequencing; the current
+broker rejects unknown top-level keys.
 
 Do not assume that publication implies approval.  The operator may decline or
 edit the TOML.
@@ -116,8 +130,8 @@ reviewed.  Every older proposal moves to =claimed/= with a =superseded= result
 naming the winning command.  Do not treat the mailbox as a backlog.
 
 The broker snapshots and parses =command.toml=.  The operator sees its numbered
-exact bytes, a SHA-256 digest, and every parsed argument rendered separately.
-The operator then chooses:
+exact bytes, a SHA-256 digest, requested and resolved cwd, and every parsed
+argument rendered separately.  The operator then chooses:
 
 - =yes=: execute the displayed argv;
 - =edit=: edit it in =vi=, reparse, redisplay, and decide again; or
@@ -172,7 +186,7 @@ mechanically.
 
 The proposed argv runs with:
 
-- current directory =mailbox/world/=;
+- current directory =mailbox/world/<cwd>/=, with ="."= as the default;
 - the broker's inherited environment as captured when the watch process
   started, including =PATH=, credentials, and any active =mise= context;
 - =TMPDIR= set to =mailbox/world/.tmp=;
@@ -215,11 +229,12 @@ argv = ["git", "clone", "--", "https://example.invalid/terraform.git", "terrafor
 After observing that result, a later proposal can inspect persistent state:
 
 #+begin_src toml
-argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
+cwd = "terraform"
+argv = ["git", "status", "--short", "--branch"]
 #+end_src
 
-Another can run =tofu -chdir=terraform plan=.  Repository state remains an
-implicit part of the operator-understood world; Seal does not attest Git
+Another can use the same cwd for a =tofu plan= argv.  Repository state remains
+an implicit part of the operator-understood world; Seal does not attest Git
 semantics in this spike.
 
 * Purge behavior

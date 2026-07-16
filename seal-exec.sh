@@ -166,9 +166,10 @@ except (OSError, tomllib.TOMLDecodeError) as error:
     print(f"cannot parse {command_path.name}: {error}", file=sys.stderr)
     raise SystemExit(1)
 
-if set(command) != {"argv"}:
+allowed_keys = {"argv", "cwd"}
+if "argv" not in command or not set(command) <= allowed_keys:
     print(
-        f"{command_path.name} must contain exactly one top-level argv key",
+        f"{command_path.name} must contain argv and may contain only cwd",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -190,9 +191,51 @@ if argv[0] == "":
     print("argv[0] must not be empty", file=sys.stderr)
     raise SystemExit(1)
 
+cwd = command.get("cwd", ".")
+if not isinstance(cwd, str) or not cwd:
+    print("cwd must be a nonempty string", file=sys.stderr)
+    raise SystemExit(1)
+if "\0" in cwd:
+    print("cwd contains a null byte", file=sys.stderr)
+    raise SystemExit(1)
+if os.path.isabs(cwd):
+    print("cwd must be relative to mailbox/world", file=sys.stderr)
+    raise SystemExit(1)
+if ".." in Path(cwd).parts:
+    print("cwd must not contain '..' path components", file=sys.stderr)
+    raise SystemExit(1)
+
+sys.stdout.buffer.write(os.fsencode(cwd) + b"\0")
 for value in argv:
     sys.stdout.buffer.write(os.fsencode(value) + b"\0")
 PY
+}
+
+resolve_command_cwd() {
+  local requested="$1"
+  local world_path resolved
+
+  if [[ ! -d "$WORLD" || -L "$WORLD" ]]; then
+    warn "mailbox/world must be a regular directory"
+    return 1
+  fi
+  world_path="$(realpath -e -- "$WORLD")" ||
+    { warn "cannot resolve mailbox/world"; return 1; }
+  resolved="$(realpath -e -- "$WORLD/$requested")" ||
+    { warn "cwd does not name an existing path beneath mailbox/world"; return 1; }
+  if [[ ! -d "$resolved" ]]; then
+    warn "cwd does not name a directory"
+    return 1
+  fi
+  case "$resolved" in
+    "$world_path"|"$world_path"/*)
+      ;;
+    *)
+      warn "cwd resolves outside mailbox/world"
+      return 1
+      ;;
+  esac
+  COMMAND_CWD_PATH="$resolved"
 }
 
 display_command() {
@@ -202,6 +245,9 @@ display_command() {
   printf '\ncommand: %s\n' "$CLAIM_ID"
   printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
   nl -ba -- "$command_file"
+  printf '\nrequested cwd: '
+  printf '%q' "$COMMAND_CWD"
+  printf '\nresolved cwd:  %s\n' "$COMMAND_CWD_PATH"
   printf '\nparsed argv:\n'
   for index in "${!COMMAND_ARGV[@]}"; do
     printf '  [%s] ' "$index"
@@ -218,11 +264,13 @@ record_mailbox_result() {
 
 execute_claim() {
   local command_file="$CLAIM_DIR/command.toml"
-  local answer edited=false
+  local answer edited=false command_valid
+  local COMMAND_CWD COMMAND_CWD_PATH
   local review_dir review argv_file
   local attempt snapshot started_at finished_at exit_code
   local stdout_pipe stderr_pipe stdout_pid stderr_pid stdout_status stderr_status
   local -a COMMAND_ARGV=()
+  local -a command_records=()
 
   if [[ ! -f "$command_file" || -L "$command_file" ]]; then
     warn "claimed command must contain a regular, non-symlink command.toml"
@@ -243,7 +291,19 @@ execute_claim() {
   while true; do
     cp -- "$command_file" "$review"
     COMMAND_DIGEST="$(command_digest "$review")"
+    command_valid=true
     if ! parse_command "$review" "$argv_file"; then
+      command_valid=false
+    else
+      command_records=()
+      mapfile -d '' -t command_records <"$argv_file"
+      COMMAND_CWD="${command_records[0]}"
+      COMMAND_ARGV=("${command_records[@]:1}")
+      if ! resolve_command_cwd "$COMMAND_CWD"; then
+        command_valid=false
+      fi
+    fi
+    if [[ "$command_valid" != true ]]; then
       rm -f -- "$argv_file"
       warn "command.toml is not executable"
       if ! read -r -p "Type 'edit' to open vi, anything else to reject invalid command: " answer; then
@@ -265,8 +325,6 @@ execute_claim() {
       return 0
     fi
 
-    COMMAND_ARGV=()
-    mapfile -d '' -t COMMAND_ARGV <"$argv_file"
     rm -f -- "$argv_file"
     display_command "$review"
     if ! read -r -p "Type 'yes' to execute, 'edit' to open vi, anything else to refuse: " answer; then
@@ -324,7 +382,7 @@ execute_claim() {
     --ro-bind "$snapshot" "$command_file" \
     --dev /dev \
     --proc /proc \
-    --chdir "$WORLD" \
+    --chdir "$COMMAND_CWD_PATH" \
     --setenv TMPDIR "$WORLD/.tmp" \
     -- "${COMMAND_ARGV[@]}" \
     >"$stdout_pipe" 2>"$stderr_pipe"
@@ -361,6 +419,7 @@ run_one() {
   require_command vi
   require_command sha256sum
   require_command python3
+  require_command realpath
   [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
 
   sync_pull

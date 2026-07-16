@@ -56,13 +56,14 @@ workflow machinery.  The execution waist preserves the exact approved
 =command.toml= bytes, their parsed argv vector, one launch, separated output
 streams, exit status, and a host-local attempt record.
 
-The proposal contains one argv vector.  Shell execution remains available only
-when the proposal names a shell explicitly.  =bwrap= gives the launched command
-a read-only view of the host and a writable view of the whole mailbox.  It
-inherits the broker's ambient environment, including =PATH= and credentials,
-while overriding only =TMPDIR=.  It does not restrict network access, cloud
-authority, reads from the host, or writes made through external APIs.  Operator
-review is the command-safety decision in this experiment.
+The proposal contains one argv vector and an optional cwd relative to =world/=.
+Shell execution remains available only when the proposal names a shell
+explicitly.  =bwrap= gives the launched command a read-only view of the host and
+a writable view of the whole mailbox.  It inherits the broker's ambient
+environment, including =PATH= and credentials, while overriding only =TMPDIR=.
+It does not restrict network access, cloud authority, reads from the host, or
+writes made through external APIs.  Operator review is the command-safety
+decision in this experiment.
 
 The normal operator surface is a watch loop.  It automates mailbox polling and
 result publication while leaving every attestation prompt synchronous and
@@ -89,11 +90,12 @@ run:
   require a regular, non-symlink command.toml
     invalid -> record invalid result -> seal push -> failure
   copy command.toml to a host-only review snapshot
-  parse snapshot as exactly one nonempty argv array
+  parse snapshot as one nonempty argv array + optional relative cwd
+  resolve cwd as an existing directory physically beneath mailbox/world
     invalid:
       edit -> run vi outside sandbox -> snapshot + parse again
       other/EOF -> record invalid result -> seal push -> failure
-  display numbered exact TOML + digest + indexed escaped argv
+  display numbered exact TOML + digest + cwd resolution + indexed escaped argv
   ask operator:
     edit -> run vi outside sandbox -> snapshot + parse + display again
     yes  -> move exact review snapshot into host-only attempt directory
@@ -104,7 +106,8 @@ run:
     host root read-only
     whole mailbox writable
     approved snapshot mounted read-only over claimed command.toml
-    cwd mailbox/world; TMPDIR points beneath world; host /tmp stays read-only
+    cwd resolves beneath mailbox/world; TMPDIR points beneath world
+    host /tmp stays read-only
     ambient broker environment inherited
     parsed argv executed directly without shell re-parsing
   wait for command and both collectors
@@ -292,9 +295,10 @@ except (OSError, tomllib.TOMLDecodeError) as error:
     print(f"cannot parse {command_path.name}: {error}", file=sys.stderr)
     raise SystemExit(1)
 
-if set(command) != {"argv"}:
+allowed_keys = {"argv", "cwd"}
+if "argv" not in command or not set(command) <= allowed_keys:
     print(
-        f"{command_path.name} must contain exactly one top-level argv key",
+        f"{command_path.name} must contain argv and may contain only cwd",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -316,9 +320,51 @@ if argv[0] == "":
     print("argv[0] must not be empty", file=sys.stderr)
     raise SystemExit(1)
 
+cwd = command.get("cwd", ".")
+if not isinstance(cwd, str) or not cwd:
+    print("cwd must be a nonempty string", file=sys.stderr)
+    raise SystemExit(1)
+if "\0" in cwd:
+    print("cwd contains a null byte", file=sys.stderr)
+    raise SystemExit(1)
+if os.path.isabs(cwd):
+    print("cwd must be relative to mailbox/world", file=sys.stderr)
+    raise SystemExit(1)
+if ".." in Path(cwd).parts:
+    print("cwd must not contain '..' path components", file=sys.stderr)
+    raise SystemExit(1)
+
+sys.stdout.buffer.write(os.fsencode(cwd) + b"\0")
 for value in argv:
     sys.stdout.buffer.write(os.fsencode(value) + b"\0")
 PY
+}
+
+resolve_command_cwd() {
+  local requested="$1"
+  local world_path resolved
+
+  if [[ ! -d "$WORLD" || -L "$WORLD" ]]; then
+    warn "mailbox/world must be a regular directory"
+    return 1
+  fi
+  world_path="$(realpath -e -- "$WORLD")" ||
+    { warn "cannot resolve mailbox/world"; return 1; }
+  resolved="$(realpath -e -- "$WORLD/$requested")" ||
+    { warn "cwd does not name an existing path beneath mailbox/world"; return 1; }
+  if [[ ! -d "$resolved" ]]; then
+    warn "cwd does not name a directory"
+    return 1
+  fi
+  case "$resolved" in
+    "$world_path"|"$world_path"/*)
+      ;;
+    *)
+      warn "cwd resolves outside mailbox/world"
+      return 1
+      ;;
+  esac
+  COMMAND_CWD_PATH="$resolved"
 }
 
 display_command() {
@@ -328,6 +374,9 @@ display_command() {
   printf '\ncommand: %s\n' "$CLAIM_ID"
   printf 'sha256:  %s\n\n' "$COMMAND_DIGEST"
   nl -ba -- "$command_file"
+  printf '\nrequested cwd: '
+  printf '%q' "$COMMAND_CWD"
+  printf '\nresolved cwd:  %s\n' "$COMMAND_CWD_PATH"
   printf '\nparsed argv:\n'
   for index in "${!COMMAND_ARGV[@]}"; do
     printf '  [%s] ' "$index"
@@ -344,11 +393,13 @@ record_mailbox_result() {
 
 execute_claim() {
   local command_file="$CLAIM_DIR/command.toml"
-  local answer edited=false
+  local answer edited=false command_valid
+  local COMMAND_CWD COMMAND_CWD_PATH
   local review_dir review argv_file
   local attempt snapshot started_at finished_at exit_code
   local stdout_pipe stderr_pipe stdout_pid stderr_pid stdout_status stderr_status
   local -a COMMAND_ARGV=()
+  local -a command_records=()
 
   if [[ ! -f "$command_file" || -L "$command_file" ]]; then
     warn "claimed command must contain a regular, non-symlink command.toml"
@@ -369,7 +420,19 @@ execute_claim() {
   while true; do
     cp -- "$command_file" "$review"
     COMMAND_DIGEST="$(command_digest "$review")"
+    command_valid=true
     if ! parse_command "$review" "$argv_file"; then
+      command_valid=false
+    else
+      command_records=()
+      mapfile -d '' -t command_records <"$argv_file"
+      COMMAND_CWD="${command_records[0]}"
+      COMMAND_ARGV=("${command_records[@]:1}")
+      if ! resolve_command_cwd "$COMMAND_CWD"; then
+        command_valid=false
+      fi
+    fi
+    if [[ "$command_valid" != true ]]; then
       rm -f -- "$argv_file"
       warn "command.toml is not executable"
       if ! read -r -p "Type 'edit' to open vi, anything else to reject invalid command: " answer; then
@@ -391,8 +454,6 @@ execute_claim() {
       return 0
     fi
 
-    COMMAND_ARGV=()
-    mapfile -d '' -t COMMAND_ARGV <"$argv_file"
     rm -f -- "$argv_file"
     display_command "$review"
     if ! read -r -p "Type 'yes' to execute, 'edit' to open vi, anything else to refuse: " answer; then
@@ -450,7 +511,7 @@ execute_claim() {
     --ro-bind "$snapshot" "$command_file" \
     --dev /dev \
     --proc /proc \
-    --chdir "$WORLD" \
+    --chdir "$COMMAND_CWD_PATH" \
     --setenv TMPDIR "$WORLD/.tmp" \
     -- "${COMMAND_ARGV[@]}" \
     >"$stdout_pipe" 2>"$stderr_pipe"
@@ -487,6 +548,7 @@ run_one() {
   require_command vi
   require_command sha256sum
   require_command python3
+  require_command realpath
   [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
 
   sync_pull
@@ -1811,7 +1873,7 @@ fake seal + fake bwrap + strict argv proposal
   -> newest ready directory becomes claimed
   -> exact argument boundaries survive without shell interpretation
   -> inherited environment is visible
-  -> command runs from world
+  -> relative cwd resolves beneath world and command runs there
   -> stdout/stderr and completed result are returned
   -> host-only approved snapshot remains
 
@@ -1822,6 +1884,10 @@ fake vi changes command.toml
   -> result records edited=true
 
 command.toml contains an extra top-level field
+  run without editing
+  -> proposal is invalid and never executes
+
+cwd is missing or resolves through a symlink outside world
   run without editing
   -> proposal is invalid and never executes
 
@@ -1932,9 +1998,10 @@ argv = ["argv-probe", "edited command"]
 COMMAND
 SH
 
-  cat >"$directory/argv-probe" <<'SH'
+cat >"$directory/argv-probe" <<'SH'
 #!/usr/bin/env bash
 printf 'ambient=<%s>\n' "$AMBIENT_TEST_VALUE"
+printf 'cwd=<%s>\n' "$(pwd)"
 index=0
 for argument in "$@"; do
   printf 'arg[%s]=<%s>\n' "$index" "$argument"
@@ -1986,9 +2053,13 @@ make_fake_tools "$tools"
 
 workspace="$TEST_ROOT/run"
 peer="$TEST_ROOT/run-peer"
-mkdir -p "$workspace/mailbox/ready/20260716-001" "$peer"
+mkdir -p \
+  "$workspace/mailbox/ready/20260716-001" \
+  "$workspace/mailbox/world/nested/work" \
+  "$peer"
 write_local_config "$workspace" "$peer"
 cat >"$workspace/mailbox/ready/20260716-001/command.toml" <<'TOML'
+cwd = "nested/work"
 argv = [
   "argv-probe",
   "two words",
@@ -2004,6 +2075,9 @@ run_spike "$workspace" "$tools" yes "$workspace/transcript"
 [[ -f "$workspace/.seal-exec/attempts/20260716-001/command.toml" ]] || fail "approved snapshot missing"
 assert_file_contains "$workspace/transcript" "parsed argv:"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "ambient=<ambient value>"
+assert_file_contains \
+  "$workspace/mailbox/output/20260716-001.out" \
+  "cwd=<$workspace/mailbox/world/nested/work>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[0]=<two words>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[1]=<*>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[2]=<\$(printf injected)>"
@@ -2016,7 +2090,7 @@ approved_digest="${approved_digest%% *}"
 assert_file_contains \
   "$workspace/mailbox/claimed/20260716-001/result.toml" \
   "command_sha256 = \"$approved_digest\""
-assert_file_contains "$workspace/mailbox/world/artifact.txt" "artifact"
+assert_file_contains "$workspace/mailbox/world/nested/work/artifact.txt" "artifact"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
 
 workspace="$TEST_ROOT/edit"
@@ -2028,6 +2102,7 @@ printf 'argv = ["argv-probe", "original command"]\n' \
 run_spike "$workspace" "$tools" $'edit\nyes' "$workspace/transcript"
 assert_file_contains "$workspace/mailbox/output/20260716-002.out" "arg[0]=<edited command>"
 assert_file_contains "$workspace/mailbox/claimed/20260716-002/result.toml" 'edited = true'
+assert_file_contains "$workspace/mailbox/world/artifact.txt" "artifact"
 
 workspace="$TEST_ROOT/invalid"
 peer="$TEST_ROOT/invalid-peer"
@@ -2035,19 +2110,56 @@ mkdir -p "$workspace/mailbox/ready/20260716-003" "$peer"
 write_local_config "$workspace" "$peer"
 cat >"$workspace/mailbox/ready/20260716-003/command.toml" <<'TOML'
 argv = ["argv-probe"]
-cwd = "/tmp"
+environment = { EXAMPLE = "value" }
 TOML
 set +e
 run_spike "$workspace" "$tools" no "$workspace/transcript"
 invalid_status=$?
 set -e
 [[ "$invalid_status" -eq 1 ]] || fail "invalid command did not fail run"
-assert_file_contains "$workspace/transcript" "exactly one top-level argv key"
+assert_file_contains "$workspace/transcript" "must contain argv and may contain only cwd"
 assert_file_contains \
   "$workspace/mailbox/claimed/20260716-003/result.toml" \
   'status = "invalid"'
 [[ ! -e "$workspace/.seal-exec/attempts/20260716-003" ]] ||
   fail "invalid command created an attempt"
+
+workspace="$TEST_ROOT/cwd-missing"
+peer="$TEST_ROOT/cwd-missing-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-004" "$peer"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-004/command.toml" <<'TOML'
+cwd = "missing"
+argv = ["argv-probe"]
+TOML
+set +e
+run_spike "$workspace" "$tools" no "$workspace/transcript"
+missing_cwd_status=$?
+set -e
+[[ "$missing_cwd_status" -eq 1 ]] || fail "missing cwd did not fail run"
+assert_file_contains "$workspace/transcript" "cwd does not name an existing path"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-004/result.toml" \
+  'status = "invalid"'
+
+workspace="$TEST_ROOT/cwd-escape"
+peer="$TEST_ROOT/cwd-escape-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-005" "$workspace/mailbox/world" "$peer"
+ln -s "$peer" "$workspace/mailbox/world/outside"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-005/command.toml" <<'TOML'
+cwd = "outside"
+argv = ["argv-probe"]
+TOML
+set +e
+run_spike "$workspace" "$tools" no "$workspace/transcript"
+escaping_cwd_status=$?
+set -e
+[[ "$escaping_cwd_status" -eq 1 ]] || fail "escaping cwd did not fail run"
+assert_file_contains "$workspace/transcript" "cwd resolves outside mailbox/world"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-005/result.toml" \
+  'status = "invalid"'
 
 workspace="$TEST_ROOT/supersede"
 peer="$TEST_ROOT/supersede-peer"
@@ -2187,9 +2299,13 @@ assert_file_contains "$workspace/transcript" "purged and reinitialized"
 if [[ -n "${SEAL_E2E_BIN:-}" ]]; then
   workspace="$TEST_ROOT/real"
   peer="$TEST_ROOT/real-peer"
-  mkdir -p "$workspace/mailbox" "$peer/ready/20260716-real"
+  mkdir -p \
+    "$workspace/mailbox" \
+    "$peer/ready/20260716-real" \
+    "$peer/world/nested"
   write_local_config "$workspace" "$peer"
   cat >"$peer/ready/20260716-real/command.toml" <<'TOML'
+cwd = "nested"
 argv = [
   "sh",
   "-c",
@@ -2212,11 +2328,11 @@ TOML
   fi
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"
-  assert_file_contains "$workspace/mailbox/world/real-artifact.txt" "real artifact"
-  assert_file_contains "$workspace/mailbox/world/ambient.txt" "real ambient"
+  assert_file_contains "$workspace/mailbox/world/nested/real-artifact.txt" "real artifact"
+  assert_file_contains "$workspace/mailbox/world/nested/ambient.txt" "real ambient"
   assert_file_contains "$peer/claimed/20260716-real/result.toml" 'status = "completed"'
   assert_file_contains "$peer/output/20260716-real.out" "real stdout"
-  assert_file_contains "$peer/world/real-artifact.txt" "real artifact"
+  assert_file_contains "$peer/world/nested/real-artifact.txt" "real artifact"
 fi
 
 printf 'seal-exec spike tests passed\n'

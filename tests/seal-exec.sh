@@ -76,9 +76,10 @@ argv = ["argv-probe", "edited command"]
 COMMAND
 SH
 
-  cat >"$directory/argv-probe" <<'SH'
+cat >"$directory/argv-probe" <<'SH'
 #!/usr/bin/env bash
 printf 'ambient=<%s>\n' "$AMBIENT_TEST_VALUE"
+printf 'cwd=<%s>\n' "$(pwd)"
 index=0
 for argument in "$@"; do
   printf 'arg[%s]=<%s>\n' "$index" "$argument"
@@ -130,9 +131,13 @@ make_fake_tools "$tools"
 
 workspace="$TEST_ROOT/run"
 peer="$TEST_ROOT/run-peer"
-mkdir -p "$workspace/mailbox/ready/20260716-001" "$peer"
+mkdir -p \
+  "$workspace/mailbox/ready/20260716-001" \
+  "$workspace/mailbox/world/nested/work" \
+  "$peer"
 write_local_config "$workspace" "$peer"
 cat >"$workspace/mailbox/ready/20260716-001/command.toml" <<'TOML'
+cwd = "nested/work"
 argv = [
   "argv-probe",
   "two words",
@@ -148,6 +153,9 @@ run_spike "$workspace" "$tools" yes "$workspace/transcript"
 [[ -f "$workspace/.seal-exec/attempts/20260716-001/command.toml" ]] || fail "approved snapshot missing"
 assert_file_contains "$workspace/transcript" "parsed argv:"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "ambient=<ambient value>"
+assert_file_contains \
+  "$workspace/mailbox/output/20260716-001.out" \
+  "cwd=<$workspace/mailbox/world/nested/work>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[0]=<two words>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[1]=<*>"
 assert_file_contains "$workspace/mailbox/output/20260716-001.out" "arg[2]=<\$(printf injected)>"
@@ -160,7 +168,7 @@ approved_digest="${approved_digest%% *}"
 assert_file_contains \
   "$workspace/mailbox/claimed/20260716-001/result.toml" \
   "command_sha256 = \"$approved_digest\""
-assert_file_contains "$workspace/mailbox/world/artifact.txt" "artifact"
+assert_file_contains "$workspace/mailbox/world/nested/work/artifact.txt" "artifact"
 [[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
 
 workspace="$TEST_ROOT/edit"
@@ -172,6 +180,7 @@ printf 'argv = ["argv-probe", "original command"]\n' \
 run_spike "$workspace" "$tools" $'edit\nyes' "$workspace/transcript"
 assert_file_contains "$workspace/mailbox/output/20260716-002.out" "arg[0]=<edited command>"
 assert_file_contains "$workspace/mailbox/claimed/20260716-002/result.toml" 'edited = true'
+assert_file_contains "$workspace/mailbox/world/artifact.txt" "artifact"
 
 workspace="$TEST_ROOT/invalid"
 peer="$TEST_ROOT/invalid-peer"
@@ -179,19 +188,56 @@ mkdir -p "$workspace/mailbox/ready/20260716-003" "$peer"
 write_local_config "$workspace" "$peer"
 cat >"$workspace/mailbox/ready/20260716-003/command.toml" <<'TOML'
 argv = ["argv-probe"]
-cwd = "/tmp"
+environment = { EXAMPLE = "value" }
 TOML
 set +e
 run_spike "$workspace" "$tools" no "$workspace/transcript"
 invalid_status=$?
 set -e
 [[ "$invalid_status" -eq 1 ]] || fail "invalid command did not fail run"
-assert_file_contains "$workspace/transcript" "exactly one top-level argv key"
+assert_file_contains "$workspace/transcript" "must contain argv and may contain only cwd"
 assert_file_contains \
   "$workspace/mailbox/claimed/20260716-003/result.toml" \
   'status = "invalid"'
 [[ ! -e "$workspace/.seal-exec/attempts/20260716-003" ]] ||
   fail "invalid command created an attempt"
+
+workspace="$TEST_ROOT/cwd-missing"
+peer="$TEST_ROOT/cwd-missing-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-004" "$peer"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-004/command.toml" <<'TOML'
+cwd = "missing"
+argv = ["argv-probe"]
+TOML
+set +e
+run_spike "$workspace" "$tools" no "$workspace/transcript"
+missing_cwd_status=$?
+set -e
+[[ "$missing_cwd_status" -eq 1 ]] || fail "missing cwd did not fail run"
+assert_file_contains "$workspace/transcript" "cwd does not name an existing path"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-004/result.toml" \
+  'status = "invalid"'
+
+workspace="$TEST_ROOT/cwd-escape"
+peer="$TEST_ROOT/cwd-escape-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-005" "$workspace/mailbox/world" "$peer"
+ln -s "$peer" "$workspace/mailbox/world/outside"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-005/command.toml" <<'TOML'
+cwd = "outside"
+argv = ["argv-probe"]
+TOML
+set +e
+run_spike "$workspace" "$tools" no "$workspace/transcript"
+escaping_cwd_status=$?
+set -e
+[[ "$escaping_cwd_status" -eq 1 ]] || fail "escaping cwd did not fail run"
+assert_file_contains "$workspace/transcript" "cwd resolves outside mailbox/world"
+assert_file_contains \
+  "$workspace/mailbox/claimed/20260716-005/result.toml" \
+  'status = "invalid"'
 
 workspace="$TEST_ROOT/supersede"
 peer="$TEST_ROOT/supersede-peer"
@@ -331,9 +377,13 @@ assert_file_contains "$workspace/transcript" "purged and reinitialized"
 if [[ -n "${SEAL_E2E_BIN:-}" ]]; then
   workspace="$TEST_ROOT/real"
   peer="$TEST_ROOT/real-peer"
-  mkdir -p "$workspace/mailbox" "$peer/ready/20260716-real"
+  mkdir -p \
+    "$workspace/mailbox" \
+    "$peer/ready/20260716-real" \
+    "$peer/world/nested"
   write_local_config "$workspace" "$peer"
   cat >"$peer/ready/20260716-real/command.toml" <<'TOML'
+cwd = "nested"
 argv = [
   "sh",
   "-c",
@@ -356,11 +406,11 @@ TOML
   fi
   assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
   assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"
-  assert_file_contains "$workspace/mailbox/world/real-artifact.txt" "real artifact"
-  assert_file_contains "$workspace/mailbox/world/ambient.txt" "real ambient"
+  assert_file_contains "$workspace/mailbox/world/nested/real-artifact.txt" "real artifact"
+  assert_file_contains "$workspace/mailbox/world/nested/ambient.txt" "real ambient"
   assert_file_contains "$peer/claimed/20260716-real/result.toml" 'status = "completed"'
   assert_file_contains "$peer/output/20260716-real.out" "real stdout"
-  assert_file_contains "$peer/world/real-artifact.txt" "real artifact"
+  assert_file_contains "$peer/world/nested/real-artifact.txt" "real artifact"
 fi
 
 printf 'seal-exec spike tests passed\n'

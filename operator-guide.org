@@ -112,15 +112,23 @@ mailbox/
       command.toml
 #+end_example
 
-=command.toml= contains exactly one nonempty string array:
+=command.toml= contains one nonempty argv string array and may contain a
+relative cwd:
 
 #+begin_src toml
-argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
+cwd = "terraform"
+argv = ["git", "status", "--short", "--branch"]
 #+end_src
 
-The broker rejects other top-level fields.  It executes argv directly without
-shell parsing.  A proposal may request a shell explicitly when needed, for
-example =argv = ["bash", "-lc", "..."]=.
+=cwd= defaults to ="."=.  It must already resolve to a directory beneath
+=mailbox/world/=.  Absolute paths, =..= components, missing directories, and
+symlinks resolving outside =world/= are invalid.  The broker rejects other
+top-level fields.  It executes argv directly without shell parsing.  A proposal
+may request a shell explicitly when needed:
+
+#+begin_src toml
+argv = ["bash", "-lc", "..."]
+#+end_src
 
 From the operator workspace root, run:
 
@@ -143,9 +151,9 @@ seal pull
   -> choose strict newest unclaimed ready command
        multiple: warn and mark every older proposal superseded
   -> move ready/<id> to claimed/<id>
-  -> snapshot and parse command.toml
+  -> snapshot and parse command.toml; resolve cwd beneath world
        invalid: offer edit or record invalid result
-  -> show ID, SHA-256 digest, numbered TOML, and indexed argv
+  -> show ID, digest, numbered TOML, cwd resolution, and indexed argv
   -> ask operator
        yes   -> execute
        edit  -> open vi, then reparse, show, and ask again
@@ -208,7 +216,7 @@ therefore retain =ready/<id>/= after the operator has claimed it.  Presence of
 
 Approved argv runs directly under =bwrap= with:
 
-- =mailbox/world/= as current directory;
+- requested cwd beneath =mailbox/world/=, defaulting to =world/= itself;
 - the whole mailbox writable;
 - the exact reviewed =command.toml= snapshot mounted read-only at its claimed
   path;

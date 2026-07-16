@@ -556,17 +556,41 @@ is no longer the natural default proposal language.  Its splitting, expansion,
 redirection, and control flow enlarge the attestation surface even when the
 intended consequence is one ordinary process invocation.
 
-Rosin proposed returning to TOML argv.  The current spike now uses one
-=command.toml= containing exactly one nonempty string array:
+Rosin proposed returning to TOML argv.  The spike moved to one =command.toml=
+with a required nonempty string array:
 
 #+begin_src toml
 argv = ["git", "-C", "terraform", "status", "--short", "--branch"]
 #+end_src
 
-There are no cwd, environment, stdin, pipeline, or sequencing fields.  A shell
-remains an ordinary explicit executable, for example =argv = ["bash", "-lc",
-"..."]=.  This preserves the permissive arbitrary-command boundary while
-making shell interpretation visible.
+The initial argv pass had no cwd, environment, stdin, pipeline, or sequencing
+fields.  A shell remained an ordinary explicit executable:
+
+#+begin_src toml
+argv = ["bash", "-lc", "..."]
+#+end_src
+
+This preserved the permissive arbitrary-command boundary while making shell
+interpretation visible.
+
+*** Cwd becomes the first live expansion
+
+The first live argv command completed without errors.  That is evidence that
+transport, attestation, direct argv execution, ambient environment, bwrap, and
+result return compose in practice, not only in tests.
+
+It also exposed the next friction: without a settable cwd, otherwise simple
+argv commands need tool-specific chdir flags or an explicit shell merely to
+=cd=.  That pushes ordinary locality back across the shell escape hatch.
+
+The current schema therefore permits =cwd= alongside required =argv=.  It
+defaults to ="."= beneath =mailbox/world/=.  A supplied path must be relative,
+must already exist as a directory, and must resolve physically beneath
+=world/=.  Absolute paths, =..= components, and symlinks escaping =world/= are
+rejected before =yes=.  The broker displays both requested and resolved cwd.
+
+This is a concrete expansion driven by observed use.  Environment, stdin,
+pipeline, and sequencing remain outside the structured proposal.
 
 *** Ambient environment remains part of =W=
 
@@ -586,7 +610,7 @@ remains a possible later experiment, not an implicit behavior.
 The broker snapshots =command.toml= before attestation, parses that snapshot
 without =eval= or shell re-parsing, displays both exact source bytes and each
 parsed argument, and holds the parsed vector through =yes=.  =edit= creates a
-new snapshot and repeats parsing and display.  Invalid or additional fields
+new snapshot and repeats parsing and display.  Invalid or unsupported fields
 cannot execute.
 
 The approved snapshot moves into host-only attempt evidence and is mounted
