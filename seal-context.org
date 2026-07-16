@@ -1,0 +1,518 @@
+#+title: Seal context: v0.1 wayfinding and grilling record
+#+date: 2026-07-16
+#+options: toc:3 num:nil
+
+* What this document is
+
+This is a record of an exploratory grilling session around the next movement
+after Seal v0.  It preserves questions, arguments, corrections, and current
+leanings.  It is not a specification, decision ledger, implementation plan, or
+claim that the vocabulary below has settled.
+
+The discussion is trying to clear fog around a usable one-shot command flow.
+Premature precision would erase useful ambiguity.  Where the conversation has
+not reached an answer, this document should leave the question open.
+
+The evidence under discussion is:
+
+- [[file:README.org][Seal v0]], particularly its opaque mailbox transport and its
+  earlier design doctrine;
+- [[file:../airlock/][Airlock]], especially
+  [[file:../airlock/train-audit.org][the adversarial train audit]];
+- [[file:../mailbox.zip][the captured day-job mailbox]]; and
+- [[file:../MAILBOX.org][the account of how that mailbox is used]].
+
+"v0.1" is a useful name for the area being explored.  It may be more honest
+than calling the next movement a hardened v1 before its product shape is known.
+
+* Where the discussion began
+
+Seal v0 is a minimal host-initiated transport.  Its operative specification
+deliberately does not represent proposals, world facts, attestations,
+executions, or results.  Its earlier design documents nevertheless describe a
+trace in which an exact proposal =P= is reviewed under material world facts
+=W=, explicitly authorized as =A=, executed as =E=, and reported as =R=.
+
+Airlock attempted to move much farther at once: reusable command shapes,
+contexts, matching, an attestation store, several proposal types, a consumer,
+and a review interface.  Its audit found that the operator-side attestation
+path arrived late and did not bind the displayed evidence to the eventual
+authority mutation.  More broadly, Airlock accumulated several authority and
+execution paths before one action-instance path was sound.
+
+The first read of these materials suggested returning to a one-shot,
+exact-proposal path.  The mailbox then complicated the picture in productive
+ways.
+
+* Is the current mailbox already =P, W, A, E, R=?
+
+** Question
+
+Does the mailbox's informality mean that it lacks the Seal trace, or is it
+already a manual realization of that trace?
+
+** Rosin's account
+
+The mutable mailbox directory functions as =P=.  The operator opens its regular
+files, reads the runbook and scripts, and refuses by declining to run them.
+
+=W= is a known host runtime context associated with the mailbox by filesystem
+locality.  In the day-job instance, entering the mailbox also enters a scoped
+=mise= environment with pinned tools and environment reconciliation.
+
+Execution is the operator running selected material from the mailbox.  Output
+files land wherever those scripts put them.  Those files are not necessarily
+durable: another invocation may overwrite them.  Standard output, standard
+error, and attempt status are recognizable result material even when the
+current workflow does not retain them systematically.
+
+** Present understanding
+
+The mailbox is a functioning manual reference system.  Its identities live in
+operator attention and timing rather than in Seal.  That difference matters
+for hardening, but it does not make the current workflow semantically empty.
+
+The runbook-shaped surface may also be contingent rather than essential.  It
+arose partly because the agent has no way to request one particular command.
+Numbered scripts, intermediate checks, and abundant debug output make a
+multi-step request tractable through a weak channel.  Once individual command
+proposals exist, some of this shape may dissolve.
+
+* Narrow first, or minimal first?
+
+** Question
+
+Should Seal begin with a narrow execution contract and cautiously widen it, or
+with a minimal permissive contract and add constraints when actual friction
+reveals their value?
+
+** Narrow-first approach
+
+A narrow-first Seal might execute only inside =bwrap=, expose a fixed tool set,
+provide a fixed environment, and admit only a constrained command language.
+This gives automation a mechanically bounded world.  The cost is having to
+guess the useful boundary before the workflow has taught us what it needs.
+
+** Minimal-first approach
+
+A minimal-first Seal admits arbitrary one-shot commands under an operator-known
+runtime profile.  Safety remains substantially an ad-hoc operator judgment:
+the operator reads the exact proposal and chooses whether to run it.  Productive
+constraints enter later when they remove observed friction, make a recurring
+judgment mechanical, or enable automation without concealing consequence.
+
+** Current leaning
+
+Rosin leans minimal-first during exploration.  This is continuous with Seal's
+existing doctrine: begin with the smallest complete manual truth, then admit
+abstractions only when they preserve that truth and answer concrete pressure.
+
+This does not answer what irreducible input, lifecycle, or storage hygiene a
+first implementation needs.  It does reject choosing a full containment and
+world model merely because those would make a later automation story tidier.
+
+* May an execution mutate =W=?
+
+** Question
+
+If later proposals depend on a writable host workspace, is a proposal allowed
+to change the world in which subsequent proposals run?
+
+** Example
+
+An early interaction may look like:
+
+#+begin_example
+P1: clone the Terraform repository
+P2: run a plan inside the cloned repository
+P3: apply the saved plan
+#+end_example
+
+=P1= exists precisely to change the conditions available to =P2=.  A system
+that forbids this has probably excluded the first workflow an agent will try to
+reconstruct.
+
+** Present understanding
+
+Nothing in a propose--attest--execute flow inherently requires =W= to remain
+unchanged.  Executions have consequences; some consequences establish useful
+state for later executions.
+
+There remains a meaningful difference between two kinds of writability:
+
+- the agent directly writes a host execution workspace; and
+- an exact agent proposal, after operator attestation, causes a host execution
+  to write that workspace.
+
+The second is compatible with the intended mediation even when it produces a
+persistent, stateful workspace.  It recreates some shared-workspace semantics
+without necessarily recreating direct shared write authority.
+
+This observation corrected an earlier suggestion to defer shared-directory
+intake wholesale.  Mutable local intake may be central.  The live question is
+how intake, execution material, and persistent host state relate—not whether
+all directory-shaped interaction should be excluded.
+
+* Must Seal represent =W= explicitly?
+
+** Question
+
+Does Seal need a first-class model of repositories, workspace revisions,
+credentials, environment state, and other world objects?  Or can =W= remain
+largely implicit in filesystem locality and a runtime profile known to the
+operator?
+
+** Argument for explicit objects
+
+If repositories become first-class world objects, facts such as origin, HEAD,
+and dirty state could make later review more intelligible.  Similar adapters
+might expose other domains.  This could eventually support mechanical
+invalidation and more automation.
+
+** Argument for implicit =W=
+
+There is no evident stopping point to a general world model.  Repository state
+is only one influence.  Effective credentials, current cloud state, tool
+behavior, network responses, time, and external code all affect consequence.
+
+Even a concrete credential example resists byte identity: the Azure access
+token used by two otherwise equivalent invocations will change.  "These exact
+token bytes are present" is less useful than "the environment has reconciled a
+working =az login=".  Exhaustive workspace identity therefore threatens to
+become a black hole of effort without producing an honest snapshot of the
+world.
+
+** Current leaning
+
+Keep =W= implicit initially: a known runtime profile reached through the
+mailbox's filesystem location and its scoped environment.  Discover which
+world facts deserve first-class treatment through use.
+
+Repository HEAD, dirty state, workspace generations, and similar ideas remain
+possible later tools.  They are not assumed prerequisites for v0.1.
+
+* Could reconciliation be the first named piece of =W=?
+
+** Question
+
+Is there a useful middle ground between an entirely ambient world and an
+exhaustive world representation?
+
+** Proposal under discussion
+
+A /world-reconciliation recipe/ could be an exact sequence of operations that
+tries to establish the assumptions under which later commands run.  "Recipe"
+here does not imply a shell language; it means executable operations.
+
+The recipe might perform such work as tool materialization, credential login,
+or environment repair.  It could permit arbitrary commands and pass through
+the same proposal, operator-attestation, and execution path as any other
+proposal.  Its exact bytes or representation could be named and hashed.
+
+This would not capture the whole world.  It would give agent and operator a
+minimal shared statement: this named reconciliation was run, with this result,
+before subsequent work.
+
+Airlock contained both a =mise= recipe backend and environment reconciliation.
+Those ideas may still be useful even though Airlock's surrounding authority
+system failed.  Its audit supplies one caution: if external reconciliation code
+affects execution but its identity is omitted from the context evidence, the
+named context says less than it appears to say.
+
+** Questions left open
+
+- Is reconciliation proposed by the agent, configured by the operator, or
+  sometimes either?
+- Does every changed recipe require ordinary one-shot attestation?
+- Does Seal run reconciliation only when explicitly requested?
+- Could it run implicitly before review or before execution?
+- If it runs implicitly, what did the operator attest: the proposal, the
+  recipe, their composition, or a remembered convention?
+- Is a successful reconciliation an observation, a mutation of =W=, part of
+  =R=, or all three?
+
+No answer has been chosen.  The recipe is presently a way to think about a
+small, named foothold in an otherwise implicit world.
+
+* Where is the boundary between =W= and =R=?
+
+** Question
+
+When a command produces files that later commands consume, are those files
+results, workspace, or future proposal material?
+
+** Current account
+
+A lifecycled command directory offers a useful local distinction:
+
+- standard output, standard error, and attempt status are =R=;
+- files deliberately placed in the command directory can travel back with
+  that directory as result material;
+- mutations outside the command directory are mutations of =W=; and
+- if a later proposal copies or marshals earlier result bytes, such as a saved
+  =plan.bin=, into its own proposed material, those copied bytes become part of
+  the later =P=.
+
+This is a promising intuition, not yet a complete rule.  A saved plan can be
+both evidence returned to the agent and persistent input in the host workspace.
+The current mailbox already permits output clobbering.  Whether v0.1 makes
+=R= durable, transports whole command directories, or distinguishes declared
+artifacts remains open.
+
+* What should happen with filesystem-hierarchical =mise= discovery?
+
+** Question
+
+Should Seal freeze or constrain environment discovery so that later workspace
+contents cannot alter the effective runtime profile?
+
+** Current leaning
+
+Probably not yet.  Filesystem-hierarchical =mise= discovery is part of the
+present workflow and may remain implicit in v0.1.
+
+A cloned repository could introduce nested configuration and thereby alter the
+environment of a later command.  That is a real consequence.  During this
+exploratory phase, it may remain one of the facts the operator is responsible
+for understanding rather than becoming an immediate Seal restriction.
+
+Experience may later show that effective environment resolution deserves a
+named review surface or a constraint.  The discussion has not established
+that point yet.
+
+* May attested code modify Seal itself?
+
+** Question
+
+If Seal runs arbitrary operator-attested commands, must it prevent those
+commands from changing =seal.toml= or a future Seal state directory?
+
+** Permissive argument
+
+An arbitrary-command runner is expected to admit some commands that alter its
+surrounding host.  Modifying Seal configuration could be an intentional
+operation.  On a minimal-first account, the operator is responsible for not
+attesting a proposal that compromises Seal unintentionally.
+
+** Protective argument
+
+If an executed command can rewrite the state through which later proposals are
+attested, an earlier execution can influence future authority.  Protecting
+Seal's own configuration and authorization record might therefore be an
+internal integrity boundary rather than a general claim that arbitrary code is
+safe.
+
+Meaningful protection would likely require an OS-enforced boundary: another
+identity, mount restriction, sandbox, or equivalent.  A path check inside Seal
+cannot constrain arbitrary code after launch.
+
+** Current leaning
+
+Do not introduce that prohibition yet.  Preserve it as a visible tension and
+make no claim that a same-authority arbitrary command cannot modify Seal.
+Observed use may later justify protecting a narrow Seal-owned directory even
+while leaving the rest of =W= permissive.
+
+* What remains from the Airlock lesson?
+
+Airlock should not be reduced to "constraints are bad".  Its failure provides
+several useful negative results:
+
+- reusable shape authority was designed before the one-shot operator path was
+  sound;
+- adding an operator-side attestation command late did not repair evidence
+  substitution or multiple execution paths;
+- a displayed review and a confirmation must concern the same object; and
+- environment and reconciliation machinery can create false confidence when
+  their real inputs are not the inputs being named.
+
+The present exploration does not yet turn those lessons into a new store,
+state machine, or command surface.  The immediate positive hypothesis is
+smaller: let an agent propose a specific command, let the operator inspect and
+attest that proposal, run it once in the locally understood context, and return
+its result.
+
+* Could the first broker be throwaway shell machinery?
+
+** Question
+
+Does exploratory use require committing immediately to a durable implementation
+of the whole command broker?
+
+** Hypothesis
+
+The first one-shot broker could plausibly be a mutable, operator-owned shell
+script built on Seal's existing pull and push semantics.  That script could be
+changed rapidly while trying different proposal shapes, review interactions,
+reconciliation behavior, command-directory lifecycles, and result layouts.
+
+"Mutable" here means easy for the operator to revise.  The script must remain
+outside the agent-writable mailbox; otherwise experimental porcelain would
+itself become proposal-controlled execution machinery.
+
+This suggests an uneven implementation on purpose.  Queue scanning, prompts,
+pagers, naming, and publication may be throwaway.  The final transition from an
+attested object to a process launch cannot be equally loose.
+
+** The firm waist
+
+The exact boundary is still under discussion, but the =exec= operation would
+need to preserve a few truths while the surrounding experiment changes:
+
+- launch the host-held proposal that was actually inspected and attested, not
+  a path the peer can still mutate;
+- consume the exact invocation chosen by the operator rather than reconstruct
+  it from changed ambient input;
+- give one attestation at most one launch attempt;
+- distinguish "not launched" from "launch began but outcome is unknown"; and
+- attribute captured status and output to that proposal, attestation, and
+  attempt.
+
+Whether that firm waist is initially a careful shell routine, a small separate
+helper, or some other throwaway-but-auditable mechanism is open.  The useful
+split is not "prototype versus correctness."  It is "semantics currently being
+discovered" versus "the one transition whose looseness would make the
+experiment report false results."
+
+* A concrete manual broker sketch
+
+** Proposed mailbox shape
+
+The first shell broker could use a deliberately small mutable layout:
+
+#+begin_example
+mailbox/
+  ready/<command>/cmd.toml
+  claimed/<command>/cmd.toml
+  claimed/<command>/result.toml
+  output/<command>.out
+  output/<command>.err
+  world/
+#+end_example
+
+=cmd.toml= contains an explicit argv list.  =world/= is shared mutable working
+state for such things as a cloned Terraform repository and generated plans.
+
+There is no watcher or poll loop.  The operator manually invokes
+=seal-exec.sh= when ready to consider one command.
+
+** Proposed interaction
+
+The rough flow is:
+
+#+begin_example
+seal pull
+inspect ready commands
+claim one command
+display its exact argv
+require the operator to type "yes"
+run it
+capture stdout and stderr under output/
+write result.toml
+seal push
+#+end_example
+
+The surrounding script may remain quick and dirty.  It need not decide whether
+an argv is safe or build a command-policy language.  The operator reads the
+proposed invocation and refuses dangerous or surprising commands.  This is an
+intentional use of operator judgment during discovery, not an assertion that
+the script has validated arbitrary command safety.
+
+** A filesystem-write guard
+
+One proposed safety measure is to execute through =bwrap= with host paths
+read-only and writes allowed only inside =mailbox/=.  This would constrain a
+command's filesystem mutations without yet trying to constrain its command
+language, tools, network activity, cloud authority, or every source of ambient
+state.
+
+That is a useful but limited claim.  A command with network and credentials may
+still mutate Azure or disclose readable data.  The boundary says where the
+process can write on the local filesystem, not that the command is harmless.
+
+** Tensions revealed by the sketch
+
+*** A transported rename is not yet a rename
+
+Seal v0 intentionally does not propagate deletions.  If the operator locally
+moves =ready/X= to =claimed/X= and then pushes, the peer receives the claimed
+copy but retains =ready/X=.  A later pull can recreate the local ready entry.
+
+Possible exploratory responses include treating =claimed/X= as a marker that
+makes any surviving =ready/X= ineligible, copying rather than pretending the
+transport performed a move, asking the agent to clean acknowledged ready
+entries, or later adding a queue-specific mutation.  None has been selected.
+
+*** A writable mailbox includes authority-shaped files
+
+If the proposed command can write all of =mailbox/=, it can rewrite
+=cmd.toml=, other ready commands, captured output, and =result.toml=.  That
+weakens the otherwise-firm relationship between displayed proposal, launch,
+and result.
+
+A small alternative is to keep =seal-exec.sh= outside the sandbox, let the
+parent script own queue transitions and result capture, and give the proposed
+command write access only to =mailbox/world/= plus any deliberately assigned
+per-command working area.  Standard output and standard error can cross the
+boundary through the parent without giving the child write access to their
+destination files.
+
+This alternative is not yet a commitment.  It identifies the smallest place
+where "allow writes inside mailbox" and "the exec operation must be firm" pull
+against one another.
+
+*** Explicit argv must stay argv
+
+The quick shell broker still needs to turn TOML strings into an argv vector
+without =eval=, shell re-parsing, or concatenation.  Heavy semantic validation
+can be omitted; lossless argument boundaries cannot.  Otherwise the displayed
+proposal and executed command are different languages.
+
+*** Output capture is part of the experiment's evidence
+
+If output is displayed through =tee=, the broker must still preserve the
+command's exit status and finish writing both streams before it records and
+pushes the result.  This is mechanical bookkeeping rather than command-safety
+policy, but getting it wrong would make the returned evidence unreliable.
+
+*** Refusal and interruption remain visible questions
+
+Claiming before the prompt raises a small lifecycle question: after the
+operator declines, does the command remain claimed with a refusal result,
+return to ready, or wait for manual cleanup?  Likewise, interruption after
+launch but before =result.toml= cannot honestly become an automatic retry.
+The prototype can use crude states, but it must not confuse them silently.
+
+* Questions still alive
+
+- What exactly is one proposal: argv, script text, a directory, or another
+  finite object?
+- How does an agent finish writing a proposal in a mutable intake directory?
+- At what moment does Seal acquire stable proposal identity?
+- What does operator-side attestation look and feel like?
+- Is attestation separate from execution, or one deliberate interaction?
+- Which failures are retryable publication failures, and which create an
+  unknown execution outcome?
+- Does the agent submit one command only after seeing the preceding result, or
+  can it queue speculative successors?
+- How much of a command directory returns to the agent?
+- What minimum result must survive output-file clobbering?
+- When does a world-reconciliation recipe run, and what does its success mean?
+- Which runtime facts remain operator knowledge, and which eventually earn a
+  first-class Seal representation?
+- Does recurring friction eventually favor a restricted runner, or does the
+  permissive operator-mediated path remain the primary product?
+- Which protections are necessary for exploratory honesty, and which would be
+  guesses about a production contract that does not yet exist?
+- How small can the firm =exec= waist be while the surrounding shell broker
+  remains easy to replace?
+
+* Method correction
+
+This session is wayfinding and fog-clearing, not code-contract litigation.
+Earlier attempts to translate every distinction immediately into immutable
+objects, generations, database rules, or CLI verbs overfit the discussion.
+
+The record should preserve pressure and uncertainty until a smaller product
+hypothesis becomes visible.  Code-facing precision will matter later.  It
+should answer this exploration rather than terminate it.
