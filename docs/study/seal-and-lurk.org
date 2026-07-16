@@ -1,0 +1,316 @@
+#+title: Seal and Lurk: Attested Change in a Persistent World
+#+date: 2026-07-16
+#+options: toc:2 num:nil
+
+#+begin_quote
+Study note.  This is an operator-facing entrance to an area of inquiry, not a
+Seal design commitment, Lurk integration plan, or cryptographic security
+claim.
+#+end_quote
+
+* Why place these projects beside one another?
+
+Seal begins with an ordinary consequential interaction:
+
+#+begin_example
+agent proposes an operation
+operator reads it in context
+operator authorizes or refuses it
+authorized operation changes a world
+result returns to agent
+#+end_example
+
+The present spike makes this interaction small enough to examine.  Its
+emerging hypothesis is a lockstep dialogue: agent proposes one small command,
+operator attests and executes it, agent observes result and changed world, then
+proposes the next command.  Failure normally becomes input to a new proposal
+rather than an instruction to replay old bytes.
+
+This begins to resemble an image in the Smalltalk or Lisp sense: a persistent
+computational world receives messages and develops through their evaluation.
+Seal adds one unusual condition.  Admission of consequential change is subject
+to operator judgment.
+
+Lurk approaches a neighboring problem from another direction.  It is a Lisp
+whose evaluation can be proved with succinct zero-knowledge proofs.  Programs
+are data supplied to a universal interpreter, and compound Lurk data is
+content-addressed.  A proof can establish that one expression and evaluator
+state reduce to another without requiring the verifier to repeat the whole
+computation or learn hidden intermediate values.
+
+The connection is not that Seal secretly needs a zk-SNARK.  Seal supplies a
+small, concrete setting in which an operator can learn why identity, evaluation,
+state transition, evidence, and authority must be distinguished before proof
+machinery can help.
+
+* Minimum Lurk orientation
+
+No Lurk knowledge is assumed here.
+
+Lurk is a statically scoped Lisp designed for proving evaluation.  Its core
+claim has the shape:
+
+#+begin_example
+input expression + environment + continuation
+  evaluates in N steps to
+output expression + environment + continuation
+#+end_example
+
+Lurk uses recursive proving machinery so a general evaluator can be iterated
+without compiling every source program into its own monolithic circuit.  Code
+remains data presented to the evaluator.
+
+Lurk data is content-addressed: a compound expression can be identified by a
+type-tagged cryptographic digest derived from its contents.  Lurk also supports
+commitments, including commitments to functions.  Depending on how a
+commitment is constructed and opened, a prover can bind itself to hidden data
+or code and later prove facts about evaluation involving that material.
+
+Three ideas matter for this study:
+
+- /Content identity/: exact data and code can receive stable names derived from
+  their contents.
+- /Proof of evaluation/: an untrusted prover can supply evidence that a
+  declared computation related an input to an output.
+- /Selective disclosure/: commitments and zero knowledge can hide material not
+  included in the public statement.
+
+None of these ideas decides whether an operator wants a resulting state to
+become authoritative.
+
+* Seal's distinctions before cryptography
+
+Seal's design vocabulary separates:
+
+- =P=: exact proposal;
+- =W=: material world facts under which it is reviewed;
+- =A=: operator authorization;
+- =E=: execution admitted by that authorization; and
+- =R=: result attributable to that execution.
+
+This separation is pedagogically useful because a proof system does not erase
+it.
+
+A Lurk proof could strengthen the relationship between =P=, =E=, and =R=: it
+can prove that identified input evaluated to identified output according to a
+particular evaluator.  Content addressing can also give a finite portion of
+=W= an exact name.
+
+The proof does not produce =A=.  Computational validity and operator authority
+answer different questions:
+
+#+begin_example
+Lurk: did this declared computation produce this declared result?
+Seal: may this consequence enter the operator's shared reality?
+#+end_example
+
+Calling a proof an attestation can obscure this difference.  In Seal,
+/attestation/ is an operator act that grants authority.  A Lurk proof is
+machine-checkable evidence about evaluation.  A future composition should name
+both rather than letting one word collapse them.
+
+* Image hypothesis
+
+Suppose the durable part of a computational world can be represented as a
+content-addressed value with root =S[n]=.  A command =C= proposes a transition:
+
+#+begin_example
+evaluate(C, S[n]) -> (S[n+1], R)
+#+end_example
+
+A Lurk-shaped system could additionally produce proof =pi= that this evaluation
+is valid.  Seal-shaped authority could then decide whether =S[n+1]= becomes the
+next canonical root:
+
+#+begin_example
+canonical image S[n]
+  -> proposed command C
+  -> private/speculative evaluation
+  -> candidate image S[n+1] + result R + proof pi
+  -> operator review
+       refuse -> canonical image remains S[n]
+       attest -> canonical image becomes S[n+1]
+#+end_example
+
+This is closer to a persistent functional image or Merkle DAG than to a
+traditional mutable heap.  "Writing" an object creates a new value and,
+eventually, a new root.  Unchanged structure can be shared between revisions.
+
+Operator attestation would not sensibly guard every transient allocation or
+object mutation performed during evaluation.  A live language mutates too
+frequently for that interaction.  The plausible boundary is admission into
+authoritative state: saving, merging, publishing, or otherwise selecting the
+new canonical image.
+
+* Why small commands matter
+
+One-at-a-time commands make the state transition visible:
+
+#+begin_example
+observe S[n]
+propose one consequence
+attest exact proposal
+observe result and S[n+1]
+propose next consequence
+#+end_example
+
+A large runbook hides several intermediate worlds inside one authorization.
+If it fails halfway, operator and agent must reconstruct which effects
+occurred.  A small command gives failure a local meaning.  Agent can inspect
+the failed result and propose a corrective next transition.
+
+This is /fail forward/.  Even repeating the same operation becomes a fresh
+proposal against the current world, with a new attestation.  That resembles
+interactive image development and also resembles an incrementally proved state
+machine: each step begins from the result of the preceding step.
+
+The watch-loop hypothesis adds dialogue without automating authority.  Agent
+polls for terminal result; operator-side broker polls for one fresh proposal;
+human attention remains at the attest/execute boundary.  Multiple simultaneous
+proposals signal that the lockstep conversation has drifted.
+
+* Attestation before or after evaluation?
+
+Arbitrary shell execution can mutate files, use credentials, call networks,
+and change external systems.  Seal therefore asks for authorization before
+execution.  "Speculatively run it and inspect the diff" is not safe when the
+operation may already have applied Terraform or disclosed a secret.
+
+A pure, self-contained image transition changes the timing:
+
+#+begin_example
+evaluate privately first
+inspect candidate state and proof
+attest only canonical admission
+#+end_example
+
+Lurk makes this latter shape intelligible because proving an evaluation need
+not itself grant the output authority.  Prover may compute candidate state;
+operator remains the finality rule.
+
+The two timings can coexist:
+
+- Pure image transition: evaluate, prove, then attest admission.
+- External effect: attest exact request first, then execute through mediated
+  capability.
+
+Any design that mixes them must show which effects occur on which side of the
+operator boundary.
+
+* Where the analogy stops
+
+** External world
+
+Filesystem state, Azure resources, network responses, credentials, time, and
+human actions do not become true merely because a Lurk expression names them.
+A proof about an internal model is not proof that external world matched it.
+
+External effects would need one of several treatments:
+
+- remain outside image and use Seal's pre-execution authorization;
+- enter image as authenticated observations or receipts; or
+- pass through capabilities whose requests and returned evidence are
+  represented by the proved transition.
+
+This is the same pressure already visible in Seal's =W=: no finite workspace
+revision honestly captures entire world.
+
+** Desirability
+
+A proof can establish that a transition obeyed its program.  It cannot establish
+that program was wise, safe, affordable, or intended.  Operator still judges
+consequence.
+
+** Termination and resources
+
+Lurk is Turing-complete.  Well-formed computation need not terminate.  Proof of
+a partial evaluation does not imply useful completion, and proof production has
+real resource costs.
+
+** Trusted boundary
+
+A proof is only as meaningful as exact statement, evaluator semantics,
+cryptographic assumptions, implementation, and connection between proved
+values and external effects.  Seal's adversarial lesson still applies: several
+individually credible mechanisms do not automatically form one sound authority
+path.
+
+* Seal as pedagogical substrate
+
+Seal can expose the conceptual machinery before hiding it behind cryptography.
+An operator can learn through direct use:
+
+1. Proposal identity differs from a description of proposal.
+2. Execution evidence differs from authorization.
+3. Persistent state makes every command a transition from one world to another.
+4. Failure can leave a real successor world even when requested goal was not
+   reached.
+5. A result is trustworthy only to extent execution and reporting remain bound.
+6. Canonical state is a policy choice, not a consequence of computation alone.
+
+A sequence of small experiments could make the path concrete:
+
+** Explicit state threading
+
+Replace an ambient toy workspace with one serialized state value.  Command
+reads old state and emits candidate new state plus result.  Operator still
+reviews ordinary code.
+
+** Content-addressed revisions
+
+Hash each state value and require proposal to name predecessor hash.  This
+teaches what a content-addressed image can and cannot say without introducing
+proofs.
+
+** Speculative branch and admission
+
+Run a pure reducer against old state, show candidate delta, then let operator
+attest whether new root becomes canonical.  Compare this with pre-execution
+attestation for an effectful shell command.
+
+** Proved reducer
+
+Express a small transition relation in Lurk.  Produce and verify evidence that
+old root, command, result, and new root satisfy evaluator.  Keep operator
+authorization separate.
+
+** Mediated external capability
+
+Let image request one narrowly described external effect.  Examine what must be
+attested before request and what receipt must return afterward.  Do not pretend
+proof of request is proof of external outcome.
+
+These are study exercises, not proposed Seal milestones.  Their value is to
+make each distinction felt before choosing machinery.
+
+* Questions left open
+
+- What portion of Seal's =world/= could honestly become an image value?
+- Is canonical image operator-private, agent-visible, or shared by commitment?
+- Does operator attest command before evaluation, candidate root after
+  evaluation, or both?
+- What view or delta is sufficient for human review of a content-addressed
+  state?
+- How does operator know displayed view corresponds to committed root?
+- Should operator authorization be included inside recursively proved history,
+  recorded beside it, or both?
+- What does refusal mean for a privately computed candidate state?
+- Which external effects can become explicit capabilities without recreating a
+  general ambient shell?
+- Can proof machinery reduce verification toil without obscuring consequence
+  operator still must judge?
+- At what point does this stop being Seal and become a different system built
+  from lessons Seal exposed?
+
+* Primary reading
+
+- [[https://research.protocol.ai/publications/lurk-lambda-the-ultimate-recursive-knowledge/][LURK: Lambda, the Ultimate Recursive Knowledge]] introduces Lurk's universal
+  interpreter, recursive proof construction, and content-addressed data model.
+- [[https://argument.xyz/blog/prog-intro/][A Programmer's Introduction to Lurk]] explains evaluation proofs,
+  content-addressed expressions, commitments, and functional commitments
+  through Lisp examples.
+- [[https://github.com/lurk-lab/lurk][The Lurk repository]] records current implementation status and links its
+  user material.
+
+These sources describe Lurk.  The Seal/image composition in this note is an
+inference and research question, not a claim made by Lurk's authors.
