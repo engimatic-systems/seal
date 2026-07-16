@@ -399,6 +399,9 @@ mailbox/
 =cmd.toml= contains an explicit argv list.  =world/= is shared mutable working
 state for such things as a cloned Terraform repository and generated plans.
 
+This was the first concrete sketch.  The implemented spike below deliberately
+changes its execution unit from =cmd.toml= argv to one =command.sh=.
+
 There is no watcher or poll loop.  The operator manually invokes
 =seal-exec.sh= when ready to consider one command.
 
@@ -423,6 +426,51 @@ an argv is safe or build a command-policy language.  The operator reads the
 proposed invocation and refuses dangerous or surprising commands.  This is an
 intentional use of operator judgment during discovery, not an assertion that
 the script has validated arbitrary command safety.
+
+** Implemented spike revision: one =command.sh=
+
+Further grilling moved the experiment closer to the usability of the original
+mailbox.  One command is now a directory containing a single =command.sh=:
+
+#+begin_example
+mailbox/
+  ready/<command>/command.sh
+  claimed/<command>/command.sh
+  claimed/<command>/result.toml
+  output/<command>.out
+  output/<command>.err
+  world/
+#+end_example
+
+The attestation granularity is one reviewed shell script.  That script may
+perform several sequenced operations or execute sibling scripts.  This is
+tighter than the old numbered-script runbook window but deliberately broader
+than a single argv vector.
+
+The operator may type =edit= before attestation; =seal-exec.sh= opens the
+claimed =command.sh= in hard-coded =vi=, then redisplays the resulting bytes.
+Scripts over 40 lines receive a warning rather than a refusal.
+
+For simplicity and usability, the proposed command receives a writable bind of
+the whole mailbox inside =bwrap=, not only =world/=.  This permits ad-hoc result
+files in the claimed command directory.  It also lets the command alter other
+mailbox material.  The experiment accepts that broader risk under operator
+judgment rather than claiming mailbox-internal isolation.
+
+The shell remains outside the mailbox.  After operator confirmation it copies
+the approved =command.sh= to a host-only attempt directory and mounts that copy
+read-only over the claimed script path during execution.  Host filesystem paths
+outside the mailbox are mounted read-only; network and external authority are
+not constrained.
+
+The spike also includes an explicit =purge= operation.  It removes local
+=ready/= and builds a queue-scoped =rsync --delete= invocation that empties only
+peer =ready/=, leaving the rest of the mailbox outside that destructive sync.
+This is operator-requested destructive cleanup, not ordinary claim propagation.
+
+The larger scope and weaker mailbox isolation are intentional.  They move the
+experience closer to the intended workflow so the experiment can reveal useful
+friction.  They are not a claim that this is the eventual Seal boundary.
 
 ** A filesystem-write guard
 
@@ -537,12 +585,16 @@ This alternative is not yet a commitment.  It identifies the smallest place
 where "allow writes inside mailbox" and "the exec operation must be firm" pull
 against one another.
 
-*** Explicit argv must stay argv
+*** Explicit argv must stay argv (earlier variant)
 
 The quick shell broker still needs to turn TOML strings into an argv vector
 without =eval=, shell re-parsing, or concatenation.  Heavy semantic validation
 can be omitted; lossless argument boundaries cannot.  Otherwise the displayed
 proposal and executed command are different languages.
+
+The current =command.sh= spike avoids this particular parser boundary by
+executing exact reviewed shell bytes.  The argv question remains relevant if a
+later experiment returns to structured command proposals.
 
 *** Output capture is part of the experiment's evidence
 

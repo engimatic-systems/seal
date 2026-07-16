@@ -5,10 +5,9 @@
 This document is Seal's canonical handwritten implementation source. Edit it
 first, then tangle the ordinary Rust files used by Cargo and reviewers.
 
-The generated files are =.gitignore=, =Cargo.toml=, =src/main.rs=,
-=src/config.rs=, =src/init.rs=, =src/transfer.rs=, =tests/cli.rs=, and the three
-files under
-=tests/fixtures/=.
+The generated files are =.gitignore=, =Cargo.toml=, =seal-exec.sh=,
+=src/main.rs=, =src/config.rs=, =src/init.rs=, =src/transfer.rs=,
+=tests/cli.rs=, =tests/seal-exec.sh=, and the three files under =tests/fixtures/=.
 =Cargo.lock= is Cargo-generated and is not literate source.
 
 Tangle, format, test, and build from the repository root:
@@ -19,6 +18,7 @@ emacs --batch --eval '(require (quote ob-tangle))' \
 cargo fmt --check
 cargo test
 cargo build
+bash tests/seal-exec.sh
 #+end_src
 
 For a clean tangle check, run the tangle command twice and confirm the second
@@ -47,6 +47,399 @@ clap = { version = "4.5", features = ["derive"] }
 rustix = { version = "1.0", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
+#+end_src
+
+* Experimental one-shot broker
+
+This spike is deliberately uneven.  The operator-owned shell is disposable
+workflow machinery.  The execution waist preserves the exact approved
+=command.sh= bytes, one launch, separated output streams, exit status, and a
+host-local attempt record.
+
+The command language remains arbitrary Bash.  =bwrap= gives the launched
+command a read-only view of the host and a writable view of the whole mailbox.
+It does not restrict network access, cloud authority, reads from the host, or
+writes made through external APIs.  Operator review is the command-safety
+decision in this experiment.
+
+Pseudocode:
+
+#+begin_example
+run (default):
+  seal pull
+  select newest ready command whose ID is not already claimed
+    none -> report no command -> success
+  move ready command to claimed
+  require a regular, non-symlink command.sh
+    invalid -> record invalid result -> seal push -> failure
+  display numbered exact script + digest
+  warn when script exceeds 40 lines
+  ask operator:
+    edit -> run vi outside sandbox -> redisplay and ask again
+    yes  -> continue
+    other/EOF -> record refusal -> seal push -> success
+  copy approved command.sh into host-only attempt directory
+  record started state before launch
+  start stdout/stderr collectors into host-only attempt files
+  bwrap command:
+    host root read-only
+    whole mailbox writable
+    approved snapshot mounted read-only over claimed command.sh
+    cwd mailbox/world; TMPDIR points beneath world; host /tmp stays read-only
+  wait for command and both collectors
+  copy captured streams into mailbox/output
+  record completed result with exact digest and exit status
+  seal push
+  return command status
+
+purge:
+  seal pull so operator sees current ready entries
+  require literal purge confirmation
+  remove local ready directory
+  construct fixed rsync plan from seal.toml
+  sync an empty ready directory to peer ready with --delete
+  leave other mailbox subtrees untouched
+#+end_example
+
+#+begin_src bash :tangle seal-exec.sh :shebang "#!/usr/bin/env bash"
+# Generated from SEAL.org; edit the literate source instead.
+set -euo pipefail
+
+ROOT="$(pwd)"
+readonly ROOT
+readonly CONFIG="$ROOT/seal.toml"
+readonly MAILBOX="$ROOT/mailbox"
+readonly READY="$MAILBOX/ready"
+readonly CLAIMED="$MAILBOX/claimed"
+readonly OUTPUT="$MAILBOX/output"
+readonly WORLD="$MAILBOX/world"
+readonly STATE="$ROOT/.seal-exec"
+readonly SEAL_BIN="${SEAL_BIN:-seal}"
+readonly LINE_WARNING=40
+
+info() {
+  printf '[info] :: %s\n' "$*"
+}
+
+warn() {
+  printf '[warn] :: %s\n' "$*" >&2
+}
+
+die() {
+  printf '[error] :: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+timestamp() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+sync_pull() {
+  "$SEAL_BIN" pull
+}
+
+sync_push() {
+  "$SEAL_BIN" push
+}
+
+write_result() {
+  local destination="$1"
+  local status="$2"
+  local command_id="$3"
+  local digest="$4"
+  local edited="$5"
+  local started_at="${6:-}"
+  local finished_at="${7:-}"
+  local exit_code="${8:-}"
+  local temporary="${destination}.tmp.$$"
+
+  {
+    printf 'status = "%s"\n' "$status"
+    printf 'command_id = "%s"\n' "$command_id"
+    printf 'command_sha256 = "%s"\n' "$digest"
+    printf 'edited = %s\n' "$edited"
+    if [[ -n "$started_at" ]]; then
+      printf 'started_at = "%s"\n' "$started_at"
+    fi
+    if [[ -n "$finished_at" ]]; then
+      printf 'finished_at = "%s"\n' "$finished_at"
+    fi
+    if [[ -n "$exit_code" ]]; then
+      printf 'exit_code = %s\n' "$exit_code"
+    fi
+  } >"$temporary"
+  mv -- "$temporary" "$destination"
+}
+
+claim_latest() {
+  local candidate id modified
+  local selected=""
+  local selected_id=""
+  local selected_modified=-1
+
+  shopt -s nullglob
+  for candidate in "$READY"/*; do
+    [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+    id="${candidate##*/}"
+    if [[ ! "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      warn "ignoring ready command with unsupported ID: $id"
+      continue
+    fi
+    [[ ! -e "$CLAIMED/$id" ]] || continue
+    modified="$(stat -c %Y -- "$candidate")"
+    if (( modified > selected_modified )) ||
+      { (( modified == selected_modified )) && [[ "$id" > "$selected_id" ]]; }; then
+      selected="$candidate"
+      selected_id="$id"
+      selected_modified="$modified"
+    fi
+  done
+  shopt -u nullglob
+
+  [[ -n "$selected" ]] || return 1
+  CLAIM_ID="$selected_id"
+  CLAIM_DIR="$CLAIMED/$selected_id"
+  mv -- "$selected" "$CLAIM_DIR"
+}
+
+inspect_command() {
+  local script="$1"
+  COMMAND_LINES="$(awk 'END { print NR }' "$script")"
+  COMMAND_DIGEST="$(sha256sum -- "$script")"
+  COMMAND_DIGEST="${COMMAND_DIGEST%% *}"
+
+  printf '\ncommand: %s\n' "$CLAIM_ID"
+  printf 'sha256:  %s\n' "$COMMAND_DIGEST"
+  printf 'lines:   %s\n\n' "$COMMAND_LINES"
+  if (( COMMAND_LINES > LINE_WARNING )); then
+    warn "command.sh is $COMMAND_LINES lines; review threshold is $LINE_WARNING"
+  fi
+  nl -ba -- "$script"
+  printf '\n'
+}
+
+record_mailbox_result() {
+  local source="$1"
+  cp -- "$source" "$CLAIM_DIR/result.toml"
+}
+
+execute_claim() {
+  local command_script="$CLAIM_DIR/command.sh"
+  local answer edited=false
+  local attempt snapshot started_at finished_at exit_code
+  local stdout_pipe stderr_pipe stdout_pid stderr_pid stdout_status stderr_status
+  local bash_path
+
+  if [[ ! -f "$command_script" || -L "$command_script" ]]; then
+    warn "claimed command must contain a regular, non-symlink command.sh"
+    COMMAND_DIGEST="missing"
+    finished_at="$(timestamp)"
+    write_result "$CLAIM_DIR/result.toml" invalid "$CLAIM_ID" \
+      "$COMMAND_DIGEST" "$edited" "" "$finished_at" ""
+    sync_push
+    return 1
+  fi
+
+  while true; do
+    inspect_command "$command_script"
+    if ! read -r -p "Type 'yes' to execute, 'edit' to open vi, anything else to refuse: " answer; then
+      answer=""
+    fi
+    case "$answer" in
+      yes)
+        break
+        ;;
+      edit)
+        vi "$command_script"
+        edited=true
+        ;;
+      *)
+        finished_at="$(timestamp)"
+        write_result "$CLAIM_DIR/result.toml" refused "$CLAIM_ID" \
+          "$COMMAND_DIGEST" "$edited" "" "$finished_at" ""
+        sync_push
+        info "refused command $CLAIM_ID"
+        return 0
+        ;;
+    esac
+  done
+
+  attempt="$STATE/attempts/$CLAIM_ID"
+  mkdir -p "$STATE/attempts"
+  mkdir "$attempt" || die "attempt already exists: $CLAIM_ID"
+  snapshot="$attempt/command.sh"
+  cp -- "$command_script" "$snapshot"
+  chmod 0444 "$snapshot"
+  COMMAND_DIGEST="$(sha256sum -- "$snapshot")"
+  COMMAND_DIGEST="${COMMAND_DIGEST%% *}"
+
+  started_at="$(timestamp)"
+  write_result "$attempt/result.toml" started "$CLAIM_ID" \
+    "$COMMAND_DIGEST" "$edited" "$started_at" "" ""
+  record_mailbox_result "$attempt/result.toml"
+
+  mkdir -p "$OUTPUT" "$WORLD/.tmp"
+  stdout_pipe="$attempt/stdout.pipe"
+  stderr_pipe="$attempt/stderr.pipe"
+  mkfifo "$stdout_pipe" "$stderr_pipe"
+  tee "$attempt/stdout" <"$stdout_pipe" &
+  stdout_pid=$!
+  tee "$attempt/stderr" <"$stderr_pipe" >&2 &
+  stderr_pid=$!
+
+  bash_path="$(command -v bash)"
+  set +e
+  bwrap \
+    --die-with-parent \
+    --new-session \
+    --unshare-pid \
+    --ro-bind / / \
+    --bind "$MAILBOX" "$MAILBOX" \
+    --ro-bind "$snapshot" "$command_script" \
+    --dev /dev \
+    --proc /proc \
+    --chdir "$WORLD" \
+    --setenv TMPDIR "$WORLD/.tmp" \
+    -- "$bash_path" "$command_script" \
+    >"$stdout_pipe" 2>"$stderr_pipe"
+  exit_code=$?
+  wait "$stdout_pid"
+  stdout_status=$?
+  wait "$stderr_pid"
+  stderr_status=$?
+  set -e
+  rm -f "$stdout_pipe" "$stderr_pipe"
+
+  if (( stdout_status != 0 || stderr_status != 0 )); then
+    warn "output capture failed: stdout=$stdout_status stderr=$stderr_status"
+  fi
+  cp -- "$attempt/stdout" "$OUTPUT/$CLAIM_ID.out"
+  cp -- "$attempt/stderr" "$OUTPUT/$CLAIM_ID.err"
+
+  finished_at="$(timestamp)"
+  write_result "$attempt/result.toml" completed "$CLAIM_ID" \
+    "$COMMAND_DIGEST" "$edited" "$started_at" "$finished_at" "$exit_code"
+  record_mailbox_result "$attempt/result.toml"
+  sync_push
+  info "completed command $CLAIM_ID with exit code $exit_code"
+  return "$exit_code"
+}
+
+run_one() {
+  require_command "$SEAL_BIN"
+  require_command bwrap
+  require_command vi
+  require_command sha256sum
+  require_command python3
+  [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
+
+  sync_pull
+  mkdir -p "$READY" "$CLAIMED" "$OUTPUT" "$WORLD"
+  if ! claim_latest; then
+    info "no unclaimed ready command"
+    return 0
+  fi
+  info "claimed command $CLAIM_ID"
+  execute_claim
+}
+
+purge_plan() {
+  local empty_ready="$1"
+  python3 - "$CONFIG" "$empty_ready" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tomllib
+
+config_path = Path(sys.argv[1]).resolve()
+empty_ready = Path(sys.argv[2]).resolve()
+with config_path.open("rb") as source:
+    config = tomllib.load(source)
+
+rsync = config["tools"]["rsync"]
+peer = config["peer"]
+argv = [
+    "--recursive",
+    "--links",
+    "--perms",
+    "--times",
+    "--checksum",
+    "--delete",
+]
+
+if "ssh" in peer:
+    ssh = config["tools"]["ssh"]
+    quoted_ssh = "'" + ssh.replace("'", "''") + "' --"
+    argv.extend(["--secluded-args", "--rsh", quoted_ssh])
+    peer_ready = peer["path"].rstrip("/") + "/ready/"
+    destination = f"{peer['ssh']}:{peer_ready}"
+else:
+    peer_path = Path(peer["path"])
+    if not peer_path.is_absolute():
+        peer_path = config_path.parent / peer_path
+    destination = str(peer_path / "ready") + "/"
+
+argv.extend(["--", str(empty_ready) + "/", destination])
+for value in [rsync, *argv]:
+    sys.stdout.buffer.write(os.fsencode(value) + b"\0")
+PY
+}
+
+purge_ready() {
+  local answer temporary
+  local -a plan
+
+  require_command "$SEAL_BIN"
+  require_command python3
+  [[ -f "$CONFIG" ]] || die "missing configuration: $CONFIG"
+
+  sync_pull
+  info "purge removes every command currently under local and peer ready/"
+  if ! read -r -p "Type 'purge' to continue: " answer || [[ "$answer" != purge ]]; then
+    info "purge cancelled"
+    return 0
+  fi
+
+  rm -rf -- "$READY"
+  mkdir -p "$STATE"
+  temporary="$(mktemp -d "$STATE/purge.XXXXXX")"
+  mkdir "$temporary/ready"
+  mapfile -d '' -t plan < <(purge_plan "$temporary/ready")
+  (( ${#plan[@]} > 1 )) || die "cannot construct purge rsync plan"
+  "${plan[0]}" "${plan[@]:1}"
+  rm -rf -- "$temporary"
+  info "purged ready commands"
+}
+
+usage() {
+  printf 'Usage: seal-exec.sh [run|purge]\n'
+}
+
+main() {
+  case "${1:-run}" in
+    run)
+      [[ $# -le 1 ]] || { usage >&2; return 2; }
+      run_one
+      ;;
+    purge)
+      [[ $# -eq 1 ]] || { usage >&2; return 2; }
+      purge_ready
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
 #+end_src
 
 * Executable
@@ -1214,6 +1607,232 @@ fn transfer(
 #+end_src
 
 * Tests
+
+** Experimental broker spike
+
+Pseudocode:
+
+#+begin_example
+fake seal + fake bwrap + command longer than 40 lines
+  run with yes
+  -> pull then push
+  -> newest ready directory becomes claimed
+  -> exact command runs from world
+  -> line warning is visible
+  -> stdout/stderr and completed result are returned
+  -> host-only approved snapshot remains
+
+fake vi changes command.sh
+  run with edit then yes
+  -> edited bytes execute
+  -> result records edited=true
+
+local peer with two ready commands
+  purge with literal confirmation
+  -> local ready removed
+  -> peer ready emptied through scoped --delete
+  -> peer world remains
+
+when SEAL_E2E_BIN names a built Seal binary:
+  real local peer + real rsync + real bwrap
+  -> pull, claim, execute, result, and push complete end to end
+#+end_example
+
+#+begin_src bash :tangle tests/seal-exec.sh :shebang "#!/usr/bin/env bash"
+# Generated from SEAL.org; edit the literate source instead.
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+readonly PROJECT_ROOT
+readonly SCRIPT="$PROJECT_ROOT/seal-exec.sh"
+REAL_RSYNC="$(command -v rsync)"
+readonly REAL_RSYNC
+TEST_ROOT="$(mktemp -d)"
+readonly TEST_ROOT
+trap 'rm -rf "$TEST_ROOT"' EXIT
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+assert_file_contains() {
+  local file="$1"
+  local expected="$2"
+  grep -F -- "$expected" "$file" >/dev/null ||
+    fail "$file does not contain: $expected"
+}
+
+make_fake_tools() {
+  local directory="$1"
+  mkdir -p "$directory"
+
+  cat >"$directory/seal" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$SEAL_TEST_LOG"
+SH
+
+  cat >"$directory/bwrap" <<'SH'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >"$BWRAP_TEST_LOG"
+cwd=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bind|--ro-bind|--dev-bind)
+      shift 3
+      ;;
+    --proc|--dev)
+      shift 2
+      ;;
+    --chdir)
+      cwd="$2"
+      shift 2
+      ;;
+    --setenv)
+      export "$2=$3"
+      shift 3
+      ;;
+    --die-with-parent|--new-session|--unshare-pid)
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      printf 'unexpected fake bwrap argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+[[ -z "$cwd" ]] || cd "$cwd"
+exec "$@"
+SH
+
+  cat >"$directory/vi" <<'SH'
+#!/usr/bin/env bash
+cat >"$1" <<'COMMAND'
+#!/usr/bin/env bash
+printf 'edited command\n'
+COMMAND
+SH
+
+  chmod +x "$directory/seal" "$directory/bwrap" "$directory/vi"
+}
+
+write_local_config() {
+  local workspace="$1"
+  local peer="$2"
+  cat >"$workspace/seal.toml" <<EOF
+local_mailbox = "mailbox"
+
+[peer]
+path = "$peer"
+
+[tools]
+rsync = "$REAL_RSYNC"
+EOF
+}
+
+run_spike() {
+  local workspace="$1"
+  local tools="$2"
+  local input="$3"
+  local transcript="$4"
+  (
+    cd "$workspace"
+    PATH="$tools:$PATH" \
+      SEAL_TEST_LOG="$workspace/seal.log" \
+      BWRAP_TEST_LOG="$workspace/bwrap.log" \
+      "$SCRIPT" <<<"$input"
+  ) >"$transcript" 2>&1
+}
+
+tools="$TEST_ROOT/tools"
+make_fake_tools "$tools"
+
+workspace="$TEST_ROOT/run"
+peer="$TEST_ROOT/run-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-001" "$peer"
+write_local_config "$workspace" "$peer"
+{
+  printf '#!/usr/bin/env bash\n'
+  for number in $(seq 1 40); do
+    printf '# review line %s\n' "$number"
+  done
+  printf 'printf "command stdout\\n"\n'
+  printf 'printf "command stderr\\n" >&2\n'
+  printf 'printf "artifact\\n" > artifact.txt\n'
+} >"$workspace/mailbox/ready/20260716-001/command.sh"
+
+run_spike "$workspace" "$tools" yes "$workspace/transcript"
+[[ ! -e "$workspace/mailbox/ready/20260716-001" ]] || fail "ready command survived claim"
+[[ -f "$workspace/mailbox/claimed/20260716-001/command.sh" ]] || fail "command was not claimed"
+[[ -f "$workspace/.seal-exec/attempts/20260716-001/command.sh" ]] || fail "approved snapshot missing"
+assert_file_contains "$workspace/transcript" "review threshold is 40"
+assert_file_contains "$workspace/mailbox/output/20260716-001.out" "command stdout"
+assert_file_contains "$workspace/mailbox/output/20260716-001.err" "command stderr"
+assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'status = "completed"'
+assert_file_contains "$workspace/mailbox/claimed/20260716-001/result.toml" 'exit_code = 0'
+assert_file_contains "$workspace/mailbox/world/artifact.txt" "artifact"
+[[ "$(printf 'pull\npush\n')" == "$(cat "$workspace/seal.log")" ]] || fail "unexpected seal calls"
+
+workspace="$TEST_ROOT/edit"
+peer="$TEST_ROOT/edit-peer"
+mkdir -p "$workspace/mailbox/ready/20260716-002" "$peer"
+write_local_config "$workspace" "$peer"
+cat >"$workspace/mailbox/ready/20260716-002/command.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'original command\n'
+SH
+run_spike "$workspace" "$tools" $'edit\nyes' "$workspace/transcript"
+assert_file_contains "$workspace/mailbox/output/20260716-002.out" "edited command"
+assert_file_contains "$workspace/mailbox/claimed/20260716-002/result.toml" 'edited = true'
+
+workspace="$TEST_ROOT/purge"
+peer="$TEST_ROOT/purge-peer"
+mkdir -p "$workspace/mailbox/ready/local" "$peer/ready/one" "$peer/ready/two" "$peer/world"
+printf 'preserve\n' >"$peer/world/preserved.txt"
+printf 'one\n' >"$peer/ready/one/command.sh"
+printf 'two\n' >"$peer/ready/two/command.sh"
+write_local_config "$workspace" "$peer"
+(
+  cd "$workspace"
+  PATH="$tools:$PATH" SEAL_TEST_LOG="$workspace/seal.log" "$SCRIPT" purge <<<'purge'
+) >"$workspace/transcript" 2>&1
+[[ ! -e "$workspace/mailbox/ready" ]] || fail "local ready directory survived purge"
+[[ -d "$peer/ready" ]] || fail "peer ready directory missing after purge"
+[[ -z "$(find "$peer/ready" -mindepth 1 -print -quit)" ]] || fail "peer ready is not empty"
+assert_file_contains "$peer/world/preserved.txt" "preserve"
+
+if [[ -n "${SEAL_E2E_BIN:-}" ]]; then
+  workspace="$TEST_ROOT/real"
+  peer="$TEST_ROOT/real-peer"
+  mkdir -p "$workspace/mailbox" "$peer/ready/20260716-real"
+  write_local_config "$workspace" "$peer"
+  cat >"$peer/ready/20260716-real/command.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'real stdout\n'
+printf 'real stderr\n' >&2
+printf 'real artifact\n' > real-artifact.txt
+SH
+  if ! (
+    cd "$workspace"
+    SEAL_BIN="$SEAL_E2E_BIN" "$SCRIPT" <<<'yes'
+  ) >"$workspace/transcript" 2>&1; then
+    cat "$workspace/transcript" >&2
+    fail "real Seal/bwrap spike failed"
+  fi
+  assert_file_contains "$workspace/mailbox/output/20260716-real.out" "real stdout"
+  assert_file_contains "$workspace/mailbox/output/20260716-real.err" "real stderr"
+  assert_file_contains "$workspace/mailbox/world/real-artifact.txt" "real artifact"
+  assert_file_contains "$peer/claimed/20260716-real/result.toml" 'status = "completed"'
+  assert_file_contains "$peer/output/20260716-real.out" "real stdout"
+  assert_file_contains "$peer/world/real-artifact.txt" "real artifact"
+fi
+
+printf 'seal-exec spike tests passed\n'
+#+end_src
 
 ** Visible seed behavior
 
