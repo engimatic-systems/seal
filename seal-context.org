@@ -376,6 +376,12 @@ experiment report false results."
 
 * A concrete manual broker sketch
 
+Everything in this section is disposable experimental machinery.  Concreteness
+lets the discussion expose races and missing semantics; it does not imply that
+the mailbox layout, locking convention, rsync choreography, or shell broker is
+converging on the correct shape.  A useful experiment may be rejected after it
+teaches one fact.
+
 ** Proposed mailbox shape
 
 The first shell broker could use a deliberately small mutable layout:
@@ -459,6 +465,59 @@ Possible exploratory responses include treating =claimed/X= as a marker that
 makes any surviving =ready/X= ineligible, copying rather than pretending the
 transport performed a move, asking the agent to clean acknowledged ready
 entries, or later adding a queue-specific mutation.  None has been selected.
+
+*** Late reconciliation of =ready/=
+
+A next-least-complex iteration could finish the command first, pull only
+=ready/= again, prune local =ready/X= wherever =claimed/X= now exists, then
+push only =ready/= with =rsync --delete=.  Commands published before that
+second pull would be preserved in the local source and returned to the peer.
+
+This materially narrows the destructive race.  It does not remove it.  A
+command published or modified after the second pull but before the delete-push
+can still be deleted or overwritten by the stale local tree.
+
+The specialized final push exceeds Seal v0's fixed whole-mailbox transfer
+profile.  An exploratory =seal-exec.sh= could build this narrower rsync
+invocation itself without immediately changing Seal.  Doing so would turn
+observed use into evidence about whether Seal eventually wants a queue-specific
+transport operation.
+
+*** A cooperative mailbox lock
+
+Another possibility is an operator-created lock that tells the agent the
+operator temporarily owns mailbox reconciliation.  While the lock is visible,
+the agent may stage work elsewhere but knows that publishing into the locked
+tree can be clobbered.
+
+For an SSH-backed mailbox, creating a lock only in the operator's local copy is
+insufficient: the lock must become visible on the peer before the final pull.
+The useful ordering is approximately:
+
+#+begin_example
+make lock visible to agent
+pull final ready state
+prune claimed commands locally
+push ready with deletion
+remove peer-visible lock after successful push
+#+end_example
+
+Removing the lock before the destructive push reopens the race: the agent may
+observe an unlocked mailbox and publish a command that the stale sender then
+deletes.  Folding lock deletion into the same rsync can also leave a smaller
+ordering question if the agent observes removal while receiver-side deletions
+are still occurring.  Explicit release after successful reconciliation says
+the intended thing more plainly.
+
+This lock may remain cooperative rather than adversarially sound in v0.1.  A
+mere presence check has check-then-publish races unless agent publication and
+operator acquisition share a stronger primitive.  The exploratory question is
+whether the actual single-agent workflow needs more than a visible convention,
+not whether the first shell script can prove distributed mutual exclusion.
+
+A stranded lock after operator interruption needs a manual recovery story or a
+lease timestamp.  That friction may itself reveal whether locking belongs in
+the eventual transport or was only useful prototype scaffolding.
 
 *** A writable mailbox includes authority-shaped files
 
